@@ -1296,7 +1296,7 @@ const MIGRATIONS: [(i64, MigrationStep); 76] = [
     }),
     (77, |c| {
         Ok(c.execute_batch(
-            "CREATE TABLE durable_send_receipts (
+            "CREATE TABLE IF NOT EXISTS durable_send_receipts (
                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                client_msg_id TEXT NOT NULL,
                outcome TEXT NOT NULL,
@@ -4147,6 +4147,19 @@ impl Store {
             "DELETE FROM queued_messages WHERE id=(SELECT id FROM queued_messages WHERE session_id=?1
                ORDER BY COALESCE(position,id),id LIMIT 1) RETURNING content,no_pending_attachments",
         )?.query_row([session_id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?)
+    }
+
+    pub(crate) fn peek_queued_message_with_policy(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, bool)>> {
+        Ok(self
+            .ps(
+                "SELECT content,no_pending_attachments FROM queued_messages WHERE session_id=?1
+               ORDER BY COALESCE(position,id),id LIMIT 1",
+            )?
+            .query_row([session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?)
     }
 
     pub fn list_queued_messages(&self, session_id: &str) -> Result<Vec<String>> {

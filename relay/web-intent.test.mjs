@@ -884,6 +884,38 @@ test('per-session drafts survive reload without clobbering another pairing or Se
   reloaded.restoreDraft('A'); assert.equal(reloaded.$('input').value, '');
 });
 
+test('failed draft persistence falls back per scope and Session, including failed deletion', () => {
+  const prefs = memoryPrefs();
+  const c = setup(['saveDraft','restoreDraft','onStorage','sessionCacheKey'], { prefs });
+  const set = prefs.set.bind(prefs), remove = prefs.remove.bind(prefs);
+  c.saveDraft('A', 'shared draft');
+  prefs.set = () => false;
+  assert.equal(c.saveDraft('A', 'unpersisted draft'), false);
+  c.restoreDraft('A');
+  assert.equal(c.$('input').value, 'unpersisted draft');
+  c.onStorage({ key: 'formless.draft:test-room:A', newValue: JSON.stringify('other tab draft') });
+  assert.equal(c.S.drafts.A, 'unpersisted draft');
+  c.S.drafts = {};
+  c.restoreDraft('A');
+  assert.equal(c.$('input').value, 'unpersisted draft');
+
+  prefs.set = set;
+  assert.equal(c.saveDraft('A', 'persisted draft'), true);
+  prefs.set('draft:test-room:B', 'shared B');
+  c.onStorage({ key: 'formless.draft:test-room:B', newValue: JSON.stringify('shared B') });
+  assert.equal(c.S.drafts.B, 'shared B');
+  c.onStorage({ key: 'formless.draft:test-room:B', newValue: JSON.stringify('new shared B') });
+  assert.equal(c.S.drafts.B, 'new shared B');
+
+  prefs.remove = () => false;
+  assert.equal(c.saveDraft('A', ''), false);
+  c.S.drafts = {};
+  c.restoreDraft('A');
+  assert.equal(c.$('input').value, '');
+  assert.equal(c.S.unpersistedDrafts.has(c.sessionCacheKey('test-room', 'A')), true);
+  prefs.remove = remove;
+});
+
 test('storage events preserve a focused composer and an active edit', () => {
   const c = setup(['onStorage','restoreDraft']);
   c.S.drafts.A = 'saved draft';
@@ -952,6 +984,7 @@ test('old daemons never dispatch durable entries and upgraded daemons do not rep
   await old.flushOutbox();
   assert.equal(old.S.outbox[0].status, 'failed');
   assert.match(old.S.outbox[0].error, /[Uu]pgrade/);
+  assert.match(old.S.outbox[0].error, /manually copy.*discard.*resend/i);
   assert.equal(calls.some(req => req.type === 'send_message' || req.type === 'send_outbox_message'), false);
 
   const prefs = memoryPrefs();
@@ -986,6 +1019,7 @@ test('only a fresh idle text send retains direct legacy compatibility', async ()
   await c.submit(true);
   assert.equal(c.S.outbox[0].status, 'failed');
   assert.match(c.S.outbox[0].error, /upgrade/);
+  assert.match(c.S.outbox[0].error, /manually copy.*discard.*resend/i);
   assert.equal(calls.filter(req => req.type === 'send_message').length, 1);
 
   const attachedCalls = [];
@@ -1017,6 +1051,79 @@ test('only a fresh idle text send retains direct legacy compatibility', async ()
   await duplicate.submit(false);
   assert.equal(duplicateCalls.some(req => req.type === 'send_message' || req.type === 'send_outbox_message'), false);
   assert.equal(duplicate.$('input').value, 'already queued');
+});
+
+test('legacy fresh sends require an empty pairing outbox under the outbox lock', async () => {
+  const prefs = memoryPrefs();
+  prefs.set('outbox:test-room', [{ scope: 'test-room', order: 1, session_id: 'B', content: 'saved elsewhere', mode: 'send', expected_attachments: [], client_msg_id: 'saved-in-B', attempted: false, status: 'queued' }]);
+  const blockedCalls = [];
+  const blocked = setup(['submit'], {
+    prefs, pingFeatures: [], askNotifyPermission() {}, closeMentions() {}, mentionsIn: () => [],
+    request: async req => { blockedCalls.push(req); return req.type === 'list_pending_attachments' ? { attachments: [] } : {}; },
+  });
+  blocked.S.settings = { limits: {} };
+  blocked.$('input').value = 'fresh send in A';
+  await blocked.submit(false);
+  assert.equal(blockedCalls.some(req => req.type === 'send_message'), false);
+  assert.equal(blocked.$('input').value, 'fresh send in A');
+
+  const locks = testLocks(), calls = [], gate = deferred();
+  const shared = {
+    prefs: memoryPrefs(), navigator: { locks }, pingFeatures: [],
+    crypto: { randomUUID: () => 'legacy-lock-test' },
+    request: async req => {
+      calls.push(req);
+      if (req.type === 'send_message') await gate.promise;
+      return req.type === 'list_pending_attachments' ? { attachments: [] } : {};
+    },
+  };
+  const sender = setup(['submit'], { ...shared, askNotifyPermission() {}, closeMentions() {}, mentionsIn: () => [] });
+  const otherTab = setup(['enqueueOutbox','loadOutbox'], shared);
+  sender.S.settings = { limits: {} };
+  sender.$('input').value = 'fresh locked send';
+  const sending = sender.submit(false);
+  for (let i = 0; i < 20 && !calls.some(req => req.type === 'send_message'); i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.some(req => req.type === 'send_message'), true);
+  otherTab.S.daemonOnline = false; otherTab.S.channel = null;
+  const enqueuing = otherTab.enqueueOutbox('B', 'concurrent deferred action', 'send', { expectedAttachments: [] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(otherTab.loadOutbox('test-room').length, 0, 'the enqueue waits for the legacy send lock');
+  gate.resolve();
+  await Promise.all([sending, enqueuing]);
+  assert.equal(calls.filter(req => req.type === 'send_message').length, 1);
+  assert.equal(otherTab.loadOutbox('test-room').length, 1);
+});
+
+test('legacy send preparation never saves a textarea after Session or pairing changes', async () => {
+  for (const transition of ['session', 'scope']) {
+    const prefs = memoryPrefs(), pingGate = deferred(), pingStarted = deferred(), draftWrites = [];
+    const set = prefs.set.bind(prefs);
+    prefs.set = (key, value) => {
+      if (key.startsWith('draft:')) draftWrites.push(key);
+      return set(key, value);
+    };
+    const c = setup(['submit'], { prefs, pingFeatures: [], askNotifyPermission() {}, closeMentions() {}, mentionsIn: () => [] });
+    c.request = async req => {
+      if (req.type === 'ping') { pingStarted.resolve(); await pingGate.promise; return { features: [] }; }
+      return req.type === 'list_pending_attachments' ? { attachments: [] } : {};
+    };
+    c.S.settings = { limits: {} };
+    c.$('input').value = 'message from A';
+    const submitting = c.submit(false);
+    await pingStarted.promise;
+    const writesBeforeTransition = draftWrites.length;
+    if (transition === 'session') {
+      c.S.current = 'B';
+      c.$('input').value = 'draft from B';
+    } else {
+      c.S.storageScope = 'another-pairing';
+      c.S.current = 'B';
+      c.$('input').value = 'draft from another pairing';
+    }
+    pingGate.resolve();
+    await submitting;
+    assert.deepEqual(draftWrites.slice(writesBeforeTransition), [], `${transition} transition must not save into A's old textarea key`);
+  }
 });
 
 test('cross-tab outbox flushes serialize and draft keys do not clobber each other', async () => {

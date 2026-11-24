@@ -6413,8 +6413,18 @@ impl Daemon {
         input: &ForecastInput,
         selected: Option<&str>,
     ) -> Result<RunForecast> {
+        self.forecast_estimate_selected_with_pending_attachments(st, cfg, input, selected, true)
+    }
+    fn forecast_estimate_selected_with_pending_attachments(
+        &self,
+        st: &Store,
+        cfg: &Config,
+        input: &ForecastInput,
+        selected: Option<&str>,
+        include_pending_attachments: bool,
+    ) -> Result<RunForecast> {
         st.read_transaction(|st| {
-            crate::forecast::estimate_store_with_window(
+            crate::forecast::estimate_store_with_window_and_pending_attachments(
                 st,
                 cfg,
                 input,
@@ -6426,6 +6436,7 @@ impl Daemon {
                         .and_then(|windows| windows.get(model).copied())
                 }),
                 selected,
+                include_pending_attachments,
             )
         })
     }
@@ -7027,17 +7038,24 @@ impl Daemon {
         let mut held_for_confirmation = false;
         let prepared = self.with_store(|st| {
             st.transaction(|st| {
-                let Some(next) = st.queued_items(&session_id)?.into_iter().next() else {
+                let Some((next_content, no_pending_attachments)) =
+                    st.peek_queued_message_with_policy(&session_id)?
+                else {
                     return Ok(None);
                 };
                 let input = ForecastInput {
                     session_id: Some(session_id.clone()),
-                    draft: next.content,
+                    draft: next_content,
                     ..Default::default()
                 };
                 let selected = self.action_model(st, &cfg, &input)?;
-                let forecast =
-                    self.forecast_estimate_selected(st, &cfg, &input, Some(&selected))?;
+                let forecast = self.forecast_estimate_selected_with_pending_attachments(
+                    st,
+                    &cfg,
+                    &input,
+                    Some(&selected),
+                    !no_pending_attachments,
+                )?;
                 if forecast.confirmation_required {
                     held_for_confirmation = true;
                     return Ok(None);

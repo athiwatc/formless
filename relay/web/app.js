@@ -76,6 +76,8 @@
   function sessionStorageKey(scope) { return scope ? "session:" + encodeURIComponent(scope) : "session"; }
   function loadDraft(scope, sessionId) {
     if (!scope || !sessionId) return "";
+    const fallbackKey = sessionCacheKey(scope, sessionId);
+    if (S.unpersistedDrafts && S.unpersistedDrafts.has(fallbackKey)) return S.unpersistedDrafts.get(fallbackKey);
     const value = prefs.get(draftStorageKey(scope, sessionId), "");
     return typeof value === "string" ? value : "";
   }
@@ -151,6 +153,7 @@
     topicFocus: null,
     current: null,
     drafts: {},
+    unpersistedDrafts: new Map(),
     attachmentInventories: {},
     outbox: [],
     outboxFlushing: false,
@@ -197,10 +200,18 @@
     }
     if (!scope) return true;
     const key = draftStorageKey(scope, sessionId);
-    return value ? prefs.set(key, value) : typeof prefs.remove === "function" ? prefs.remove(key) : prefs.set(key, "");
+    S.unpersistedDrafts = S.unpersistedDrafts || new Map();
+    const fallbackKey = sessionCacheKey(scope, sessionId);
+    const saved = value ? prefs.set(key, value) : typeof prefs.remove === "function" ? prefs.remove(key) : prefs.set(key, "");
+    if (saved) S.unpersistedDrafts.delete(fallbackKey);
+    else S.unpersistedDrafts.set(fallbackKey, value);
+    return saved;
   }
   function restoreDraft(sessionId) {
-    const value = loadDraft(S.storageScope, sessionId);
+    const fallbackKey = sessionCacheKey(S.storageScope, sessionId);
+    const value = S.unpersistedDrafts && S.unpersistedDrafts.has(fallbackKey)
+      ? S.unpersistedDrafts.get(fallbackKey)
+      : loadDraft(S.storageScope, sessionId);
     S.drafts[sessionId] = value;
     $("input").value = value;
     autosize();
@@ -394,7 +405,7 @@
             item.status = "failed";
             item.error = item.attempted
               ? "This daemon does not support durable retries. The message may already have been sent; check the Session before resending."
-              : "This daemon does not support the durable outbox. Upgrade it before sending this saved message; it was not sent.";
+              : "This daemon does not support the durable outbox; upgrade it, manually copy this message text, discard the saved item, and resend it; it was not sent.";
             persistOutbox(scope, entries); refreshOutbox(scope); break;
           }
           if (item.forecast_pending) {
@@ -500,7 +511,14 @@
     const prefix = "formless.draft:" + encodeURIComponent(scope) + ":";
     if (event.key.startsWith(prefix)) {
       const sessionId = decodeURIComponent(event.key.slice(prefix.length));
-      const value = typeof event.newValue === "string" ? (() => { try { return JSON.parse(event.newValue); } catch (_) { return ""; } })() : "";
+      const storedValue = typeof event.newValue === "string" ? (() => { try { return JSON.parse(event.newValue); } catch (_) { return ""; } })() : "";
+      const fallbackKey = sessionCacheKey(scope, sessionId);
+      let value = storedValue;
+      if (S.unpersistedDrafts && S.unpersistedDrafts.has(fallbackKey)) {
+        const fallback = S.unpersistedDrafts.get(fallbackKey);
+        if (fallback === storedValue) S.unpersistedDrafts.delete(fallbackKey);
+        else value = fallback;
+      }
       const composer = $("input");
       const localDraft = S.drafts[sessionId];
       const preserveComposer = S.current === sessionId && (S.editMessageId || composer.value !== (localDraft || ""));
@@ -9065,6 +9083,10 @@
       if (!S.current) return;
       const sid = S.current;
       const scope = S.storageScope;
+      const saveCurrentDraft = (value) => {
+        if (scope !== S.storageScope || S.current !== sid) return false;
+        return saveDraft(sid, value, scope);
+      };
       const mode = queued ? "queue" : S.running.has(sid) ? "steer" : "send";
       const expectedRunId = mode === "steer" && S.liveRun && !S.liveRun.ended ? S.liveRun.id : null;
       const editMessageId = S.editMessageId;
@@ -9098,7 +9120,7 @@
         }
         try {
           const attachment = await request({ type: "attach_path", session_id: sid, path });
-          if (scope !== S.storageScope) { saveDraft(sid, text, scope); return; }
+          if (scope !== S.storageScope) { saveCurrentDraft(text); return; }
           (mentionAttached[sessionKey] = mentionAttached[sessionKey] || new Set()).add(path);
           (S.chips[sid] = S.chips[sid] || []).push(attachment);
           fresh.push(attachment.name);
@@ -9111,8 +9133,8 @@
       }
       if (fresh.length) {
         await refreshAttachmentInventory(sid, scope);
-        if (S.current === sid && scope === S.storageScope) { saveDraft(sid, input.value); autosize(); renderChips(); }
-        else { attachmentDrafts[sessionCacheKey(scope, sid)] = text; saveDraft(sid, text, scope); }
+        if (S.current === sid && scope === S.storageScope) { saveCurrentDraft(input.value); autosize(); renderChips(); }
+        else { attachmentDrafts[sessionCacheKey(scope, sid)] = text; saveCurrentDraft(text); }
         note("This message attaches " + fresh.join(", ") + " (shown above the box; × removes one). Press Send again to send.");
         return;
       }
@@ -9122,19 +9144,19 @@
         else {
           try {
             if (!(await confirmForecast(sid, text))) {
-              if (scope !== S.storageScope) saveDraft(sid, text, scope);
-              else if (S.current !== sid) { attachmentDrafts[sessionCacheKey(scope, sid)] = text; saveDraft(sid, text, scope); }
+              if (scope !== S.storageScope) saveCurrentDraft(text);
+              else if (S.current !== sid) { attachmentDrafts[sessionCacheKey(scope, sid)] = text; saveCurrentDraft(text); }
               return;
             }
           } catch (error) {
             if (!S.daemonOnline) forecastPending = true;
-            else { saveDraft(sid, text, scope); note("Forecast was not confirmed: " + error.message, true); return; }
+            else { saveCurrentDraft(text); note("Forecast was not confirmed: " + error.message, true); return; }
           }
         }
       }
-      if (scope !== S.storageScope) { saveDraft(sid, text, scope); return; }
+      if (scope !== S.storageScope) { saveCurrentDraft(text); return; }
       const inventory = await refreshAttachmentInventory(sid, scope);
-      if (scope !== S.storageScope) { saveDraft(sid, text, scope); return; }
+      if (scope !== S.storageScope) { saveCurrentDraft(text); return; }
       let durableOutboxSupported = null;
       let capabilityError = null;
       if (S.daemonOnline && S.channel) {
@@ -9143,64 +9165,83 @@
           durableOutboxSupported = Array.isArray(ping && ping.features) && ping.features.includes("durable_outbox_v1");
         } catch (error) { capabilityError = error; }
       }
-      if (scope !== S.storageScope) { saveDraft(sid, text, scope); return; }
+      if (scope !== S.storageScope) { saveCurrentDraft(text); return; }
       if (durableOutboxSupported === false && mode === "send") {
-        if (loadOutbox(scope).some((item) => item.session_id === sid && item.content === text)) {
-          saveDraft(sid, input.value, scope);
-          note("A matching saved outbox action exists; check or discard it before sending this message again.", true);
+        if (S.current !== sid) {
+          saveCurrentDraft(input.value);
+          note("The active Session changed while preparing this message; review it before sending with this daemon.", true);
           return;
         }
         if (!Array.isArray(inventory) || inventory.length) {
-          saveDraft(sid, input.value, scope);
+          saveCurrentDraft(input.value);
           note("This daemon cannot safely send a message with pending attachments; upgrade it before sending.", true);
           return;
         }
         if (S.running.has(sid)) {
-          saveDraft(sid, input.value, scope);
+          saveCurrentDraft(input.value);
           note("The Session started a Run while this message was being prepared; choose a send mode again.", true);
           return;
         }
-        saveDraft(sid, input.value, scope);
-        let currentAttachments;
-        try { currentAttachments = await fetchFreshAttachmentInventory(sid, scope); }
-        catch (error) {
-          note("Could not verify pending attachments for the legacy send: " + error.message, true);
-          return;
-        }
-        if (scope !== S.storageScope || S.current !== sid) { saveDraft(sid, text, scope); return; }
-        if (!Array.isArray(currentAttachments) || currentAttachments.length || JSON.stringify(currentAttachments) !== JSON.stringify(inventory)) {
-          note("Pending attachments changed while preparing this message; review it before sending.", true);
-          return;
-        }
-        if (S.running.has(sid) || input.value.trim() !== text) {
-          saveDraft(sid, input.value, scope);
-          note("The message or Session state changed while preparing it; review before sending.", true);
-          return;
-        }
+        saveCurrentDraft(input.value);
+        let legacyResult;
         try {
-          await request({
-            type: "send_message",
-            session_id: sid,
-            content: text,
-            mode: "send",
-            client_msg_id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2),
+          legacyResult = await withOutboxLock(scope, async () => {
+            if (scope !== S.storageScope || S.current !== sid) return { blocked: "The active Session or pairing changed; this message was not sent." };
+            if (loadOutbox(scope).length) return { blocked: "The pairing outbox is not empty; review its saved messages before sending this legacy message." };
+            if (S.running.has(sid) || input.value.trim() !== text) return { blocked: "The message or Session state changed while preparing it; review before sending." };
+            let currentAttachments;
+            try { currentAttachments = await fetchFreshAttachmentInventory(sid, scope); }
+            catch (error) { return { inventoryError: error }; }
+            if (scope !== S.storageScope || S.current !== sid) return { blocked: "The active Session or pairing changed; this message was not sent." };
+            if (!Array.isArray(currentAttachments) || currentAttachments.length || JSON.stringify(currentAttachments) !== JSON.stringify(inventory)) {
+              return { blocked: "Pending attachments changed while preparing this message; review it before sending." };
+            }
+            if (S.running.has(sid) || input.value.trim() !== text) return { blocked: "The message or Session state changed while preparing it; review before sending." };
+            try {
+              await request({
+                type: "send_message",
+                session_id: sid,
+                content: text,
+                mode: "send",
+                client_msg_id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2),
+              });
+              return { sent: true };
+            } catch (error) { return { requestError: error }; }
           });
-        } catch (error) {
+        } catch (error) { legacyResult = { lockError: error }; }
+        if (!legacyResult) {
+          note("Could not coordinate with other tabs; this legacy message was not sent.", true);
+          return;
+        }
+        if (legacyResult.inventoryError) {
+          note("Could not verify pending attachments for the legacy send: " + legacyResult.inventoryError.message, true);
+          return;
+        }
+        if (legacyResult.blocked) {
+          note(legacyResult.blocked, true);
+          return;
+        }
+        if (legacyResult.lockError) {
+          note("Could not coordinate with other tabs; this legacy message was not sent: " + legacyResult.lockError.message, true);
+          return;
+        }
+        if (legacyResult.requestError) {
+          const error = legacyResult.requestError;
           note(error.daemonResponse
             ? "Legacy send failed: " + error.message
             : "Legacy send outcome is unknown; check the Session before retrying: " + error.message, true);
           return;
         }
-        if (scope === S.storageScope && S.current === sid) {
-          if (input.value.trim() === text) { input.value = ""; saveDraft(sid, "", scope); autosize(); }
-          else saveDraft(sid, input.value, scope);
+        if (legacyResult.sent && scope === S.storageScope && S.current === sid) {
+          if (input.value.trim() === text) { input.value = ""; saveCurrentDraft(""); autosize(); }
+          else saveCurrentDraft(input.value);
         }
         return;
       }
       let blockedReason = attachmentError;
       if (mode === "steer" && !expectedRunId) blockedReason = "The active Run could not be identified; this Steer was not sent.";
       if (mode === "queue" && inventory && inventory.length) blockedReason = "Queue mode cannot preserve pending attachments; this message was not sent.";
-      if (durableOutboxSupported === false) blockedReason = "This daemon does not support the durable outbox; upgrade it before sending this deferred message.";
+      if (durableOutboxSupported === false) blockedReason = "This daemon does not support the durable outbox; upgrade it, manually copy this message text, discard the saved item, and resend it.";
       if (capabilityError && capabilityError.daemonResponse) blockedReason = "Could not verify durable outbox support: " + capabilityError.message;
       const item = await enqueueOutbox(sid, text, mode, {
         expectedAttachments: inventory,
@@ -9217,9 +9258,9 @@
         return;
       }
       if (S.current === sid && scope === S.storageScope) {
-        if (input.value.trim() === text) { input.value = ""; saveDraft(sid, "", scope); autosize(); }
-        else saveDraft(sid, input.value, scope);
-      } else saveDraft(sid, "", scope);
+        if (input.value.trim() === text) { input.value = ""; saveCurrentDraft(""); autosize(); }
+        else saveCurrentDraft(input.value);
+      }
       if (item.status === "failed") { note(item.error, true); return; }
       return scope === S.storageScope ? flushOutbox() : undefined;
     } finally {

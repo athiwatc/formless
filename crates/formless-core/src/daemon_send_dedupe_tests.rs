@@ -434,3 +434,172 @@ async fn queued_outbox_message_does_not_consume_attachments_added_later() {
     release_fixture(&env, daemon).await;
     let _ = std::fs::remove_dir_all(base);
 }
+
+#[tokio::test]
+async fn queued_text_outbox_drain_ignores_later_image_for_forecast() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (daemon, sid, base) = fixture(&env);
+    let paths = fixture_paths(&base);
+    let model = "queued-image-forecast".to_string();
+    let mut cfg = Config::default();
+    cfg.provider.base_url = "http://127.0.0.1:9".into();
+    cfg.provider.model = model.clone();
+    cfg.provider.vision = Some(true);
+    cfg.provider.image_max_px = 256;
+    cfg.provider
+        .model_context_tokens
+        .insert(model.clone(), 100_000);
+    cfg.provider.prices.insert(
+        model.clone(),
+        crate::config::ModelPrice {
+            input: 1_000_000.0,
+            output: 1_000_000.0,
+            ..Default::default()
+        },
+    );
+    cfg.provider.max_retries = 0;
+    cfg.limits.forecast_confirm_usd = None;
+    cfg.naming.enabled = false;
+    cfg.skills.auto_create = false;
+    cfg.save(&paths).unwrap();
+    daemon.config_with_refresh(true).unwrap();
+    daemon
+        .with_store(|st| {
+            let baseline = crate::forecast::estimate_store(
+                st,
+                &cfg,
+                &ForecastInput {
+                    session_id: Some(sid.clone()),
+                    draft: "forecast baseline".into(),
+                    ..Default::default()
+                },
+            )?;
+            let run = st.create_run(&sid)?;
+            st.record_forecast(&run, &baseline)?;
+            st.bump_run_steps(&run)?;
+            st.record_forecast_request(&run, "run")?;
+            st.record_usage_full(
+                &sid,
+                &run,
+                "default",
+                &model,
+                &crate::provider::Usage {
+                    prompt_tokens: 100,
+                    completion_tokens: 100,
+                    reported: 3,
+                    ..Default::default()
+                },
+                "run",
+            )?;
+            st.set_run_status(&run, "completed")?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(daemon.runs.locked().contains_key(&sid));
+    daemon
+        .handle(Request::SendOutboxMessage {
+            session_id: sid.clone(),
+            content: "text-only queue item".into(),
+            mode: SendMode::Queue,
+            expected_attachments: vec![],
+            expected_run_id: None,
+            client_msg_id: "text-only-queue-with-later-image".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        daemon
+            .with_reader(|st| st.list_queued_messages(&sid))
+            .unwrap(),
+        vec!["text-only queue item"]
+    );
+
+    let generated = base.join("later.png");
+    image::DynamicImage::new_rgb8(4096, 1024)
+        .save(&generated)
+        .unwrap();
+    let bytes = std::fs::read(&generated).unwrap();
+    let owned = paths.data_dir.join("artifacts/later.png");
+    std::fs::create_dir_all(owned.parent().unwrap()).unwrap();
+    std::fs::copy(&generated, &owned).unwrap();
+    let artifact_id = daemon
+        .with_store(|st| {
+            st.save_artifact(Some(&sid), owned.to_str().unwrap(), "", bytes.len() as i64)
+        })
+        .unwrap();
+    let later_attachment = json!({
+        "id": artifact_id,
+        "path": owned,
+        "name": "later.png",
+        "mime": "image/png",
+        "bytes": bytes.len(),
+    });
+    daemon
+        .with_store(|st| st.add_pending_attachment(&sid, &later_attachment))
+        .unwrap();
+
+    let input = ForecastInput {
+        session_id: Some(sid.clone()),
+        draft: "text-only queue item".into(),
+        ..Default::default()
+    };
+    let (text_only, with_later_image) = daemon
+        .with_reader(|st| {
+            Ok((
+                crate::forecast::estimate_store_with_window_and_pending_attachments(
+                    st, &cfg, &input, None, None, false,
+                )?,
+                crate::forecast::estimate_store(st, &cfg, &input)?,
+            ))
+        })
+        .unwrap();
+    let text_cost = text_only.cost_usd.as_ref().unwrap().p90;
+    let image_cost = with_later_image.cost_usd.as_ref().unwrap().p90;
+    assert!(
+        image_cost > text_cost,
+        "text={text_cost}, image={image_cost}"
+    );
+    cfg.limits.forecast_confirm_usd = Some((text_cost + image_cost) / 2.0);
+    cfg.save(&paths).unwrap();
+    let cfg = daemon.config_with_refresh(true).unwrap();
+    let (text_gate, image_gate) = daemon
+        .with_reader(|st| {
+            Ok((
+                crate::forecast::estimate_store_with_window_and_pending_attachments(
+                    st, &cfg, &input, None, None, false,
+                )?,
+                crate::forecast::estimate_store(st, &cfg, &input)?,
+            ))
+        })
+        .unwrap();
+    assert!(!text_gate.confirmation_required);
+    assert!(image_gate.confirmation_required);
+
+    assert!(daemon.runs.locked().remove(&sid).is_some());
+    daemon.start_next_queued_message(sid.clone());
+    let (queue, messages, inventory) = daemon
+        .with_reader(|st| {
+            Ok((
+                st.list_queued_messages(&sid)?,
+                st.list_messages(&sid)?,
+                st.pending_attachment_inventory(&sid)?,
+            ))
+        })
+        .unwrap();
+    assert!(
+        queue.is_empty(),
+        "text-only outbox item was held for the later image"
+    );
+    let queued_message = messages
+        .iter()
+        .find(|message| message.content == "text-only queue item")
+        .unwrap();
+    let metadata: Value =
+        serde_json::from_str(queued_message.meta.as_deref().unwrap_or("{}")).unwrap();
+    assert!(metadata.get("attachments").is_none());
+    assert_eq!(inventory, vec![later_attachment]);
+
+    release_fixture(&env, daemon).await;
+    let _ = std::fs::remove_dir_all(base);
+}
