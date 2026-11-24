@@ -15,6 +15,20 @@ macro_rules! parse {
     };
 }
 
+fn ready_harness_count(harnesses: &[formless_protocol::HarnessAvailability]) -> usize {
+    harnesses
+        .iter()
+        .filter(|harness| {
+            harness.installed
+                && if harness.kind == formless_protocol::HarnessKind::Acp {
+                    harness.signed_in == Some(true)
+                } else {
+                    harness.signed_in != Some(false)
+                }
+        })
+        .count()
+}
+
 impl App {
     pub(crate) fn topic_connected(&mut self) {
         self.topic.disconnected();
@@ -590,10 +604,7 @@ impl App {
                         self.notes.push("No harnesses reported.".into())
                     }
                     Some(harnesses) => {
-                        let ready = harnesses
-                            .iter()
-                            .filter(|h| h.installed && h.signed_in != Some(false))
-                            .count();
+                        let ready = ready_harness_count(&harnesses);
                         let total = harnesses.len();
                         for harness in harnesses {
                             self.notes.push(topic::harness_availability_line(&harness));
@@ -746,6 +757,62 @@ pub(crate) fn draw_chat_with_topics(
 mod tests {
     use super::*;
     use crate::tests::test_app;
+
+    #[test]
+    fn acp_harness_count_and_status_require_verified_readiness() {
+        let availability =
+            |kind, acp_agent, installed, signed_in| formless_protocol::HarnessAvailability {
+                kind,
+                acp_agent,
+                installed,
+                signed_in,
+                version: None,
+                detail: None,
+            };
+        let harnesses = vec![
+            availability(
+                formless_protocol::HarnessKind::Acp,
+                Some("gemini".into()),
+                true,
+                Some(true),
+            ),
+            availability(
+                formless_protocol::HarnessKind::Acp,
+                Some("cursor".into()),
+                true,
+                None,
+            ),
+            availability(
+                formless_protocol::HarnessKind::Acp,
+                Some("cline".into()),
+                true,
+                Some(false),
+            ),
+            availability(formless_protocol::HarnessKind::Codex, None, true, None),
+            availability(
+                formless_protocol::HarnessKind::Codex,
+                None,
+                true,
+                Some(false),
+            ),
+            availability(
+                formless_protocol::HarnessKind::Claude,
+                None,
+                false,
+                Some(true),
+            ),
+        ];
+
+        assert_eq!(ready_harness_count(&harnesses), 2);
+        assert!(topic::harness_availability_line(&harnesses[1])
+            .contains("unavailable for execution; sign-in readiness cannot be verified"));
+        assert!(topic::harness_availability_line(&harnesses[2])
+            .contains("unavailable for execution; sign-in required"));
+        assert!(topic::harness_availability_line(&harnesses[0]).contains("ready"));
+        assert!(
+            topic::harness_availability_line(&harnesses[3]).contains("installed (sign-in unknown)")
+        );
+    }
 
     fn feature(id: &str, request: &str, status: TopicFeatureStatus) -> TopicFeatureInfo {
         TopicFeatureInfo {

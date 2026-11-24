@@ -51,6 +51,7 @@ pub const SPEC: AgentSpec = AgentSpec {
     check_agent,
     not_signed_in:
         "OpenCode requires provider authentication. Configure OpenCode in a terminal, then retry.",
+    auth_error_codes: &[-32000],
     read_only_modes: &["formless-review"],
     read_only_fail_closed: true,
     write_modes: &["build"],
@@ -368,6 +369,7 @@ fn prepare(request: &HarnessRequest) -> Result<HarnessRequest> {
         mcp_args: request.mcp_args.clone(),
         mcp_env_vars: request.mcp_env_vars.clone(),
         executable: request.executable.clone(),
+        executable_argv0: request.executable_argv0.clone(),
         environment,
     })
 }

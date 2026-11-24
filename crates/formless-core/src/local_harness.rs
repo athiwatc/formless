@@ -1,8 +1,12 @@
 //! Safe, testable command construction for supported local coding CLIs.
 
 pub mod acp;
+pub mod acp_agents;
 pub mod antigravity;
+mod interaction;
 pub mod opencode;
+
+pub use interaction::run;
 
 use std::{collections::BTreeMap, ffi::OsString, fmt, path::PathBuf, process::Command};
 
@@ -17,11 +21,11 @@ pub mod muse;
 
 #[path = "local_harness_probe.rs"]
 mod readiness;
-pub(crate) use readiness::resolve_executable;
 pub use readiness::{
     acp_probe, blocking_probe, claude_probe, codex_probe, harness_availability, list_harnesses,
     ProbeContext,
 };
+pub(crate) use readiness::{harness_readiness, resolve_executable};
 
 pub struct HarnessPermissionRequest {
     pub title: String,
@@ -70,6 +74,7 @@ pub struct HarnessRequest {
     pub mcp_args: Vec<String>,
     pub mcp_env_vars: Vec<String>,
     pub executable: Option<PathBuf>,
+    pub executable_argv0: Option<OsString>,
     pub environment: BTreeMap<OsString, OsString>,
 }
 
@@ -146,20 +151,15 @@ pub(crate) fn validate_acp_agent(kind: Option<HarnessKind>, agent: Option<&str>)
     {
         bail!("acp_agent is required and must be nonempty exactly when the harness is acp");
     }
-    Ok(())
-}
-
-/// Runs an integrated interactive harness using the core's interaction contract.
-pub async fn run(
-    request: &HarnessRequest,
-    interactions: std::sync::Arc<dyn InteractionHandler>,
-    cancel: &tokio_util::sync::CancellationToken,
-) -> Result<HarnessResult> {
-    validate_acp_agent(Some(request.kind), request.acp_agent.as_deref())?;
-    match request.kind {
-        HarnessKind::OpenCode => opencode::run(request, interactions, cancel).await,
-        _ => bail!("{:?} has no integrated interactive adapter; use its supported local harness entry point", request.kind),
+    if let Some(id) = agent {
+        if acp_agents::spec(id).is_none() {
+            bail!(
+                "Unknown ACP agent `{id}`; available agents: {}",
+                acp_agents::agent_ids().join(", ")
+            );
+        }
     }
+    Ok(())
 }
 
 fn validate_request(request: &HarnessRequest) -> Result<()> {
@@ -171,10 +171,7 @@ fn validate_request(request: &HarnessRequest) -> Result<()> {
         return Ok(());
     }
     if request.kind == HarnessKind::Acp {
-        bail!(
-            "{:?} adapter not integrated yet; use Claude or Codex for now",
-            request.kind
-        );
+        bail!("ACP is interactive; use local_harness::run instead of command_spec");
     }
     if request.prompt.trim().is_empty() {
         bail!("harness prompt must not be empty");
@@ -455,6 +452,7 @@ mod tests {
             ],
             mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],
             executable: Some(PathBuf::from("/opt/test/harness")),
+            executable_argv0: None,
             environment: BTreeMap::new(),
         }
     }
@@ -613,7 +611,7 @@ mod access_tests {
         ] {
             let request = HarnessRequest {
                 kind,
-                acp_agent: (kind == HarnessKind::Acp).then(|| "configured-agent".into()),
+                acp_agent: (kind == HarnessKind::Acp).then(|| "gemini".into()),
                 model: None,
                 cwd: std::env::current_dir().unwrap(),
                 prompt: "inspect".into(),
@@ -622,6 +620,7 @@ mod access_tests {
                 mcp_args: vec![],
                 mcp_env_vars: vec![],
                 executable: None,
+                executable_argv0: None,
                 environment: BTreeMap::new(),
             };
             if matches!(kind, HarnessKind::Claude | HarnessKind::Codex) {
@@ -632,6 +631,16 @@ mod access_tests {
                 } else {
                     assert!(args.windows(2).any(|p| p == ["--sandbox", "read-only"]));
                 }
+            } else if kind == HarnessKind::Acp {
+                assert!(command_spec(&request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("local_harness::run"));
+            } else if kind == HarnessKind::Antigravity {
+                assert!(command_spec(&request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("antigravity::run"));
             } else if kind == HarnessKind::Pi {
                 assert!(command_spec(&request)
                     .unwrap_err()
@@ -677,6 +686,7 @@ mod access_tests {
             mcp_args: vec![],
             mcp_env_vars: vec![],
             executable: None,
+            executable_argv0: None,
             environment: BTreeMap::new(),
         };
         assert!(command_spec(&antigravity)

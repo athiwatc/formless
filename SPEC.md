@@ -6749,6 +6749,23 @@ configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 for the test-only doctor subprocess, which installs an in-memory credential
 backend before read-only dispatch; the shipped binary does not read this variable).
 
+`FORMLESS_LIVE_ACP_BIN_DIR` gates the ignored ACP initialize and availability tests.
+It names a directory of installed ACP CLI executables (or symlinks). These tests
+use isolated HOME/XDG directories and skip absent binaries. Initialize-only tests
+send only ACP initialize; the availability test also sends session/new without
+MCP servers, with an eight-second deadline. It is not a product configuration
+override and does not authenticate or send prompts.
+
+The existing ignored Antigravity bridge test uses `FORMLESS_LIVE_AGY=1` as its
+opt-in gate and optional `FORMLESS_AGY_BIN` as its executable override.
+`FORMLESS_TOPIC_CAPABILITY` is the per-attempt bearer capability for the private
+MCP bridge. Pi topic runs include it in the Pi RPC process environment and
+forward it to the MCP child through the extension's allow-listed `envVars`; it
+is not placed in argv, prompts, or transcripts. Pi and descendants inheriting
+the environment can access it. The Pi process also inherits the daemon's
+ambient environment, so native credentials already present there are not
+isolated from the harness.
+
 `FORMLESS_EXPORT_DESCRIPTOR_FIXTURE` is a Linux-only export test hook pointing
 to an owned redirected-stdout alias; it verifies that descriptor output preserves
 the underlying file instead of atomically replacing the alias. The shipped
@@ -7115,10 +7132,10 @@ Each attempt has a private staging directory, including Git attempts.
 Directory/Scratch steps use private directories with copied read-only file
 inputs. File/text outputs are reported through scoped MCP. A failed step is
 returned to the model without automatically failing the feature; it can choose
-another harness. Pi uses its integrated RPC adapter; OpenCode and Antigravity
-use their ACP adapters. Muse Code uses its interactive session protocol and
-requires one-run workspace trust from the user. Generic ACP returns an
-actionable adapter-not-integrated step result.
+another harness. Pi uses its integrated RPC adapter; Antigravity, named ACP
+profiles and OpenCode use their ACP adapters. Muse Code uses its interactive
+session protocol and requires one-run workspace trust from the user. ACP
+requires a valid acp_agent.
 
 CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
 on Unix (the direct child on Windows). The last launch check is serialized
@@ -7179,10 +7196,10 @@ sets persisted allow_external_context (default false); opting in permits all
 non-deleted conversations. List/read/search share this scope. Search is a
 case-insensitive substring match returning at most 40 bounded snippets.
 
-The wire also includes ACP (`acp`) and Muse (`muse`), without integrated adapters
-in Phase A. `acp_agent` is required, nonempty and present only for ACP; selectors
-are otherwise opaque until adapter integration. It is retained in advisory
-steps and attempt metadata.
+The wire also includes ACP (acp) and Muse (muse). ACP dispatches through the
+registered named-agent adapter and requires acp_agent to be nonempty and
+present only for ACP; selectors are validated against the registry and retained
+in advisory steps and attempt metadata.
 
 Harness questions reuse UserQuestion, AnswerQuestion and UserQuestionClosed on
 the canonical attempt conversation. Topic MCP AskUser and InteractionHandler
@@ -7309,43 +7326,72 @@ rejected. Raising increments the hit cap by its default (3 or 20, saturating)
 and returns the topic to Running; Stop leaves NeedsUser. Neither answer starts
 a model or harness automatically. SetTopicLimits itself changes limits only.
 
-ListHarnesses refreshes CLI harnesses concurrently. Every probe is capped at
+ListHarnesses refreshes all seven kinds concurrently, expanding ACP into one
+entry per ACP registry id with acp_agent set. Every probe is capped at
 10s overall (ProbeContext defaults to 10s); a timeout reports unknown auth with
-detail "probe timed out". A harness is ready iff installed and signed_in is
-not Some(false): unknown auth is ready. Planning receives fresh availability,
+detail "probe timed out". Legacy non-ACP readiness requires installed and
+signed_in is not Some(false). ACP requires signed_in=true and a resolved
+executable; unknown ACP authentication is unavailable. Cursor, Cline, Junie,
+Auggie, and Devin remain unavailable because Formless has not integrated a
+supported non-model sign-in readiness check for them, even if session/new
+succeeds. Signing in alone does not
+unblock them. Planning receives fresh availability,
 and each step refreshes its selected harness before launching. Claude uses
 --version and auth status; Codex uses --version and login status. Muse Code
 checks its version before using usage --json and only confirms sign-in when
 it receives a Meta account allowance. These probes do not send model turns
 or copy raw auth output into detail or logs.
 
-Readiness resolves the CLI from absolute `FORMLESS_TOPIC_<KIND>_EXE` overrides
-or the kind's command on PATH. This includes `FORMLESS_TOPIC_OPENCODE_EXE` for
-its version probe, along with `FORMLESS_TOPIC_PI_EXE`,
-`FORMLESS_TOPIC_MUSE_EXE`, and `FORMLESS_TOPIC_ANTIGRAVITY_EXE` overrides.
-Pi has adapter-specific availability and an attempt-private RPC runner. OpenCode
-has an availability probe that runs `--version` in a private cwd under the
-probe deadline, with kill-on-drop and process-group cleanup; its auth remains
-unknown, including version failures. Antigravity uses a bounded adapter-specific
-probe: ACP initialization checks installation/version and `agy models` checks
-existing sign-in. Topic steps carry the selected executable identity from
-readiness through launch and fail closed if it is unavailable. Generic ACP
-reports lookup-only availability and preserves its configured agent. Adapter
-owners can replace fallbacks with async probes or the bounded spawn_blocking
-probe hook. The reusable ACP
-probe initializes and creates a session with no MCP servers in a private
-temporary cwd, never prompts, maps configured auth errors, and kills its
-process group on success, failure or timeout.
+Readiness resolves absolute `FORMLESS_TOPIC_<KIND>_EXE` overrides or each
+kind's command on PATH. This includes `FORMLESS_TOPIC_OPENCODE_EXE`,
+`FORMLESS_TOPIC_PI_EXE`, `FORMLESS_TOPIC_MUSE_EXE`, and
+`FORMLESS_TOPIC_ANTIGRAVITY_EXE`. Pi has adapter-specific availability and an
+attempt-private RPC runner. OpenCode has a bounded `--version` probe in a
+private cwd with kill-on-drop and process-group cleanup; it requires V2 >= 2.3.2
+and leaves credential status unknown because checking auth initializes
+providers and makes network requests. Muse Code checks its version before
+`usage --json` and only confirms sign-in when it receives a Meta account
+allowance. Antigravity uses a bounded adapter-specific probe: ACP initialization
+checks installation/version and `agy models` checks existing sign-in. Topic
+steps carry the selected Antigravity executable identity from readiness through
+launch and fail closed if it is unavailable.
 
-Antigravity readiness resolves `agy`, verifies ACP v1 and the minimum supported
-version, then runs `agy models` to determine sign-in. An explicit sign-in prompt
-means not signed in; inconclusive failures remain unknown.
-Adapter blocking probes must enforce their own internal deadline and kill
-child processes on drop: core's outer timeout cannot abort spawn_blocking.
-Core does not own the ACP agent registry and omits the bare ACP entry from
-ListHarnesses; the ACP adapter's registry supplies per-agent entries.
-The per-kind probe dispatch receives the selected acp_agent id, including
-for its current executable-only fallback. ACP is a protocol, not a CLI.
+ACP applies `FORMLESS_TOPIC_ACP_EXE` to each named-agent preparation; otherwise
+the agent's command is resolved from the daemon's PATH. Readiness canonicalizes
+the selected absolute path and probes that path on a bounded blocking worker,
+including initialize version (`agentInfo.version`, then
+`_meta.agentVersion`) and `session/new` sign-in checks. It retains the
+pre-canonical selected absolute path as `executable_argv0` alongside the
+canonical executable. Each topic step carries both internally; public
+`HarnessAvailability` and ListHarnesses shapes remain unchanged. The topic
+launch executes the canonical path with the retained invocation path as argv0
+on Unix, without rereading PATH or the ACP override and without executing the
+symlink path. Workspace-local PATH entries therefore cannot substitute a
+different ACP executable. If preparation does not produce an executable
+identity, the step stops before attempt launch with the existing
+retry/substitute guidance. Unknown ACP authentication is unavailable. If the selected path
+disappears before spawn, launch fails without a PATH fallback. Resolution is
+fresh after each retry or approved substitute; this pins path selection, not
+executable contents.
+
+The shared ACP spawn also anchors relative and empty child `PATH` entries to
+the daemon's working directory before setting the topic workspace as cwd. This
+applies to named ACP agents, OpenCode, and Antigravity. Workspace-local `./bin`
+is not implicitly searched for child tools or shebang interpreters, so
+workflows relying on workspace-relative `PATH` entries may resolve differently.
+
+The reusable ACP probe initializes and creates a session with no MCP servers in
+a private temporary cwd, never prompts, maps configured auth errors, and kills
+its process group on success, failure or timeout. ACP's inner probe deadline is
+eight seconds; the blocking worker is bounded at ten seconds. Antigravity
+readiness resolves `agy`, verifies ACP v1 and the minimum supported version,
+then runs `agy models` to determine sign-in. An explicit sign-in prompt means
+not signed in; inconclusive failures remain unknown. Adapter blocking probes
+must enforce their own internal deadline and kill child processes on drop:
+core's outer timeout cannot abort spawn_blocking. Core does not own the ACP
+agent registry and omits the bare ACP entry from ListHarnesses; the ACP
+adapter's registry supplies per-agent entries. The per-kind probe dispatch
+receives the selected acp_agent id.
 
 topic_request_harness_substitute raises a user_only question with "Sign in and
 retry", "Use <substitute>", and "Skip step". Model answers are rejected.

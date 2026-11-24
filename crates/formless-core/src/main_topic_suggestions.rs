@@ -19,6 +19,7 @@ const POLICY: &str = r#"Topic suggestions:
 Answer everyday chat, questions and brainstorming normally. For an explicit request to do work that belongs in a topic (such as changes in a named repo or a new accounting flow), use read_topic_context to get the persisted source user message IDs, topic tree and local working directory, then propose_topic rather than starting the proposed work. In a Topic Chat, continue the current topic's work normally; propose a child or another topic only for distinct work. Choose the closest existing topic that is neither pending approval nor rejected as parent when the request clearly belongs there. Otherwise omit the parent: from a Topic Chat this defaults to the current topic, and from Main the proposal sits directly under Main.
 One user message can request multiple independent work items: put each in its own feature request linked to the same original message ID. Do not create synthetic messages. Include a workspace only when the user names one or a known repo applies; otherwise omit it to use scratch space. The working directory is a hint, not a workspace choice by itself. Use an outline only from the user's stated or standing preferences; otherwise leave it empty. Keep workflow steps within the leaf topic instead of treating steps as child topics. Any supported harness can take any step, including using the same harness for multiple steps. The outline is advisory; the Formless model orchestrating the Topic Chat makes the final decisions.
 In a Topic Chat, answer a harness question only when it is not user-only and you can cite a specific user request or decision as the basis. Bring all other harness questions and permission requests to the user; never grant or deny harness permissions yourself. Approval, rejection, cancellation, permission rules, topic limits and external context access are user decisions, never assistant tool actions. Do not automatically re-propose cancelled or declined work. A proposal is pending only: the user must explicitly approve in the client's consent UI. A yes in chat is not approval to move messages, start work, run a harness, or use other tools to do the proposed work."#;
+const ACP_READINESS_POLICY: &str = "ACP outline choices do not establish execution readiness. An ACP profile is executable only when installed and signed_in=true; unknown or false signed-in status is unavailable for execution. Do not claim readiness from registration or session creation alone. This planning context may not contain fresh readiness; the Topic Chat checks it before launch. If a requested profile is unavailable, explain the limitation and obtain explicit user approval before using a supported substitute. This ACP-specific rule does not change readiness policy for non-ACP harnesses.";
 
 pub(crate) enum SuggestionSource {
     Main,
@@ -34,10 +35,41 @@ pub(crate) fn system_prompt<'a>(
     session_id: &str,
     prompt: &'a str,
 ) -> Result<Cow<'a, str>> {
-    if store.topic_suggestion_source(session_id)?.is_some() && !prompt.contains(POLICY) {
-        Ok(Cow::Owned(format!("{prompt}\n\n{POLICY}")))
+    if store.topic_suggestion_source(session_id)?.is_some()
+        && (!prompt.contains(POLICY) || !prompt.contains(ACP_READINESS_POLICY))
+    {
+        Ok(Cow::Owned(topic_suggestion_prompt(prompt)))
     } else {
         Ok(Cow::Borrowed(prompt))
+    }
+}
+
+fn topic_suggestion_prompt(prompt: &str) -> String {
+    let mut result = prompt.to_owned();
+    if !result.contains(POLICY) {
+        result.push_str("\n\n");
+        result.push_str(POLICY);
+    }
+    if !result.contains(ACP_READINESS_POLICY) {
+        result.push('\n');
+        result.push_str(ACP_READINESS_POLICY);
+    }
+    result
+}
+
+#[cfg(test)]
+mod acp_readiness_policy_tests {
+    use super::{topic_suggestion_prompt, ACP_READINESS_POLICY, POLICY};
+
+    #[test]
+    fn initial_topic_planning_does_not_assume_acp_readiness() {
+        let prompt = topic_suggestion_prompt("Main chat planning");
+        assert!(prompt.contains("Any supported harness can take any step"));
+        assert!(prompt.contains("unknown or false signed-in status is unavailable for execution"));
+        assert!(prompt.contains("explicit user approval"));
+        assert!(prompt.contains("does not change readiness policy for non-ACP harnesses"));
+        let prompt_with_existing_policy = topic_suggestion_prompt(POLICY);
+        assert!(prompt_with_existing_policy.contains(ACP_READINESS_POLICY));
     }
 }
 

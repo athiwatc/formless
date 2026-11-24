@@ -1,0 +1,924 @@
+{
+  "gemini": {
+    "initialize": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "authMethods": [
+          {
+            "id": "oauth-personal",
+            "name": "Log in with Google",
+            "description": "Log in with your Google account"
+          },
+          {
+            "id": "gemini-api-key",
+            "name": "Gemini API key",
+            "description": "Use an API key with Gemini Developer API",
+            "_meta": {
+              "api-key": {
+                "provider": "google"
+              }
+            }
+          },
+          {
+            "id": "vertex-ai",
+            "name": "Vertex AI",
+            "description": "Use an API key with Vertex AI GenAI API"
+          },
+          {
+            "id": "gateway",
+            "name": "AI API Gateway",
+            "description": "Use a custom AI API Gateway",
+            "_meta": {
+              "gateway": {
+                "protocol": "google",
+                "restartRequired": "false"
+              }
+            }
+          }
+        ],
+        "agentInfo": {
+          "name": "gemini-cli",
+          "title": "Gemini CLI",
+          "version": "0.70.0"
+        },
+        "agentCapabilities": {
+          "loadSession": true,
+          "promptCapabilities": {
+            "image": true,
+            "audio": true,
+            "embeddedContext": true
+          },
+          "mcpCapabilities": {
+            "http": true,
+            "sse": true
+          }
+        }
+      }
+    },
+    "session_new": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "error": {
+        "code": -32000,
+        "message": "Gemini API key is missing or not configured."
+      }
+    }
+  },
+  "copilot": {
+    "initialize": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "auth": {
+            "logout": {}
+          },
+          "loadSession": true,
+          "mcpCapabilities": {
+            "http": true,
+            "sse": true
+          },
+          "promptCapabilities": {
+            "image": true,
+            "audio": false,
+            "embeddedContext": true
+          },
+          "sessionCapabilities": {
+            "close": {},
+            "list": {}
+          }
+        },
+        "agentInfo": {
+          "name": "Copilot",
+          "title": "Copilot",
+          "version": "1.0.114"
+        },
+        "authMethods": [
+          {
+            "id": "copilot-login",
+            "name": "Log in with Copilot CLI",
+            "description": "Run `copilot login` in the terminal",
+            "_meta": {
+              "terminal-auth": {
+                "command": "/home/ubuntu/acp-smoke/npm-copilot/node_modules/@github/copilot-linux-x64/copilot",
+                "args": [
+                  "login"
+                ],
+                "label": "Copilot Login"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "session_new": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "error": {
+        "code": -32000,
+        "message": "Authentication required"
+      }
+    }
+  },
+  "cursor": {
+    "initialize": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "loadSession": true,
+          "mcpCapabilities": {
+            "http": true,
+            "sse": true
+          },
+          "promptCapabilities": {
+            "audio": false,
+            "embeddedContext": false,
+            "image": true
+          },
+          "sessionCapabilities": {
+            "list": {}
+          }
+        },
+        "authMethods": [
+          {
+            "id": "cursor_login",
+            "name": "Cursor Login",
+            "description": "Authenticate using existing Cursor login credentials. Run 'agent login' first if not logged in."
+          }
+        ]
+      }
+    },
+    "session_new": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "error": {
+        "code": -32000,
+        "message": "Authentication required",
+        "data": {
+          "message": "Authentication required. Please run 'agent login' first, then call authenticate() with methodId 'cursor_login'."
+        }
+      }
+    }
+  },
+  "droid": {
+    "initialize": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "loadSession": true,
+          "sessionCapabilities": {
+            "list": {},
+            "resume": {},
+            "close": {},
+            "fork": {}
+          },
+          "promptCapabilities": {
+            "image": true,
+            "embeddedContext": true
+          },
+          "mcpCapabilities": {
+            "http": true,
+            "sse": true
+          },
+          "auth": {
+            "logout": {},
+            "status": {}
+          },
+          "_meta": {
+            "terminal-auth": true,
+            "factory": {
+              "modelsList": true,
+              "promptWhileRunning": true,
+              "messageRetraction": true
+            }
+          }
+        },
+        "agentInfo": {
+          "name": "@factory/cli",
+          "title": "Factory Droid",
+          "version": "1.17.1"
+        },
+        "authMethods": [
+          {
+            "id": "device-pairing",
+            "name": "Login",
+            "description": "Authenticate with Factory using a device pairing code in your browser."
+          },
+          {
+            "id": "factory-api-key",
+            "name": "Factory API Key",
+            "description": "Authenticate using a Factory API key set in the FACTORY_API_KEY environment variable."
+          }
+        ]
+      }
+    },
+    "session_new": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "error": {
+        "code": -32000,
+        "message": "Authentication required: \n\nYour code: [redacted device code]\n\nClick the \"Login\" button to authenticate, or set a FACTORY_API_KEY environment variable."
+      }
+    }
+  },
+  "kiro": {
+    "initialize": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "loadSession": false,
+          "promptCapabilities": {
+            "image": false,
+            "audio": false,
+            "embeddedContext": false
+          },
+          "mcpCapabilities": {
+            "http": false,
+            "sse": false
+          },
+          "sessionCapabilities": {},
+          "auth": {}
+        },
+        "authMethods": [
+          {
+            "id": "kiro-login",
+            "name": "Kiro Login",
+            "description": "Run 'kiro-cli login' in a terminal, then reconnect to this agent. See https://kiro.dev/docs/cli/authentication/"
+          }
+        ],
+        "agentInfo": {
+          "name": "Kiro CLI Agent",
+          "title": "Kiro CLI Agent",
+          "version": "3.5.0"
+        }
+      }
+    },
+    "session_new": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "error": {
+        "code": -32000,
+        "message": "Authentication required. Not logged in. Set the KIRO_API_KEY environment variable or run `kiro-cli login` first. Then reconnect to start the Kiro agent."
+      }
+    }
+  },
+  "junie": {
+    "initialize": {
+      "type": "com.agentclientprotocol.rpc.JsonRpcResponse",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "loadSession": true,
+          "promptCapabilities": {
+            "audio": false,
+            "image": true,
+            "embeddedContext": true
+          },
+          "mcpCapabilities": {
+            "http": true,
+            "sse": true
+          },
+          "sessionCapabilities": {
+            "fork": {},
+            "list": {},
+            "resume": {},
+            "close": {},
+            "additionalDirectories": {}
+          },
+          "auth": {
+            "logout": {}
+          },
+          "providers": {}
+        },
+        "authMethods": [
+          {
+            "type": "agent",
+            "id": "jetbrains-account",
+            "name": "Junie Account",
+            "description": "Log in via Junie Account in a browser."
+          }
+        ],
+        "agentInfo": {
+          "name": "@jetbrains/junie",
+          "version": "26.9.7 (3110.7)",
+          "title": "Junie"
+        },
+        "_meta": {
+          "requiredPlugins": [
+            {
+              "pluginId": "org.jetbrains.junie",
+              "displayName": "Junie",
+              "channel": "stable",
+              "version": "261.1218.96",
+              "comment": "Required for IDE integration"
+            }
+          ],
+          "steering": {
+            "supported": true
+          },
+          "jetbrains": {
+            "air": {
+              "version": 1,
+              "capabilities": [
+                "nativeSubagentSessions"
+              ]
+            }
+          }
+        }
+      },
+      "jsonrpc": "2.0"
+    },
+    "session_new": {
+      "type": "com.agentclientprotocol.rpc.JsonRpcResponse",
+      "id": 2,
+      "result": {
+        "sessionId": "session-261121-163712-1sp5",
+        "configOptions": [
+          {
+            "type": "select",
+            "id": "mode",
+            "name": "Mode",
+            "description": "How Junie approaches your request: Default: Junie plans and implements as needed; Plan: Junie prepares a plan and waits for your approval before implementing",
+            "currentValue": "default",
+            "options": [
+              {
+                "value": "default",
+                "name": "Default",
+                "description": "Junie plans and implements as needed"
+              },
+              {
+                "value": "plan",
+                "name": "Plan",
+                "description": "Junie prepares a plan and waits for your approval before implementing"
+              }
+            ]
+          },
+          {
+            "type": "select",
+            "id": "brave_mode",
+            "name": "Brave Mode",
+            "description": "How Junie asks before running commands: Off asks for everything, Auto auto-approves safe commands and asks for the rest, On runs everything without asking",
+            "category": "mode",
+            "currentValue": "brave-auto",
+            "options": [
+              {
+                "value": "brave-auto",
+                "name": "Brave auto"
+              },
+              {
+                "value": "on",
+                "name": "Brave on"
+              },
+              {
+                "value": "off",
+                "name": "Brave off"
+              }
+            ]
+          }
+        ]
+      },
+      "jsonrpc": "2.0"
+    }
+  },
+  "qwen": {
+    "initialize": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "agentInfo": {
+          "name": "qwen-code",
+          "title": "Qwen Code",
+          "version": "0.28.3"
+        },
+        "authMethods": [
+          {
+            "id": "openai",
+            "name": "Use OpenAI API key",
+            "description": "Requires setting the `OPENAI_API_KEY` environment variable",
+            "_meta": {
+              "type": "terminal",
+              "args": [
+                "--auth-type=openai"
+              ]
+            }
+          }
+        ],
+        "agentCapabilities": {
+          "loadSession": true,
+          "promptCapabilities": {
+            "image": true,
+            "audio": true,
+            "embeddedContext": true
+          },
+          "sessionCapabilities": {
+            "list": {},
+            "resume": {}
+          },
+          "mcpCapabilities": {
+            "sse": true,
+            "http": true
+          },
+          "_meta": {
+            "imageCapability": {
+              "autoHandlesWrongModel": true,
+              "maxBytes": 10380902,
+              "maxImagesPerTurn": 4
+            }
+          }
+        }
+      }
+    },
+    "session_new": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "error": {
+        "code": -32000,
+        "message": "Authentication required: Use /auth to sign in or configure a model first.",
+        "data": {
+          "authMethods": [
+            {
+              "id": "openai",
+              "name": "Use OpenAI API key",
+              "description": "Requires setting the `OPENAI_API_KEY` environment variable",
+              "_meta": {
+                "type": "terminal",
+                "args": [
+                  "--auth-type=openai"
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "kimi": {
+    "initialize": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "loadSession": true,
+          "promptCapabilities": {
+            "image": true,
+            "audio": false,
+            "embeddedContext": true
+          },
+          "sessionCapabilities": {
+            "list": {},
+            "resume": {},
+            "close": {},
+            "delete": {},
+            "fork": {},
+            "additionalDirectories": {}
+          },
+          "mcpCapabilities": {
+            "http": true,
+            "sse": true
+          },
+          "auth": {
+            "logout": {}
+          }
+        },
+        "authMethods": [
+          {
+            "id": "login",
+            "type": "terminal",
+            "name": "Login with Kimi account",
+            "description": "Open the device-code login flow in a terminal.",
+            "args": [
+              "--login"
+            ],
+            "env": {},
+            "_meta": {
+              "terminal-auth": {
+                "type": "terminal",
+                "label": "Login with Kimi account",
+                "command": "/home/ubuntu/acp-smoke/npm-kimi/node_modules/.bin/kimi",
+                "args": [
+                  "login"
+                ],
+                "env": {}
+              }
+            }
+          }
+        ],
+        "agentInfo": {
+          "name": "Kimi Code CLI",
+          "version": "2.7.2"
+        }
+      }
+    },
+    "session_new": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "error": {
+        "code": -32000,
+        "message": "Authentication required"
+      }
+    }
+  },
+  "vibe": {
+    "initialize": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "loadSession": true,
+          "promptCapabilities": {
+            "image": true,
+            "audio": false,
+            "embeddedContext": true
+          },
+          "sessionCapabilities": {
+            "list": {},
+            "fork": {},
+            "close": {}
+          }
+        },
+        "authMethods": [
+          {
+            "id": "browser-auth",
+            "name": "Sign in through Mistral AI Studio",
+            "description": "Sign into Mistral Vibe through your Mistral AI Studio account."
+          }
+        ],
+        "agentInfo": {
+          "name": "@mistralai/mistral-vibe",
+          "title": "Mistral Vibe",
+          "version": "3.1.4"
+        }
+      }
+    },
+    "session_new": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "error": {
+        "code": -32000,
+        "message": "Missing API key for mistral provider.",
+        "data": null
+      }
+    }
+  },
+  "auggie": {
+    "initialize": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "loadSession": true,
+          "promptCapabilities": {
+            "image": true
+          },
+          "sessionCapabilities": {
+            "resume": {},
+            "close": {},
+            "list": {},
+            "additionalDirectories": {}
+          }
+        },
+        "agentInfo": {
+          "name": "auggie",
+          "title": "Auggie Coding Agent",
+          "version": "1.2.2"
+        }
+      }
+    },
+    "session_new": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "result": {
+        "sessionId": "3b720aee-d9b2-4f23-9f8a-9279478a0d93",
+        "configOptions": [
+          {
+            "type": "select",
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "currentValue": "unknown/unknown",
+            "options": []
+          }
+        ]
+      }
+    }
+  },
+  "goose": {
+    "initialize": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "loadSession": true,
+          "promptCapabilities": {
+            "image": true,
+            "audio": false,
+            "embeddedContext": true
+          },
+          "mcpCapabilities": {
+            "http": true,
+            "sse": false
+          },
+          "sessionCapabilities": {
+            "list": {},
+            "delete": {},
+            "close": {}
+          },
+          "auth": {},
+          "_meta": {
+            "goose": {
+              "recipeParameterScopes": {},
+              "localInference": {}
+            }
+          }
+        },
+        "authMethods": [
+          {
+            "id": "goose-provider",
+            "name": "Configure Provider",
+            "description": "Run `goose configure` to set up your AI provider and API key"
+          }
+        ],
+        "agentInfo": {
+          "name": "goose",
+          "version": "1.60.2"
+        }
+      }
+    },
+    "session_new": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "error": {
+        "code": -32603,
+        "message": "Internal error",
+        "data": "Failed to resolve provider and model: Configuration value not found: GOOSE_PROVIDER"
+      }
+    }
+  },
+  "cline": {
+    "initialize": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "loadSession": true,
+          "promptCapabilities": {
+            "image": true,
+            "audio": false,
+            "embeddedContext": false
+          }
+        },
+        "agentInfo": {
+          "name": "cline",
+          "version": "3.0.75"
+        },
+        "authMethods": [
+          {
+            "id": "cline",
+            "name": "Sign in with Cline"
+          },
+          {
+            "id": "cline-pass",
+            "name": "Sign in with ClinePass"
+          },
+          {
+            "id": "openai-codex",
+            "name": "Sign in with ChatGPT Subscription"
+          }
+        ]
+      }
+    },
+    "session_new": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "error": {
+        "code": -32000,
+        "message": "Authentication required: Call authenticate before starting a session"
+      }
+    }
+  },
+  "devin": {
+    "initialize": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "loadSession": true,
+          "promptCapabilities": {
+            "image": true,
+            "audio": false,
+            "embeddedContext": true,
+            "_meta": {
+              "cognition.ai/untrustedPageContent": true
+            }
+          },
+          "mcpCapabilities": {
+            "http": true,
+            "sse": true
+          },
+          "sessionCapabilities": {
+            "list": {},
+            "delete": {},
+            "additionalDirectories": {},
+            "close": {
+              "_meta": {
+                "cognition.ai/force": true
+              }
+            }
+          },
+          "auth": {},
+          "_meta": {
+            "cognition.ai/sessionDefaultConfigOptions": true,
+            "cognition.ai/multiRootWorkspace": true,
+            "cognition.ai/sessionListContentSearch": true,
+            "cognition.ai/sessionListOrderBy": [
+              "updated_at",
+              "created_at"
+            ],
+            "cognition.ai/sessionListSortDirection": true,
+            "cognition.ai/sessionRename": true,
+            "cognition.ai/persistOnCreate": true,
+            "cognition.ai/sessionShare": true,
+            "cognition.ai/documentLifecycle": true,
+            "cognition.ai/userEdits": true,
+            "cognition.ai/pickup": true,
+            "cognition.ai/terminalLifecycle": true,
+            "cognition.ai/userConfig": true,
+            "cognition.ai/userShellCommand": true,
+            "cognition.ai/editableCommands": true,
+            "cognition.ai/commandRevision": true,
+            "cognition.ai/chains": true,
+            "cognition.ai/megaplan": true,
+            "cognition.ai/ruleMentions": true,
+            "cognition.ai/mentionTypes": [
+              {
+                "type": "file"
+              },
+              {
+                "type": "directory"
+              },
+              {
+                "type": "git"
+              },
+              {
+                "type": "rule",
+                "icon": "book",
+                "label": "Rules"
+              },
+              {
+                "type": "skill",
+                "icon": "zap",
+                "label": "Skills"
+              },
+              {
+                "type": "plan",
+                "icon": "file-text",
+                "label": "Plans"
+              },
+              {
+                "type": "conversation"
+              },
+              {
+                "type": "terminal"
+              },
+              {
+                "type": "codemap",
+                "icon": "map",
+                "label": "Codemaps"
+              }
+            ],
+            "cognition.ai/midTurnPrompts": true
+          }
+        },
+        "authMethods": [
+          {
+            "id": "devin-browser",
+            "name": "Log in with browser",
+            "description": "Sign in via your browser"
+          }
+        ],
+        "agentInfo": {
+          "name": "affogato",
+          "title": "Devin Agent",
+          "version": "3000.14.30821"
+        },
+        "_meta": {
+          "mcpConfigPath": "/home/ubuntu/acp-smoke/home-devin/.config/devin/mcp_config.json"
+        }
+      }
+    },
+    "session_new": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "result": {
+        "sessionId": "cheerful-zinnia",
+        "modes": {
+          "currentModeId": "accept-edits",
+          "availableModes": [
+            {
+              "id": "accept-edits",
+              "name": "Code"
+            },
+            {
+              "id": "smart",
+              "name": "Smart"
+            },
+            {
+              "id": "ask",
+              "name": "Ask"
+            },
+            {
+              "id": "plan",
+              "name": "Plan"
+            },
+            {
+              "id": "bypass",
+              "name": "Bypass Permissions"
+            }
+          ]
+        },
+        "configOptions": [
+          {
+            "id": "mode",
+            "name": "Session Mode",
+            "category": "mode",
+            "type": "select",
+            "currentValue": "accept-edits",
+            "options": [
+              {
+                "value": "accept-edits",
+                "name": "Code",
+                "description": "Write and edit code",
+                "_meta": {
+                  "cognition.ai/icon": "code"
+                }
+              },
+              {
+                "value": "smart",
+                "name": "Smart",
+                "description": "Auto-approve actions the model judges safe",
+                "_meta": {
+                  "cognition.ai/icon": "sparkles"
+                }
+              },
+              {
+                "value": "ask",
+                "name": "Ask",
+                "description": "Answer questions without code changes",
+                "_meta": {
+                  "cognition.ai/icon": "message-circle"
+                }
+              },
+              {
+                "value": "plan",
+                "name": "Plan",
+                "description": "Plan changes before implementing",
+                "_meta": {
+                  "cognition.ai/icon": "file-text"
+                }
+              },
+              {
+                "value": "bypass",
+                "name": "Bypass Permissions",
+                "description": "Auto-approve all tool calls unless your organization's policy requires approval",
+                "_meta": {
+                  "cognition.ai/icon": "shield-off"
+                }
+              }
+            ]
+          },
+          {
+            "id": "model",
+            "name": "Model",
+            "description": "AI model to use",
+            "category": "model",
+            "type": "select",
+            "currentValue": "swe-1-6-fast",
+            "options": []
+          }
+        ],
+        "_meta": {
+          "cognition.ai/planFilePath": "/home/ubuntu/acp-smoke/home-devin/.devin/plans/plan-05e4047c5ba06ac7.md",
+          "cognition.ai/isLocked": false,
+          "cognition.ai/lockHolderPid": null
+        }
+      }
+    }
+  }
+}
