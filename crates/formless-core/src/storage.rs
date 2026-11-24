@@ -2694,14 +2694,22 @@ impl Store {
         if msg.role != "user" {
             return Ok(None);
         }
+        let replacement_meta = msg.meta.as_deref().and_then(|metadata| {
+            let mut meta = serde_json::from_str::<Value>(metadata).ok()?;
+            let removed = meta.as_object_mut()?.remove("steer").is_some();
+            removed.then(|| meta.to_string())
+        });
+        if let Some(metadata) = replacement_meta {
+            msg.meta = Some(metadata);
+        }
         self.note_rewrite();
         // One edit is one commit: four separate ones cost four fsyncs (or
         // four WAL commits) for a single user action.
         self.transaction(|st| {
             let tx = &st.conn;
             tx.execute(
-                "UPDATE messages SET content=?3 WHERE session_id=?1 AND id=?2",
-                params![session_id, message_id, content],
+                "UPDATE messages SET content=?3, meta=?4 WHERE session_id=?1 AND id=?2",
+                params![session_id, message_id, content, msg.meta.as_deref()],
             )?;
             tx.execute(
                 "DELETE FROM messages WHERE session_id=?1 AND seq>?2",
@@ -9256,6 +9264,46 @@ mod context_watermark_tests {
         assert_eq!(resumed_meta["steer"]["context_included"], true);
         assert_eq!(unrelated_meta["steer"]["run_id"], "unrelated-run");
         assert_eq!(unrelated_meta["steer"]["context_included"], Value::Null);
+    }
+
+    #[test]
+    fn editing_steered_message_clears_provenance_and_rebuilds_context_candidates() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        let message = store
+            .append_message_meta(
+                &session,
+                "user",
+                "original steered content",
+                Some(
+                    json!({
+                        "review_context":{"path":"fixture.rs"},
+                        "steer":{"run_id":"run","step":2,"context_included":true}
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+        let mut cache = ContextCache::default();
+        cache
+            .build(&store, &session, "private prompt", 100_000, 0.8)
+            .unwrap();
+        assert_eq!(cache.included_user_message_ids(), &[message.id.clone()]);
+        assert_eq!(cache.included_steer_message_ids(), &[message.id.clone()]);
+
+        let edited = store
+            .edit_message(&session, &message.id, "replacement content")
+            .unwrap()
+            .unwrap();
+        let meta: Value = serde_json::from_str(edited.meta.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["review_context"]["path"], "fixture.rs");
+        assert!(meta.get("steer").is_none());
+
+        cache
+            .build(&store, &session, "private prompt", 100_000, 0.8)
+            .unwrap();
+        assert_eq!(cache.included_user_message_ids(), &[message.id]);
+        assert!(cache.included_steer_message_ids().is_empty());
     }
 }
 
