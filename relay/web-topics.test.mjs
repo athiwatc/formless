@@ -371,13 +371,26 @@ test('readiness never equates an installed executable with verified sign-in', as
   const calls = []; let options;
   const c = setup(['showHarnessStatus', 'harnessAvailabilityLabel', 'harnessLabel'], { h: element, request: async req => { calls.push(json(req)); return [
     { kind: 'claude', installed: false }, { kind: 'codex', installed: true, signed_in: false },
-    { kind: 'muse', installed: true, signed_in: null }, { kind: 'acp', acp_agent: 'local', installed: true, signed_in: true }]; },
+    { kind: 'muse', installed: true, signed_in: null }, { kind: 'acp', acp_agent: 'gemini', installed: true, signed_in: true },
+    { kind: 'acp', acp_agent: 'cursor', installed: true, signed_in: false },
+    { kind: 'acp', acp_agent: 'cline', installed: true, signed_in: null },
+    { kind: 'acp', acp_agent: 'junie', installed: false, signed_in: null }]; },
     ask: async opts => { options = opts; } });
   await c.showHarnessStatus();
   assert.deepEqual(calls, [{ type: 'list_harnesses' }]);
   const text = JSON.stringify(options.body);
   assert.match(text, /Not installed/); assert.match(text, /sign in required/);
-  assert.match(text, /sign-in status unknown/); assert.match(text, /signed in/);
+  assert.match(text, /sign-in status unknown/); assert.match(text, /Installed · ready/);
+  assert.match(text, /Installed · unavailable for execution; sign-in required/);
+  assert.match(text, /Installed · unavailable for execution; sign-in readiness cannot be verified/);
+  assert.match(text, /Not installed · unavailable for execution/);
+  assert.equal(c.harnessAvailabilityLabel({ kind: 'acp', installed: true, signed_in: false }),
+    'Installed · unavailable for execution; sign-in required');
+  assert.equal(c.harnessAvailabilityLabel({ kind: 'acp', installed: true, signed_in: null }),
+    'Installed · unavailable for execution; sign-in readiness cannot be verified');
+  assert.equal(c.harnessAvailabilityLabel({ kind: 'acp', installed: true, signed_in: true }), 'Installed · ready');
+  assert.equal(c.harnessAvailabilityLabel({ kind: 'muse', installed: true, signed_in: false }), 'Installed · sign in required');
+  assert.equal(c.harnessAvailabilityLabel({ kind: 'muse', installed: true, signed_in: null }), 'Installed · sign-in status unknown');
   c.request = async () => { throw new Error('topic control request is not implemented yet'); };
   let error; c.toast = message => { error = message; };
   await c.showHarnessStatus(); assert.match(error, /not implemented/);

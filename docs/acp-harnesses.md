@@ -167,8 +167,15 @@ If preparation cannot return an executable identity, including on timeout or
 worker error, the step stops before launch with the existing retry/substitute
 guidance. If the selected path disappears before spawn, launch fails without
 fallback. Each retry or approved substitute gets fresh preparation. Unknown
-authentication remains ready only when installed and `signed_in` is not
-`Some(false)`. This pins path selection, not executable contents.
+ACP authentication is unavailable for execution; only installed profiles with
+`signed_in=true` are launchable. This pins path selection, not executable
+contents.
+
+The shared ACP spawn anchors relative and empty child `PATH` entries to the
+daemon's working directory before entering the topic workspace. This applies to
+named ACP agents, OpenCode, and Antigravity. A workspace-local `./bin` is not
+implicitly searched for tools or shebang interpreters, so workflows relying on
+workspace-relative `PATH` entries may resolve differently.
 
 ## Installation observations
 

@@ -18,10 +18,11 @@ use std::{
 
 const CAPABILITY: &str = local_harness::TOPIC_CAPABILITY_ENV;
 pub(crate) const ACP_PLANNER_READINESS: &str = "For ACP, only installed profiles with signed_in=true are executable; signed_in=null or false is unavailable. Cursor, Cline, Junie, Auggie, and Devin are unavailable because Formless has not integrated a supported non-model sign-in check for them. Signing in alone will not unblock them. Explain this limitation and request the user's explicit approval through topic_request_harness_substitute before using a supported substitute. For explicit sign-in errors on supported profiles, direct the user to sign in and retry.";
+pub(crate) const NON_ACP_PLANNER_READINESS: &str = "For non-ACP harnesses only, preserve legacy readiness: installed=true and signed_in!=false; signed_in=null remains eligible. Do not apply this legacy rule to ACP.";
 
 #[cfg(test)]
 mod planner_readiness_tests {
-    use super::ACP_PLANNER_READINESS;
+    use super::{ACP_PLANNER_READINESS, NON_ACP_PLANNER_READINESS};
 
     #[test]
     fn unverified_profiles_are_never_advertised_as_ready() {
@@ -30,6 +31,14 @@ mod planner_readiness_tests {
         }
         assert!(ACP_PLANNER_READINESS.contains("Signing in alone will not unblock"));
         assert!(ACP_PLANNER_READINESS.contains("explicit approval"));
+    }
+
+    #[test]
+    fn topic_kickoff_preserves_non_acp_legacy_readiness_separately() {
+        assert!(NON_ACP_PLANNER_READINESS.contains("installed=true"));
+        assert!(NON_ACP_PLANNER_READINESS.contains("signed_in!=false"));
+        assert!(NON_ACP_PLANNER_READINESS.contains("signed_in=null remains eligible"));
+        assert!(ACP_PLANNER_READINESS.contains("signed_in=true"));
     }
 }
 
@@ -502,7 +511,7 @@ impl Daemon {
             if self.shutdown.is_cancelled(){bail!("daemon shutting down");}
             if self.with_reader(|st|st.get_topic(&topic_id))?.is_none_or(|topic|topic.status!=TopicStatus::Running){bail!("topic stopped during readiness probes");}
             if self.runs.locked().contains_key(&session){bail!("Topic Chat already has an active model run");}
-            let kickoff=format!("{kickoff}\nFresh local harness availability:\n{}\n{ACP_PLANNER_READINESS}\nNever launch an unready harness. Saved permission rules and topic limits are user controls, not model tools.\n",serde_json::to_string(&availability)?);
+            let kickoff=format!("{kickoff}\nFresh local harness availability:\n{}\n{NON_ACP_PLANNER_READINESS}\n{ACP_PLANNER_READINESS}\nNever launch an unready harness. Saved permission rules and topic limits are user controls, not model tools.\n",serde_json::to_string(&availability)?);
             let daemon = self.clone();
             tokio::spawn(async move {
                 GENERATED_MESSAGE
