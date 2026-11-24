@@ -130,6 +130,14 @@ test('malformed fragment pairs preserve independently valid pairs and plus signs
   assert.equal(c.hashParams().k, 'a+b=');
 });
 
+test('incoming share retains title, text, and URL without duplicating an included URL', () => {
+  const c = setup(['incomingShareText']);
+  assert.equal(c.incomingShareText({ title: 'Article title', text: 'Shared description', url: 'https://example.test/page' }),
+    'Article title\nShared description\nhttps://example.test/page');
+  assert.equal(c.incomingShareText({ title: 'Article title', text: 'See https://example.test/page', url: 'https://example.test/page' }),
+    'Article title\nSee https://example.test/page');
+});
+
 test('incoming share content is appended to the selected Topic Chat draft and files stay staged', async () => {
   const staged = [], stored = [];
   let sends = 0;

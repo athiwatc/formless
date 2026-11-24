@@ -10167,9 +10167,9 @@
     const text = typeof share.text === "string" ? share.text : "";
     const title = typeof share.title === "string" ? share.title : "";
     const url = typeof share.url === "string" ? share.url : "";
-    if (text) return url && !text.includes(url) ? text + "\n" + url : text;
-    if (url) return title && title !== url ? title + "\n" + url : url;
-    return title;
+    const parts = [title, text].filter((part, index, values) => part && values.indexOf(part) === index);
+    if (url && !parts.includes(url) && !text.includes(url)) parts.push(url);
+    return parts.join("\n");
   }
   function incomingShareFile(value) {
     if (typeof File !== "undefined" && value instanceof File) return value;
