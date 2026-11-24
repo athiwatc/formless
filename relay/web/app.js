@@ -8604,6 +8604,7 @@
     S.sessions = [s, ...S.sessions.filter((x) => x.id !== s.id)];
     await openSession(s.id);
     $("input").focus();
+    return s;
   }
   /** What this client is called to others on the same Session (§10.4). */
   const CLIENT_LABEL = document.querySelector('meta[name="formless-local"]') ? "web" : "web (relay)";
@@ -10025,6 +10026,135 @@
   }
 
   // =========================================================== connection
+  const launchParams = new URLSearchParams(location.search);
+  const launchShareToken = launchParams.get("share");
+  const launchShareError = launchParams.has("share-error");
+  const launchAction = launchParams.get("action");
+  const launchView = launchParams.get("view");
+  let launchRouteHandled = false;
+
+  function openShareInbox() {
+    return new Promise((resolve, reject) => {
+      const open = indexedDB.open("formless-share-inbox", 1);
+      open.onupgradeneeded = () => {
+        if (!open.result.objectStoreNames.contains("shares")) open.result.createObjectStore("shares", { keyPath: "token" });
+      };
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => resolve(open.result);
+    });
+  }
+  async function readIncomingShare(token) {
+    const db = await openShareInbox();
+    try {
+      return await new Promise((resolve, reject) => {
+        const request = db.transaction("shares", "readonly").objectStore("shares").get(token);
+        request.onsuccess = () => resolve(request.result || null);
+        request.onerror = () => reject(request.error);
+      });
+    } finally { db.close(); }
+  }
+  async function storeIncomingShare(share) {
+    const db = await openShareInbox();
+    try {
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction("shares", "readwrite");
+        tx.objectStore("shares").put(share);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error("share storage aborted"));
+      });
+    } finally { db.close(); }
+  }
+  async function deleteIncomingShare(token) {
+    const db = await openShareInbox();
+    try {
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction("shares", "readwrite");
+        tx.objectStore("shares").delete(token);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error("share cleanup aborted"));
+      });
+    } finally { db.close(); }
+  }
+  function incomingShareText(share) {
+    const text = typeof share.text === "string" ? share.text : "";
+    const title = typeof share.title === "string" ? share.title : "";
+    const url = typeof share.url === "string" ? share.url : "";
+    if (text) return url && !text.includes(url) ? text + "\n" + url : text;
+    if (url) return title && title !== url ? title + "\n" + url : url;
+    return title;
+  }
+  function incomingShareFile(value) {
+    if (typeof File !== "undefined" && value instanceof File) return value;
+    if (typeof File !== "undefined" && typeof Blob !== "undefined" && value instanceof Blob && typeof value.name === "string") {
+      return new File([value], value.name, { type: value.type });
+    }
+    return null;
+  }
+  async function applyIncomingShare(token, share) {
+    if (!S.current && !await newSession()) return false;
+    if (currentTopicAttempt()) {
+      const parent = topicForSession()?.topic_session_id;
+      if (parent) await openSession(parent);
+    }
+    if (!S.current) return false;
+    const record = { ...share, token, files: Array.isArray(share.files) ? share.files : [] };
+    if (!record.draftApplied) {
+      const sharedText = incomingShareText(record);
+      if (sharedText) {
+        const input = $("input");
+        input.value = input.value ? input.value + (input.value.endsWith("\n") ? "" : "\n\n") + sharedText : sharedText;
+        saveDraft(S.current, input.value);
+        autosize();
+        scheduleForecast();
+      }
+      record.draftApplied = true;
+      await storeIncomingShare(record);
+    }
+    const files = record.files.map(incomingShareFile).filter(Boolean);
+    record.files = await attachFiles(files);
+    await storeIncomingShare(record);
+    if (record.files.length) {
+      note("Some shared files couldn't be attached; reload to retry.", true);
+      return false;
+    }
+    return true;
+  }
+  function stripLaunchParams(keys) {
+    const url = new URL(location.href);
+    for (const key of keys) url.searchParams.delete(key);
+    history.replaceState(history.state, "", url.pathname + url.search + url.hash);
+  }
+  async function handleLaunchRoute() {
+    if (launchRouteHandled) return;
+    launchRouteHandled = true;
+    if (launchAction === "new-session" && await newSession()) stripLaunchParams(["action"]);
+    if (launchShareError) {
+      note("Shared content couldn't be saved. Please share it again.", true);
+      stripLaunchParams(["share-error"]);
+    }
+    if (launchShareToken) {
+      try {
+        const share = await readIncomingShare(launchShareToken);
+        if (!share) {
+          note("This shared content is no longer available. Share it again.", true);
+          stripLaunchParams(["share"]);
+        }
+        else if (await applyIncomingShare(launchShareToken, share)) {
+          await deleteIncomingShare(launchShareToken);
+          stripLaunchParams(["share"]);
+        }
+      } catch (error) {
+        note("Shared content couldn't be added to this draft: " + (error?.message || "storage is unavailable"), true);
+      }
+    }
+    if (launchView === "approvals") {
+      setView("approvals");
+      stripLaunchParams(["view"]);
+    }
+  }
+
   async function loadAll() {
     if (runningPanelExposed()) refreshRunning("exposure");
     await refreshSessions();
@@ -10042,6 +10172,7 @@
     refreshProposals();
     refreshModelStats();
     refreshSettings();
+    await handleLaunchRoute();
   }
 
   /** The page can hold the pairing secret only over HTTPS or on this
@@ -10470,17 +10601,19 @@
     }
   }
   async function attachFiles(files) {
-    if (currentTopicAttempt()) return;
+    if (currentTopicAttempt()) return files;
     const sid = S.current;
-    if (!sid) { note("Open a session first", true); return; }
+    if (!sid) { note("Open a session first", true); return files; }
+    const failed = [];
     for (const file of files) {
       const r = await uploadFile(sid, file);
       if (r) {
         (S.chips[sid] = S.chips[sid] || []).push(r);
         if (S.current === sid) renderChips();
-      }
+      } else failed.push(file);
     }
     await refreshAttachmentInventory(sid);
+    return failed;
   }
   /** A sent message's attachments by name; one retention removed says
    * so instead of vanishing (#858). */

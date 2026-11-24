@@ -18,9 +18,61 @@ self.addEventListener("activate", (e) => {
   );
 });
 
+function storeIncomingShare(share) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open("formless-share-inbox", 1);
+    open.onupgradeneeded = () => {
+      if (!open.result.objectStoreNames.contains("shares")) open.result.createObjectStore("shares", { keyPath: "token" });
+    };
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      try {
+        const tx = db.transaction("shares", "readwrite");
+        tx.objectStore("shares").put(share);
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror = () => { db.close(); reject(tx.error); };
+        tx.onabort = () => { db.close(); reject(tx.error || new Error("share storage aborted")); };
+      } catch (error) {
+        db.close();
+        reject(error);
+      }
+    };
+  });
+}
+
+async function receiveShare(request) {
+  try {
+    const form = await request.formData();
+    const text = form.get("text");
+    const title = form.get("title");
+    const url = form.get("url");
+    const files = form.getAll("files").filter((value) => value && typeof value.arrayBuffer === "function" && typeof value.name === "string");
+    const share = {
+      token: crypto.randomUUID(),
+      text: typeof text === "string" ? text : "",
+      title: typeof title === "string" ? title : "",
+      url: typeof url === "string" ? url : "",
+      files,
+      draftApplied: false,
+    };
+    if (!share.text && !share.title && !share.url && !files.length) {
+      return Response.redirect(new URL("/", location.origin), 303);
+    }
+    await storeIncomingShare(share);
+    return Response.redirect(new URL("/?share=" + encodeURIComponent(share.token), location.origin), 303);
+  } catch (_) {
+    return Response.redirect(new URL("/?share-error=1", location.origin), 303);
+  }
+}
+
 self.addEventListener("fetch", (e) => {
   const url = new URL(e.request.url);
   const path = url.pathname === "/index.html" ? "/" : url.pathname;
+  if (e.request.method === "POST" && e.request.mode === "navigate" && url.origin === location.origin && url.pathname === "/share") {
+    e.respondWith(receiveShare(e.request));
+    return;
+  }
   if (e.request.method !== "GET" || url.origin !== location.origin || !SHELL.includes(path)) return;
   e.respondWith(
     fetch(e.request)

@@ -129,6 +129,58 @@ test('malformed fragment pairs preserve independently valid pairs and plus signs
   assert.equal(c.hashParams().k, 'a+b=');
 });
 
+test('incoming share content is appended to the selected Topic Chat draft and files stay staged', async () => {
+  const staged = [], stored = [];
+  const c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft'], {
+    File, Blob,
+    attachFiles: async files => { staged.push(...files); return []; },
+    storeIncomingShare: async share => { stored.push(share); },
+    submit: () => { throw new Error('sharing must not send'); },
+  });
+  c.S.current = 'topic-chat';
+  c.$('input').value = 'keep my draft';
+  const photo = new File(['photo'], 'photo.png', { type: 'image/png' });
+  assert.equal(await c.applyIncomingShare('share-token', {
+    text: 'Look at this', url: 'https://example.test/page', files: [photo], draftApplied: false,
+  }), true);
+  assert.equal(c.$('input').value, 'keep my draft\n\nLook at this\nhttps://example.test/page');
+  assert.equal(c.prefs.get('draft:test-room:topic-chat'), c.$('input').value);
+  assert.deepEqual(staged, [photo]);
+  assert.equal(stored.at(-1).draftApplied, true);
+});
+
+test('incoming shares from a Topic Chat attempt use its writable parent chat', async () => {
+  const opened = [], staged = [];
+  const c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft'], {
+    File, Blob,
+    currentTopicAttempt: () => ({ conversation_session_id: 'attempt' }),
+    topicForSession: () => ({ topic_session_id: 'topic-chat' }),
+    openSession: async id => { opened.push(id); c.S.current = id; c.$('input').value = 'topic draft'; },
+    attachFiles: async files => { staged.push(...files); return []; },
+    storeIncomingShare: async () => {},
+  });
+  c.S.current = 'attempt';
+  assert.equal(await c.applyIncomingShare('share-token', { text: 'shared text', files: [], draftApplied: false }), true);
+  assert.deepEqual(opened, ['topic-chat']);
+  assert.equal(c.S.current, 'topic-chat');
+  assert.equal(c.$('input').value, 'topic draft\n\nshared text');
+  assert.deepEqual(staged, []);
+});
+
+test('app shortcut launch routes create a Session and open approvals', async () => {
+  const calls = [];
+  const c = setup(['handleLaunchRoute'], {
+    launchRouteHandled: false,
+    launchAction: 'new-session', launchShareError: false, launchShareToken: null, launchView: 'approvals',
+    newSession: async () => { calls.push('new-session'); return {}; },
+    stripLaunchParams: keys => calls.push(['strip', ...keys]),
+    setView: view => calls.push(['view', view]),
+  });
+  await c.handleLaunchRoute();
+  assert.deepEqual(calls, ['new-session', ['strip', 'action'], ['view', 'approvals'], ['strip', 'view']]);
+  assert.equal(c.launchRouteHandled, true);
+});
+
 test('environment approvals distinguish credential words from ordinary name fragments', () => {
   const c = setup(['broadWhy']);
   for (const name of ['SSH_AUTH_SOCK', 'ssh_auth_sock', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL',

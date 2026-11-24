@@ -6073,6 +6073,19 @@ during its snapshot fetch, deduplicated by message id.
   and URL fragments never reach it. Offline, the status pill says "offline
   · daemon unreachable" and the transcript says the daemon is offline. The
   CSP allows `manifest-src 'self'` and `worker-src 'self'` for this.
+  Installed browsers that implement Web Share Target can share a title,
+  text, URL, image, text file or PDF to Formless. The service worker stores
+  the incoming content in the browser's IndexedDB until the client connects;
+  Formless then adds text to the selected Session's draft (or opens the
+  writable parent Topic Chat for a Topic Chat attempt) and stages files using
+  the pending-attachment flow. Existing draft text is preserved, and nothing
+  is sent until the user submits it. The manifest also offers New Session and
+  Approvals shortcuts where the platform supports them. These manifest
+  features are supported by installed Chromium-based Android browsers;
+  Safari on iOS does not implement Web Share Target or manifest shortcuts,
+  and unsupported browsers ignore them. The relay's pairing key remains
+  governed by the existing "Stay paired after reloading this tab" choice;
+  sharing does not persist a new key.
   **Notifications (Web Push, opt-in per device):**
   - Settings → This browser subscribes with the relay's VAPID key
     (`GET /push/key`) and sends `{"relay":"push_subscribe","sub"}` to the
@@ -6094,8 +6107,11 @@ during its snapshot fetch, deduplicated by message id.
     and a push service refusing our signature (400/401/403) shows there
     and in the log.
   - The service worker shows "An approval or a question is waiting for
-    you", and clicking it focuses the app. No Session content reaches the
-    relay or the push service.
+    you", and clicking a generic push focuses the app (or opens it when
+    closed). Pushes carry no Session identifier, so they cannot select a
+    specific waiting item. Notifications raised by the connected page carry
+    the relevant Session locally and open it on click. No Session content
+    reaches the relay or the push service.
 
 ## 13. Configuration (complete settings table)
 
