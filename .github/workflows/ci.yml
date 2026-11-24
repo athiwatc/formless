@@ -42,6 +42,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Open-handle log retention
         run: cargo test --locked -p formless-core --test logs
+      - name: Windows log rotation compatibility fallback
+        run: cargo test --locked -p formless-core --lib logs::windows_rotation_fallback -- --test-threads=1
       - name: Detached daemon rotation and long profile paths
         run: cargo test --locked -p formless-bin --test windows_long_daemon -- --test-threads=1
       - name: Legacy console code pages and TUI frame

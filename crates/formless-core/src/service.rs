@@ -152,12 +152,12 @@ fn plan_for(paths: &Paths, exe: &Path, home: &Path, os: ServiceOs) -> Result<Pla
         // expansion too, so literal exclamation marks survive inherited /V:ON.
         let data = data.replace('%', "%%");
         let config = config.replace('%', "%%");
-        let log = log.replace('%', "%%");
         let exe_s = exe_s.replace('%', "%%");
         let file = paths.data_dir.join(format!("{name}-service.cmd"));
+        // The foreground daemon owns its append handles and opens them with
+        // delete sharing. cmd.exe must not open or hold the live log.
         let contents = format!(
-            "@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\nset \"FORMLESS_DATA_DIR={data}\"\r\nset \"FORMLESS_CONFIG_DIR={config}\"\r\nset \"{}=1\"\r\n\"{exe_s}\" daemon serve --stay >> \"{log}\" 2>&1\r\n",
-            crate::logs::DAEMON_LOG_ENV
+            "@echo off\r\nsetlocal EnableExtensions DisableDelayedExpansion\r\nset \"FORMLESS_DATA_DIR={data}\"\r\nset \"FORMLESS_CONFIG_DIR={config}\"\r\n\"{exe_s}\" daemon serve --stay --own-log\r\n"
         );
         let task = format!("Formless ({name})");
         Ok(Plan {
@@ -900,8 +900,10 @@ mod tests {
         assert!(p
             .contents
             .contains(r#"set "FORMLESS_DATA_DIR=C:\Users\A space & %%TEMP%%!\data""#));
-        assert!(p.contents.contains(r#""C:\Program Files\A & %%NAME%%!\formless.exe" daemon serve --stay >> "C:\Users\A space & %%TEMP%%!\data/daemon.log" 2>&1"#)
-            || p.contents.contains(r#""C:\Program Files\A & %%NAME%%!\formless.exe" daemon serve --stay >> "C:\Users\A space & %%TEMP%%!\data\daemon.log" 2>&1"#));
+        assert!(p.contents.contains(
+            r#""C:\Program Files\A & %%NAME%%!\formless.exe" daemon serve --stay --own-log"#
+        ));
+        assert!(!p.contents.contains(">>"));
         let preview = dry_run(&p);
         assert!(preview.contains(&p.contents));
         assert!(preview.contains("$ schtasks /Create"));

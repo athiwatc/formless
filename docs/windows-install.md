@@ -116,6 +116,11 @@ a fresh terminal and verify its resolved path and version. Do not overwrite
 configuration/data as part of replacing the binary. Winget publication is
 separate; templates alone do not establish that `winget install` is available.
 
+If you installed Formless as a Windows logon task with an older executable,
+run `formless daemon install-service` with the updated executable to refresh
+the launcher. Use the same profile and data/config locations as before.
+Replacing the executable alone does not rewrite the existing task launcher.
+
 If Windows rejects a long profile data directory, `formless doctor` reports
 the path length alongside the directory or database error. A shorter
 `FORMLESS_DATA_DIR` can avoid the Windows path limit.

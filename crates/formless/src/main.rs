@@ -1846,6 +1846,10 @@ enum DaemonAction {
         /// Never stop for being idle (how the login service runs it)
         #[arg(long)]
         stay: bool,
+        /// Open the Windows log in this process, rather than using shell redirection.
+        #[cfg(windows)]
+        #[arg(long, hide = true, requires = "stay")]
+        own_log: bool,
     },
     /// Start the daemon at login (launchd, systemd user unit or a Windows
     /// logon task), so scheduled jobs run on time
@@ -3174,7 +3178,16 @@ fn relay_cmd(paths: Paths, action: RelayAction) -> Result<()> {
 
 fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
     match action {
-        DaemonAction::Serve { stay } => {
+        DaemonAction::Serve {
+            stay,
+            #[cfg(windows)]
+            own_log,
+        } => {
+            #[cfg(windows)]
+            if own_log {
+                formless_core::logs::reopen_stdio(&paths).context("open daemon log")?;
+                std::env::set_var(formless_core::logs::DAEMON_LOG_ENV, "1");
+            }
             if stay {
                 std::env::set_var(formless_core::daemon::STAY_ENV, "1");
             }
