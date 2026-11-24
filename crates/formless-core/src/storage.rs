@@ -4685,6 +4685,35 @@ impl Store {
         Ok(Some((info, v)))
     }
 
+    pub(crate) fn current_input_schemas_for(
+        &self,
+        tool_ids: &[&str],
+    ) -> Result<HashMap<String, (i64, String)>> {
+        let mut schemas = HashMap::new();
+        for chunk in tool_ids.chunks(128) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT t.id, v.version, v.input_schema FROM tools AS t
+                 JOIN tool_versions AS v ON v.tool_id=t.id AND v.version=t.current_version
+                 WHERE t.retired=0 AND t.disabled=0 AND t.id IN ({placeholders})"
+            );
+            let mut stmt = self.ps(&sql)?;
+            let rows =
+                stmt.query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+            for row in rows {
+                let (id, version, schema) = row?;
+                schemas.insert(id, (version, schema));
+            }
+        }
+        Ok(schemas)
+    }
+
     pub fn list_tools(&self, include_retired: bool) -> Result<Vec<ToolInfo>> {
         let ids: Vec<String> = {
             let sql = if include_retired {

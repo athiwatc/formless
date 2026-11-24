@@ -979,19 +979,34 @@ fn agent_tools(store: &Store) -> Result<Vec<ToolInfo>> {
     Ok(tools)
 }
 
-fn provider_compatible_tools(store: &Store) -> Result<Vec<ToolInfo>> {
+fn provider_compatible_tools(
+    store: &Store,
+) -> Result<(
+    Vec<ToolInfo>,
+    std::collections::HashMap<String, (i64, String)>,
+)> {
+    let tools = agent_tools(store)?;
+    let input_schemas = current_input_schemas(store, &tools)?;
     let mut compatible = Vec::new();
-    for info in agent_tools(store)? {
-        let Some((_, version)) = store.get_tool_current(&info.id)? else {
+    for info in tools {
+        let Some((_, input_schema)) = input_schemas.get(&info.id) else {
             continue;
         };
-        if let Err(error) = validate_stored_input_schema(&version.input_schema) {
+        if let Err(error) = validate_stored_input_schema(input_schema) {
             warn_omitted_tool_schema(&info.id, &info.name, &error);
             continue;
         }
         compatible.push(info);
     }
-    Ok(compatible)
+    Ok((compatible, input_schemas))
+}
+
+fn current_input_schemas(
+    store: &Store,
+    tools: &[ToolInfo],
+) -> Result<std::collections::HashMap<String, (i64, String)>> {
+    let ids: Vec<&str> = tools.iter().map(|tool| tool.id.as_str()).collect();
+    store.current_input_schemas_for(&ids)
 }
 
 /// Search active Tools with the configured ranking (`tools.search`).
@@ -1001,11 +1016,11 @@ pub fn search_tools_with(
     limit: usize,
     method: &str,
 ) -> Result<Vec<ToolInfo>> {
-    let tools = provider_compatible_tools(store)?;
+    let (tools, input_schemas) = provider_compatible_tools(store)?;
     if method.eq_ignore_ascii_case("keyword") {
         search_tools_from(store, tools, query, limit)
     } else {
-        search_tools_bm25_from(store, tools, query, limit)
+        search_tools_bm25_from(tools, &input_schemas, query, limit)
     }
 }
 
@@ -1056,12 +1071,14 @@ fn stems(s: &str) -> Vec<String> {
 /// matches and the [`SYNONYMS`] groups at reduced weight. Ties go to the
 /// more used, more reliable Tool.
 pub fn search_tools_bm25(store: &Store, query: &str, limit: usize) -> Result<Vec<ToolInfo>> {
-    search_tools_bm25_from(store, agent_tools(store)?, query, limit)
+    let tools = agent_tools(store)?;
+    let input_schemas = current_input_schemas(store, &tools)?;
+    search_tools_bm25_from(tools, &input_schemas, query, limit)
 }
 
 fn search_tools_bm25_from(
-    store: &Store,
     tools: Vec<ToolInfo>,
+    input_schemas: &std::collections::HashMap<String, (i64, String)>,
     query: &str,
     limit: usize,
 ) -> Result<Vec<ToolInfo>> {
@@ -1077,8 +1094,8 @@ fn search_tools_bm25_from(
             }
             doc.extend(stems(&t.title));
             doc.extend(stems(&t.description));
-            if let Ok(Some((_, v))) = store.get_tool_current(&t.id) {
-                if let Ok(schema) = serde_json::from_str::<Value>(&v.input_schema) {
+            if let Some((_, input_schema)) = input_schemas.get(&t.id) {
+                if let Ok(schema) = serde_json::from_str::<Value>(input_schema) {
                     for (prop, def) in schema["properties"].as_object().into_iter().flatten() {
                         doc.extend(stems(prop));
                         doc.extend(stems(def["description"].as_str().unwrap_or_default()));
@@ -1190,8 +1207,12 @@ fn search_tools_from(
 
 /// The function definition a registry Tool is listed to the model with.
 pub fn registry_definition(info: &ToolInfo, v: &formless_protocol::ToolVersionInfo) -> Value {
+    registry_definition_with_input_schema(info, &v.input_schema)
+}
+
+fn registry_definition_with_input_schema(info: &ToolInfo, input_schema: &str) -> Value {
     let params: Value =
-        serde_json::from_str(&v.input_schema).unwrap_or_else(|_| json!({"type": "object"}));
+        serde_json::from_str(input_schema).unwrap_or_else(|_| json!({"type": "object"}));
     json!({
         "type": "function",
         "function": {"name": info.name, "description": crate::descriptions::model_text(&info.description), "parameters": params}
@@ -1475,6 +1496,7 @@ fn definitions(
     persist: bool,
 ) -> Result<Vec<Value>> {
     let all_tools = agent_tools(store)?;
+    let input_schemas = current_input_schemas(store, &all_tools)?;
     let loaded_tool_ids = match session_id {
         Some(session) => store.session_tool_ids(session)?,
         None => Default::default(),
@@ -1506,8 +1528,8 @@ fn definitions(
             .map(|definition| validate_definition_input_schema(&definition));
         let validation = match pinned_check {
             Some(validation) => validation,
-            None => match store.get_tool_current(&info.id)? {
-                Some((_, version)) => validate_stored_input_schema(&version.input_schema),
+            None => match input_schemas.get(&info.id) {
+                Some((_, input_schema)) => validate_stored_input_schema(input_schema),
                 None => continue,
             },
         };
@@ -1625,14 +1647,14 @@ fn definitions(
                 }
             }
         }
-        if let Some((_i, v)) = store.get_tool_current(&info.id)? {
-            if let Err(error) = validate_stored_input_schema(&v.input_schema) {
+        if let Some((version, input_schema)) = input_schemas.get(&info.id) {
+            if let Err(error) = validate_stored_input_schema(input_schema) {
                 warn_omitted_tool_schema(&info.id, &info.name, &error);
                 continue;
             }
-            let def = registry_definition(&info, &v);
+            let def = registry_definition_with_input_schema(&info, input_schema);
             if let Some(s) = session_id.filter(|_| persist) {
-                store.pin_definition(s, &info.id, v.version, &def.to_string())?;
+                store.pin_definition(s, &info.id, *version, &def.to_string())?;
                 // Preserve legacy read/write ordering, including triggers or
                 // refreshes caused by a missing/invalid pin's fallback write.
                 // Fully pinned listings keep the bounded batch fast path.
@@ -1862,6 +1884,55 @@ mod tests {
         ));
         assert_eq!(state.completed_refs.len(), depth);
         assert_eq!(state.cycle_count, 0);
+    }
+
+    #[test]
+    fn batched_current_input_schema_drives_search_documents() {
+        let store = Store::open_in_memory().unwrap();
+        let initial_schema = r#"{"type":"object","properties":{"oldneedle":{"type":"string"}}}"#;
+        let current_schema =
+            r#"{"type":"object","properties":{"currentneedle":{"type":"string"}}}"#;
+        let (tool, _) = store
+            .create_tool_version(
+                "schema_batch_search",
+                "schema batch fixture",
+                initial_schema,
+                "{}",
+                "function run(input){return input;}",
+                &formless_runtime::Capabilities::default(),
+                64,
+                "agent",
+            )
+            .unwrap();
+        let (_, current_version) = store
+            .create_tool_version_with_schema_policy(
+                &tool.name,
+                "schema batch fixture",
+                current_schema,
+                "{}",
+                "function run(input){return input;}",
+                &formless_runtime::Capabilities::default(),
+                64,
+                "agent",
+                crate::tool_compatibility::SchemaWritePolicy::Agent {
+                    allow_breaking: true,
+                },
+            )
+            .unwrap();
+
+        let schemas = store
+            .current_input_schemas_for(&[tool.id.as_str()])
+            .unwrap();
+        let current_entry = (current_version, current_schema.to_string());
+        assert_eq!(schemas.get(&tool.id), Some(&current_entry));
+        assert!(search_tools_bm25(&store, "currentneedle", 10)
+            .unwrap()
+            .iter()
+            .any(|result| result.id == tool.id));
+        assert!(!search_tools_bm25(&store, "oldneedle", 10)
+            .unwrap()
+            .iter()
+            .any(|result| result.id == tool.id));
     }
 
     #[test]
