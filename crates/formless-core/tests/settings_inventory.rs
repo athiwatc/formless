@@ -68,6 +68,7 @@ fn documented_settable_values_choices_and_optional_keys_are_complete() {
     );
     assert_eq!(values["provider.max_retries"], 7);
     assert_eq!(values["naming.auto_download"], false);
+    assert_eq!(values["naming.model"], "qwen2.5-0.5b");
     assert_eq!(
         values["provider.fallback_models"],
         json!(["small,with-comma", "large"])
@@ -90,10 +91,11 @@ fn documented_settable_values_choices_and_optional_keys_are_complete() {
         assert!(!values.contains_key(key), "{key} must not become editable");
     }
     assert_eq!(summary["read_only"]["mcp.servers"], "1 configured");
-    assert_eq!(summary["read_only"]["naming.model"], "qwen2.5-0.5b");
+    assert!(summary["read_only"].get("naming.model").is_none());
     assert_eq!(summary["read_only"]["naming.model_size"], "409 MiB");
     assert_eq!(summary["read_only"]["naming.cache_size"], "0 B");
     assert_eq!(summary["read_only"]["naming.status"], "not installed");
+    assert_eq!(summary["naming"]["model"], "qwen2.5-0.5b");
     assert!(!summary["docs"]["naming.auto_download"]["description"]
         .as_str()
         .unwrap()

@@ -2082,7 +2082,6 @@ impl Config {
                 self.security.roots().len(), self.security.trusted_hosts.len(), self.security.secret_patterns.len()),
             "hooks": format!("{} configured", self.hooks.len()),
             "mcp.servers": format!("{} configured", self.mcp.servers.len()),
-            "naming.model": self.naming.model,
             "naming.model_size": naming_model_size,
             "naming.cache_size": naming_cache_size,
             "naming.status": naming_status,
