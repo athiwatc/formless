@@ -115,6 +115,16 @@ pub fn models_dir(paths: &Paths) -> PathBuf {
     paths.data_dir.join("models")
 }
 
+pub fn display_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{} KiB", (bytes as f64 / 1024.0).round() as u64)
+    } else {
+        format!("{} MiB", (bytes as f64 / (1024.0 * 1024.0)).round() as u64)
+    }
+}
+
 pub struct CachedModel {
     pub id: &'static str,
     pub bytes: u64,
@@ -282,12 +292,14 @@ const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
 fn download_client(idle_timeout: Duration, timeout: Duration) -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .user_agent(concat!("formless/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(idle_timeout)
-        .timeout(timeout)
-        .build()?)
+        .timeout(timeout);
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+    Ok(builder.build()?)
 }
 
 /// Fetch missing model files. Hold a per-model lock across both files so

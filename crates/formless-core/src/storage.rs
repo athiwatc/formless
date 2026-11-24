@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use formless_protocol::{
     MessageInfo, ModuleInfo, PromptProposalInfo, SearchHit, SessionInfo, SubagentInfo,
-    TemplateInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo, TopicAttemptInfo, TopicFeatureInfo,
-    TopicInfo,
+    TemplateInfo, ToolInfo, ToolMetricsInfo, ToolSummary, ToolVersionInfo, TopicAttemptInfo,
+    TopicFeatureInfo, TopicInfo,
 };
 use formless_runtime::Capabilities;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -113,6 +113,60 @@ pub struct CandidateData {
     pub output_schema: String,
     pub capabilities: Vec<String>,
     pub memory_mb: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RegistryToolSummary {
+    pub id: String,
+    pub name: String,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub pinned: bool,
+    pub disabled: bool,
+    pub description: String,
+    pub retired: bool,
+    pub current_version: i64,
+    pub capabilities: Vec<String>,
+    pub memory_mb: u32,
+    pub invocations: i64,
+    pub success: i64,
+    pub failure: i64,
+    pub validation_failures: i64,
+    pub denied: i64,
+    pub sessions: i64,
+    pub success_rate: Option<f64>,
+    pub needs_attention: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_used_at: Option<String>,
+    pub author: String,
+    pub input_schema: String,
+    pub has_current_version: bool,
+}
+
+impl From<&RegistryToolSummary> for ToolSummary {
+    fn from(summary: &RegistryToolSummary) -> Self {
+        Self {
+            id: summary.id.clone(),
+            name: summary.name.clone(),
+            title: summary.title.clone(),
+            tags: summary.tags.clone(),
+            pinned: summary.pinned,
+            disabled: summary.disabled,
+            description: summary.description.clone(),
+            retired: summary.retired,
+            current_version: summary.current_version,
+            capabilities: summary.capabilities.clone(),
+            memory_mb: summary.memory_mb,
+            invocations: summary.invocations,
+            success_rate: summary.success_rate,
+            needs_attention: summary.needs_attention,
+            created_at: summary.created_at.clone(),
+            updated_at: summary.updated_at.clone(),
+            last_used_at: summary.last_used_at.clone(),
+            author: summary.author.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5358,55 +5412,72 @@ impl Store {
         Ok(Some((info, v)))
     }
 
-    pub(crate) fn current_input_schemas_for(
+    pub fn list_tool_summaries(&self, include_retired: bool) -> Result<Vec<ToolSummary>> {
+        self.registry_tool_summaries(include_retired)
+            .map(|tools| tools.iter().map(ToolSummary::from).collect())
+    }
+
+    pub(crate) fn registry_tool_summaries(
         &self,
-        tool_ids: &[&str],
-    ) -> Result<HashMap<String, (i64, String)>> {
-        let mut schemas = HashMap::new();
-        for chunk in tool_ids.chunks(128) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!(
-                "SELECT t.id, v.version, v.input_schema FROM tools AS t
-                 JOIN tool_versions AS v ON v.tool_id=t.id AND v.version=t.current_version
-                 WHERE t.retired=0 AND t.disabled=0 AND t.id IN ({placeholders})"
-            );
-            let mut stmt = self.ps(&sql)?;
-            let rows =
-                stmt.query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?;
-            for row in rows {
-                let (id, version, schema) = row?;
-                schemas.insert(id, (version, schema));
-            }
-        }
-        Ok(schemas)
+        include_retired: bool,
+    ) -> Result<Vec<RegistryToolSummary>> {
+        let mut stmt = self.ps(
+            "SELECT t.id,t.name,t.description,t.retired,t.current_version,t.needs_attention,
+                    t.created_at,t.updated_at,t.title,t.tags,t.user_pinned,t.disabled,
+                    v.capabilities,v.memory_mb,v.author,v.input_schema,
+                    COALESCE(i.total,0),COALESCE(i.success,0),COALESCE(i.failure,0),
+                    COALESCE(i.validation_failures,0),COALESCE(i.denied,0),
+                    COALESCE(i.sessions,0),i.last_used_at,v.tool_id IS NOT NULL
+             FROM tools t
+             LEFT JOIN tool_versions v ON v.tool_id=t.id AND v.version=t.current_version
+             LEFT JOIN tool_invocation_summary i ON i.tool_id=t.id
+             WHERE (?1 OR t.retired=0)
+             ORDER BY t.name_lower",
+        )?;
+        let rows = stmt.query_map([include_retired], |r| {
+            let invocations = r.get::<_, i64>(16)?;
+            let success = r.get::<_, i64>(17)?;
+            let failure = r.get::<_, i64>(18)?;
+            let denom = success + failure;
+            Ok(RegistryToolSummary {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                description: crate::descriptions::screen(&r.get::<_, String>(2)?).text,
+                retired: r.get::<_, i64>(3)? != 0,
+                current_version: r.get(4)?,
+                needs_attention: r.get::<_, i64>(5)? != 0,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
+                title: r.get(8)?,
+                tags: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
+                pinned: r.get::<_, i64>(10)? != 0,
+                disabled: r.get::<_, i64>(11)? != 0,
+                capabilities: serde_json::from_str(
+                    &r.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                )
+                .unwrap_or_default(),
+                memory_mb: r.get::<_, Option<i64>>(13)?.unwrap_or_default() as u32,
+                author: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                input_schema: r
+                    .get::<_, Option<String>>(15)?
+                    .unwrap_or_else(|| "{}".into()),
+                has_current_version: r.get(23)?,
+                invocations,
+                success,
+                failure,
+                validation_failures: r.get(19)?,
+                denied: r.get(20)?,
+                sessions: r.get(21)?,
+                success_rate: (denom > 0).then(|| success as f64 / denom as f64),
+                last_used_at: r.get(22)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn list_tools(&self, include_retired: bool) -> Result<Vec<ToolInfo>> {
-        let ids: Vec<String> = {
-            let sql = if include_retired {
-                "SELECT id FROM tools ORDER BY name_lower"
-            } else {
-                "SELECT id FROM tools WHERE retired=0 ORDER BY name_lower"
-            };
-            let mut stmt = self.ps(sql)?;
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
-        };
-        let mut out = Vec::new();
-        for id in ids {
-            if let Some(info) = self.tool_info(&id)? {
-                out.push(info);
-            }
-        }
-        Ok(out)
+        self.list_tool_summaries(include_retired)
+            .map(|tools| tools.into_iter().map(ToolInfo::from).collect())
     }
 
     fn module_row(r: &rusqlite::Row) -> rusqlite::Result<ModuleInfo> {
@@ -7876,6 +7947,26 @@ impl Store {
                 None
             },
         ))
+    }
+
+    pub fn windowed_successes(&self, window: usize) -> Result<HashMap<String, (i64, Option<f64>)>> {
+        let mut stmt = self.ps("SELECT tool_id,COUNT(*),COALESCE(SUM(status='success'),0)
+             FROM (
+                 SELECT i.tool_id,i.status,
+                        ROW_NUMBER() OVER (PARTITION BY i.tool_id ORDER BY i.rowid DESC) AS position
+                 FROM invocations i JOIN tools t ON t.id=i.tool_id
+                 WHERE i.status IN ('success','failure') AND t.retired=0 AND t.needs_attention=0
+             )
+             WHERE position<=?1
+             GROUP BY tool_id")?;
+        let rows = stmt.query_map([window as i64], |row| {
+            let tool_id = row.get::<_, String>(0)?;
+            let sample = row.get::<_, i64>(1)?;
+            let successes = row.get::<_, i64>(2)?;
+            let rate = (sample > 0).then(|| successes as f64 / sample as f64);
+            Ok((tool_id, (sample, rate)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
     }
 
     /// Bounded recent terminal inputs, selected without balancing outcomes.

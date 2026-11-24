@@ -1,5 +1,5 @@
 //! Explicit stored-state selection; default list cells and order stay intact.
-use formless_protocol::ToolInfo;
+use formless_protocol::ToolSummary;
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub(super) enum Filter {
@@ -17,7 +17,7 @@ pub(super) enum Filter {
     Pinned,
 }
 impl Filter {
-    fn matches(self, tool: &ToolInfo) -> bool {
+    fn matches(self, tool: &ToolSummary) -> bool {
         match self {
             Self::NotRetired => !tool.retired,
             Self::Retired => tool.retired,
@@ -39,7 +39,7 @@ impl Filter {
     }
 }
 
-pub(super) fn select(tools: &mut Vec<ToolInfo>, filter: Option<Filter>, tag: Option<&str>) {
+pub(super) fn select(tools: &mut Vec<ToolSummary>, filter: Option<Filter>, tag: Option<&str>) {
     let tag = tag.map(|tag| tag.trim_start_matches('#').to_lowercase());
     tools.retain(|tool| {
         filter.is_none_or(|filter| filter.matches(tool))
@@ -75,7 +75,7 @@ pub(super) fn empty_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn tools() -> Vec<ToolInfo> {
+    fn tools() -> Vec<ToolSummary> {
         serde_json::from_str(include_str!("../tests/fixtures/tool-filter-list.json")).unwrap()
     }
     #[test]

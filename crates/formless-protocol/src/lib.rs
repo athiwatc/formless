@@ -1016,6 +1016,85 @@ pub struct ToolInfo {
     pub author: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolSummary {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub disabled: bool,
+    pub description: String,
+    pub retired: bool,
+    pub current_version: i64,
+    pub capabilities: Vec<String>,
+    pub memory_mb: u32,
+    pub invocations: i64,
+    pub success_rate: Option<f64>,
+    pub needs_attention: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+    #[serde(default)]
+    pub author: String,
+}
+
+impl From<ToolSummary> for ToolInfo {
+    fn from(summary: ToolSummary) -> Self {
+        Self {
+            id: summary.id,
+            name: summary.name,
+            title: summary.title,
+            tags: summary.tags,
+            pinned: summary.pinned,
+            disabled: summary.disabled,
+            description: summary.description,
+            retired: summary.retired,
+            current_version: summary.current_version,
+            capabilities: summary.capabilities,
+            memory_mb: summary.memory_mb,
+            invocations: summary.invocations,
+            success_rate: summary.success_rate,
+            needs_attention: summary.needs_attention,
+            created_at: summary.created_at,
+            updated_at: summary.updated_at,
+            last_used_at: summary.last_used_at,
+            recent: String::new(),
+            author: summary.author,
+        }
+    }
+}
+
+impl From<ToolInfo> for ToolSummary {
+    fn from(tool: ToolInfo) -> Self {
+        Self {
+            id: tool.id,
+            name: tool.name,
+            title: tool.title,
+            tags: tool.tags,
+            pinned: tool.pinned,
+            disabled: tool.disabled,
+            description: tool.description,
+            retired: tool.retired,
+            current_version: tool.current_version,
+            capabilities: tool.capabilities,
+            memory_mb: tool.memory_mb,
+            invocations: tool.invocations,
+            success_rate: tool.success_rate,
+            needs_attention: tool.needs_attention,
+            created_at: tool.created_at,
+            updated_at: tool.updated_at,
+            last_used_at: tool.last_used_at,
+            author: tool.author,
+        }
+    }
+}
+
 /// A registry change the agent made during a Run (SPEC §10.6).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolChange {

@@ -61,6 +61,11 @@ mod tests {
         cfg.provider.base_url = "http://127.0.0.1:9/v1".into();
         cfg.provider.model = "saved-model".into();
         cfg.save(&other).unwrap();
+        std::fs::write(
+            other.config_file(),
+            "[provider]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"saved-model\"\n\n[naming]\nauto_download = true\n",
+        )
+        .unwrap();
         let before = std::fs::read(other.config_file()).unwrap();
         let scratch = base.named("scratch").unwrap();
         for active in [&base, &scratch] {
