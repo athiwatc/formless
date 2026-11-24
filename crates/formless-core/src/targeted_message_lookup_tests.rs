@@ -169,6 +169,17 @@ fn targeted_message_lookup_narrows_only_unrelated_corruption_and_keeps_target_ma
         )
         .unwrap();
     assert_eq!(indexed_unrelated, 1);
+    for term in ["u6587", "u4ef6", "u6587x4ef6"] {
+        let matching_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_unicode_fts WHERE messages_unicode_fts MATCH ?1 AND rowid=?2",
+                params![term, unrelated_rowid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(matching_rows, 1, "indexed term {term} should match");
+    }
     store
         .conn
         .execute(
@@ -201,6 +212,20 @@ fn targeted_message_lookup_narrows_only_unrelated_corruption_and_keeps_target_ma
         )
         .unwrap();
     assert_eq!(remaining_unrelated_index, 0);
+    for term in ["u6587", "u4ef6", "u6587x4ef6"] {
+        let matching_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_unicode_fts WHERE messages_unicode_fts MATCH ?1 AND rowid=?2",
+                params![term, unrelated_rowid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            matching_rows, 0,
+            "deleted message should not retain indexed term {term}"
+        );
+    }
     store
         .conn
         .execute(
