@@ -478,8 +478,16 @@ async fn whole_v23_profile_answers_status_migrates_consent_and_preserves_key_and
         Some("historical-fixture-model")
     );
     assert_eq!(
+        persisted_config["provider"]["base_url"].as_str(),
+        Some("http://127.0.0.1:9/v1")
+    );
+    assert_eq!(
         persisted_config["provider"]["context_tokens"].as_integer(),
         Some(8192)
+    );
+    assert_eq!(
+        persisted_config["provider"]["max_retries"].as_integer(),
+        Some(0)
     );
     assert_eq!(
         persisted_config["optimiser"]["cooldown_secs"].as_integer(),
