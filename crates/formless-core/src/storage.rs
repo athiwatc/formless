@@ -8626,7 +8626,7 @@ fn identifier_prefix_phrase(text: &str) -> Option<String> {
 
 fn search_words(text: &str) -> impl Iterator<Item = &str> {
     text.split(|c: char| !c.is_alphanumeric() && !unicode_normalization::char::is_combining_mark(c))
-        .filter(|word| !word.is_empty())
+        .filter(|word| word.chars().any(char::is_alphanumeric))
 }
 
 fn search_normalize(text: &str) -> String {

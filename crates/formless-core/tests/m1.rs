@@ -122,6 +122,22 @@ fn session_search_handles_multilingual_substrings_and_preserves_english_prefixes
 }
 
 #[test]
+fn emoji_search_does_not_match_messages_by_variation_selector_alone() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(Some("emoji search".into())).unwrap();
+    store
+        .append_message(&session.id, "user", "sun ☀️")
+        .unwrap();
+    let heart = store
+        .append_message(&session.id, "user", "heart ❤️")
+        .unwrap();
+
+    let hits = store.search_sessions("❤️", 20).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].message_id, heart.id);
+}
+
+#[test]
 fn unicode_search_index_backfills_existing_messages() {
     let paths = temp_paths("unicode-index-backfill");
     let session_id;
