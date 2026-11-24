@@ -51,7 +51,7 @@ function setup(names, extras = {}) {
     // These tests isolate intent/data behavior; real focus/inert behavior runs
     // against the complete shipped UI in web-focus.browser-test.py.
     document: { activeElement: null }, popoverTrigger: null, focusBefore: {}, openDialog() {}, closeDialog() {}, activeDialog: () => null,
-    renderChips() {}, renderOutbox() {}, renderComposer() {}, note() {}, ask: async () => null, autosize() {}, currentTopicAttempt: () => null,
+    renderChips() {}, renderOutbox() {}, renderComposer() {}, setView() {}, note() {}, ask: async () => null, autosize() {}, currentTopicAttempt: () => null,
     renderTopicNavigation() {}, topicSessionIds: () => new Set(),
     ...extras,
     request: async req => req.type === 'ping'
