@@ -63,7 +63,7 @@ function setup(names, extras = {}) {
   if (names.some(name => ['rateButtons', 'retryRun'].includes(name))) {
     vm.runInContext(['currentRunTarget', 'ensureRunTarget'].map(fn).join('\n'), context);
   }
-  const storageFunctions = ['outboxStorageKey','draftStorageKey','attachmentStorageKey','sessionCacheKey','outboxLockName','sessionStorageKey','loadDraft','normalizeTextareaValue','clearSubmittedDraft','loadOutbox','saveDraft','restoreDraft','persistOutbox','hasOutboxLock','withOutboxLock','refreshOutbox','activateStorageScope','loadAttachmentInventory','saveAttachmentInventory','refreshAttachmentInventory','fetchFreshAttachmentInventory','enqueueOutbox','canFlushOutbox','discardOutbox','flushOutbox','onStorage'];
+  const storageFunctions = ['outboxStorageKey','draftStorageKey','attachmentStorageKey','sessionCacheKey','outboxLockName','sessionStorageKey','loadDraft','normalizeTextareaValue','sharedSlashDraftKey','sharedSlashDraftValue','rememberSharedSlashDraft','clearSharedSlashDraft','clearEditedSharedSlashDraft','isSharedSlashDraft','clearSubmittedDraft','loadOutbox','saveDraft','restoreDraft','persistOutbox','hasOutboxLock','withOutboxLock','refreshOutbox','activateStorageScope','loadAttachmentInventory','saveAttachmentInventory','refreshAttachmentInventory','fetchFreshAttachmentInventory','enqueueOutbox','canFlushOutbox','discardOutbox','flushOutbox','onStorage'];
   const dependencies = [...(names.some(name => ['decide', 'renderApproval'].includes(name)) ? ['approvalHelpSeen', 'rememberApprovalHelp'] : []), ...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput', 'showAskError'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : []), ...(names.some(name => storageFunctions.includes(name)) || names.includes('submit') || names.includes('openSession') || names.includes('acceptMention') || names.includes('acceptCommand') ? storageFunctions : [])];
   if (names.includes('showNextAsk')) vm.runInContext(source.slice(source.indexOf('  let askResolve'), source.indexOf('  /** Promise-based prompt')), context);
   if (names.includes('renderApproval') || names.includes('branchSummaryReviewText')) {
@@ -198,6 +198,23 @@ test('failed draft persistence leaves the per-share marker false for a safe retr
   assert.equal(c.$('input').value, 'shared content');
   assert.equal(c.prefs.get('draft:test-room:A'), 'shared content');
   assert.equal(stored.at(-1).draftApplied, true);
+});
+
+test('leading-slash shared text submits literally until the user edits it', async () => {
+  let commands = 0;
+  const c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft', 'submit'], {
+    attachFiles: async () => [],
+    storeIncomingShare: async () => {},
+    slash: () => { commands++; },
+  });
+  c.S.current = 'A';
+  assert.equal(await c.applyIncomingShare('share-token', { text: '/tmp/notes', files: [], draftApplied: false }), true);
+  assert.equal(c.isSharedSlashDraft('test-room', 'A', '/tmp/notes'), true);
+  c.S.submitting.add('test-room\u0000/tmp/notes');
+  await c.submit(false);
+  assert.equal(commands, 0);
+  c.clearEditedSharedSlashDraft('test-room', 'A', '/tmp/notes --edited');
+  assert.equal(c.isSharedSlashDraft('test-room', 'A', '/tmp/notes --edited'), false);
 });
 
 test('share inbox read does not apply to a Session selected while IndexedDB is resolving', async () => {

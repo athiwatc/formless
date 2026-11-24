@@ -84,7 +84,41 @@
   function normalizeTextareaValue(value) {
     return typeof value === "string" ? value.replace(/\r\n?/g, "\n") : value;
   }
+  function sharedSlashDraftKey(scope, sessionId) {
+    return scope && sessionId ? "shared-slash-draft:" + encodeURIComponent(scope) + ":" + encodeURIComponent(sessionId) : null;
+  }
+  function sharedSlashDraftValue(scope, sessionId) {
+    const key = sharedSlashDraftKey(scope, sessionId);
+    if (!key) return null;
+    if (S.sharedSlashDrafts?.has(key)) return S.sharedSlashDrafts.get(key);
+    const value = prefs.get(key, null);
+    return typeof value === "string" ? value : null;
+  }
+  function rememberSharedSlashDraft(scope, sessionId, value) {
+    const key = sharedSlashDraftKey(scope, sessionId);
+    if (!key) return false;
+    const normalized = normalizeTextareaValue(value);
+    (S.sharedSlashDrafts || (S.sharedSlashDrafts = new Map())).set(key, normalized);
+    return prefs.set(key, normalized);
+  }
+  function clearSharedSlashDraft(scope, sessionId) {
+    const key = sharedSlashDraftKey(scope, sessionId);
+    if (!key) return false;
+    if (S.sharedSlashDrafts) S.sharedSlashDrafts.delete(key);
+    return prefs.remove(key);
+  }
+  function clearEditedSharedSlashDraft(scope, sessionId, value) {
+    const marked = sharedSlashDraftValue(scope, sessionId);
+    if (marked !== null && normalizeTextareaValue(marked) !== normalizeTextareaValue(value)) {
+      clearSharedSlashDraft(scope, sessionId);
+    }
+  }
+  function isSharedSlashDraft(scope, sessionId, value) {
+    const marked = sharedSlashDraftValue(scope, sessionId);
+    return marked !== null && normalizeTextareaValue(marked) === normalizeTextareaValue(value);
+  }
   function clearSubmittedDraft(scope, sessionId, snapshot) {
+    clearSharedSlashDraft(scope, sessionId);
     const fallbackKey = sessionCacheKey(scope, sessionId);
     const fallbacks = S.unpersistedDrafts || (S.unpersistedDrafts = new Map());
     const sharedValues = S.unpersistedDraftSharedValues || (S.unpersistedDraftSharedValues = new Map());
@@ -9250,7 +9284,7 @@
     const draftSnapshot = normalizeTextareaValue(input.value);
     const text = input.value.trim();
     if (!text) return;
-    if (text.startsWith("/") && !S.editMessageId) {
+      if (text.startsWith("/") && !S.editMessageId && !isSharedSlashDraft(S.storageScope, S.current, input.value)) {
       input.value = "";
       saveDraft(S.current, "");
       autosize();
@@ -10208,11 +10242,14 @@
       if (sharedText) {
         const input = $("input");
         input.value = input.value ? input.value + (input.value.endsWith("\n") ? "" : "\n\n") + sharedText : sharedText;
-        if (!saveDraft(destination.sessionId, input.value, destination.scope)) {
-          note("Shared text couldn't be saved to this draft; reload to retry.", true);
-          return false;
-        }
-        autosize();
+          if (!saveDraft(destination.sessionId, input.value, destination.scope)) {
+            note("Shared text couldn't be saved to this draft; reload to retry.", true);
+            return false;
+          }
+          if (sharedText.trimStart().startsWith("/") && input.value.trimStart().startsWith("/")) {
+            rememberSharedSlashDraft(destination.scope, destination.sessionId, input.value);
+          }
+          autosize();
         scheduleForecast();
       }
       record.draftApplied = true;
@@ -10807,7 +10844,7 @@
     if (files.length) { e.preventDefault(); attachFiles(files); }
   });
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); submit(false); });
-  $("input").addEventListener("input", () => { if (!S.editMessageId) saveDraft(S.current, $("input").value); palette.sel = 0; autosize(); updatePalette(); updateMentions(); scheduleForecast(); });
+  $("input").addEventListener("input", () => { if (!S.editMessageId) { clearEditedSharedSlashDraft(S.storageScope, S.current, $("input").value); saveDraft(S.current, $("input").value); } palette.sel = 0; autosize(); updatePalette(); updateMentions(); scheduleForecast(); });
   $("input").addEventListener("blur", () => setTimeout(() => { closeMentions(); closePalette(); }, 100));
   $("input").addEventListener("keydown", (e) => {
     if (e.isComposing || e.keyCode === 229) return;
