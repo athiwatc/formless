@@ -6365,10 +6365,13 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   or provisionally named Session with suitable user text can download weights
   or a tokenizer when the selected [catalogue model](docs/architecture.md#local-naming-models)
   needs them. Automatic naming is enabled by default, but model downloads are
-  opt-in. Older saved configs are migrated to disable automatic downloads;
-  enable `naming.auto_download` to allow a first-use download, or set
-  `naming.enabled = false` to disable automatic naming. Without the model,
-  titles use a heuristic.
+  opt-in. Older saved configs and hand-authored configs without the migration
+  marker are conservatively migrated to disable downloads, because an
+  unmarked `true` cannot be distinguished from the former default. Opt in
+  with `formless config set naming.auto_download true`, or in TOML set both
+  `auto_download = true` and `auto_download_migration_done = true` in
+  `[naming]`. Set `naming.enabled = false` to disable automatic naming.
+  Without the model, titles use a heuristic.
 - **Recording:** Invocation inputs/outputs are recorded for metrics + replay,
   with secret-pattern redaction (API keys, bearer tokens, configured
   patterns), capped at `metrics.retention_per_tool` (default 200/Tool).

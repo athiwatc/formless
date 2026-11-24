@@ -2181,23 +2181,37 @@ impl Config {
         cfg.apply_env()?;
         Ok(cfg)
     }
-    /// The config file alone, without `FORMLESS_*` environment overrides
-    /// (what an edit should write back).
+    /// The config file alone, without `FORMLESS_*` environment overrides.
+    /// This read-only load never persists the in-memory naming migration.
     pub fn load_file_only(paths: &Paths) -> Result<Self> {
+        Self::load_file_only_with_migration(paths).map(|(cfg, _)| cfg)
+    }
+
+    /// Persist the naming consent migration for an active-profile startup or
+    /// explicit config edit. Diagnostics and profile scans should use the
+    /// read-only `load` methods instead.
+    pub fn persist_naming_download_migration(paths: &Paths) -> Result<bool> {
+        let (cfg, migrated) = Self::load_file_only_with_migration(paths)?;
+        if migrated {
+            if let Err(error) = cfg.save_inner(paths, false) {
+                tracing::warn!("could not persist naming download-consent migration: {error:#}");
+                return Ok(false);
+            }
+        }
+        Ok(migrated)
+    }
+
+    fn load_file_only_with_migration(paths: &Paths) -> Result<(Self, bool)> {
         let file = paths.config_file();
         if !file.exists() {
-            return Ok(Self::default());
+            return Ok((Self::default(), false));
         }
         let text =
             std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
         let mut cfg: Self =
             toml::from_str(&text).with_context(|| format!("parse {}", file.display()))?;
-        if cfg.naming.migrate_auto_download() {
-            if let Err(error) = cfg.save_inner(paths, false) {
-                tracing::warn!("could not persist naming download-consent migration: {error:#}");
-            }
-        }
-        Ok(cfg)
+        let migrated = cfg.naming.migrate_auto_download();
+        Ok((cfg, migrated))
     }
 
     /// Set one dotted key (`tools.inline_limit`) from JSON, validated by

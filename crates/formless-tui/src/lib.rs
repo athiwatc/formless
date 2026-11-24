@@ -20639,6 +20639,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
     if Config::load(&paths).is_ok_and(|c| c.tui.screen_reader) {
         return plain::run(paths);
     }
+    let _ = Config::persist_naming_download_migration(&paths);
     let mut app = App::new(paths)?;
     if let Some(s) = start {
         app.on_start = s.to_string();

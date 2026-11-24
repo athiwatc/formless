@@ -128,16 +128,38 @@ fn legacy_naming_download_default_is_migrated_before_explicit_opt_in() {
 
     std::fs::write(paths.config_file(), "[naming]\nauto_download = true\n").unwrap();
 
+    let legacy_text = std::fs::read_to_string(paths.config_file()).unwrap();
+    let file_only = Config::load_file_only(&paths).unwrap();
+    assert!(!file_only.naming.auto_download);
+    assert!(file_only.naming.auto_download_migration_done);
+    assert_eq!(std::fs::read_to_string(paths.config_file()).unwrap(), legacy_text);
+
     let mut cfg = Config::load(&paths).unwrap();
     assert!(!cfg.naming.auto_download);
     assert!(cfg.naming.auto_download_migration_done);
+    assert_eq!(std::fs::read_to_string(paths.config_file()).unwrap(), legacy_text);
+
+    assert!(Config::persist_naming_download_migration(&paths).unwrap());
     let saved = std::fs::read_to_string(paths.config_file()).unwrap();
     assert!(saved.contains("auto_download = false"));
     assert!(saved.contains("auto_download_migration_done = true"));
+    assert!(!Config::persist_naming_download_migration(&paths).unwrap());
 
     cfg.set_key("naming.auto_download", json!(true)).unwrap();
+    assert!(cfg.naming.auto_download_migration_done);
     cfg.save(&paths).unwrap();
     assert!(Config::load(&paths).unwrap().naming.auto_download);
+
+    let hand_authored_opt_in =
+        "[naming]\nauto_download = true\nauto_download_migration_done = true\n";
+    std::fs::write(paths.config_file(), hand_authored_opt_in).unwrap();
+    let opted_in = Config::load_file_only(&paths).unwrap();
+    assert!(opted_in.naming.auto_download);
+    assert!(!Config::persist_naming_download_migration(&paths).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(paths.config_file()).unwrap(),
+        hand_authored_opt_in
+    );
 
     std::fs::remove_dir_all(base).unwrap();
 }

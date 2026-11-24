@@ -311,6 +311,8 @@ formless memory rm m1a2b3c4
 
 Set `naming.model` to select a model. Sizes are decimal MB rounded to two places and cover the GGUF weights only. The tokenizer is downloaded separately.
 
+A hand-authored `[naming]` config that sets `auto_download = true` without `auto_download_migration_done = true` is conservatively treated as legacy and remains off. Opt in with `formless config set naming.auto_download true`, or set both keys to `true` in TOML.
+
 | Model ID | Model | Quantization | Weights | License |
 | --- | --- | --- | --- | --- |
 | `qwen2.5-0.5b` | Qwen2.5-0.5B-Instruct (default) | `Q4_0` | 428.73 MB | [Apache-2.0](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/blob/9217f5db79a29953eb74d5343926648285ec7e67/LICENSE) |

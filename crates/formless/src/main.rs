@@ -6815,6 +6815,10 @@ fn config_edit(paths: &Paths) -> Result<()> {
             "warning: {} could not be loaded before editing: {error:#}",
             file.display()
         );
+    } else if let Err(error) = Config::persist_naming_download_migration(paths) {
+        eprintln!(
+            "warning: could not persist naming download-consent migration: {error:#}"
+        );
     }
     let draft = file.with_extension("toml.edit");
     #[cfg(unix)]
