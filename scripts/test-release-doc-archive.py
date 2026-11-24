@@ -14,6 +14,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 GUIDES = ("docs/usage.md", "docs/cli.md", "docs/architecture.md")
 REQUIRED_ARCHIVE_FILES = {
+    "SECURITY.md",
     "docs/usage.md",
     "docs/cli.md",
     "docs/architecture.md",
@@ -58,7 +59,7 @@ class ReleaseDocArchive(unittest.TestCase):
             script = r'''
 $name = $env:FORMLESS_RELEASE_TEST_PACKAGE
 New-Item -ItemType Directory -Path $name -Force | Out-Null
-Copy-Item README.md,SPEC.md,LICENSE $name
+Copy-Item README.md,SPEC.md,LICENSE,SECURITY.md $name
 New-Item -ItemType Directory -Path "$name/packaging","$name/relay","$name/crates/formless-desktop" -Force | Out-Null
 Copy-Item GLOSSARY.md "$name"
 Copy-Item -Path docs -Destination "$name" -Recurse
@@ -76,7 +77,7 @@ Copy-Item crates/formless-desktop/README.md "$name/crates/formless-desktop"
         else:
             script = '''
 mkdir -p "$name" "$name/packaging" "$name/relay" "$name/crates/formless-desktop"
-cp README.md SPEC.md LICENSE "$name/"
+cp README.md SPEC.md LICENSE SECURITY.md "$name/"
 cp GLOSSARY.md "$name/"
 cp -R docs "$name/"
 cp packaging/*.md "$name/packaging/"
@@ -153,6 +154,11 @@ Compress-Archive -Path $name -DestinationPath "$name.zip"
             workflow = (ROOT / ".github/workflows" / workflow_name).read_text(encoding="utf-8")
             with self.subTest(workflow=workflow_name):
                 for command in (
+                    'cp README.md SPEC.md LICENSE SECURITY.md "$name/"',
+                    'cp target/release/formless target/formless.1 README.md SPEC.md LICENSE SECURITY.md "$name/"',
+                ):
+                    self.assertEqual(workflow.count(command), 1, command)
+                for command in (
                     'cp GLOSSARY.md "$name/"',
                     'cp -R docs "$name/"',
                     'cp packaging/*.md "$name/packaging/"',
@@ -161,6 +167,7 @@ Compress-Archive -Path $name -DestinationPath "$name.zip"
                 ):
                     self.assertEqual(workflow.count(command), 2, command)
                 for command in (
+                    'Copy-Item README.md,SPEC.md,LICENSE,SECURITY.md $name',
                     'Copy-Item GLOSSARY.md "$name"',
                     'Copy-Item -Path docs -Destination "$name" -Recurse',
                     'Copy-Item -Path packaging/*.md -Destination "$name/packaging"',
