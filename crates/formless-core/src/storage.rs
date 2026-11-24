@@ -802,7 +802,7 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 76;
+pub const SCHEMA_VERSION: i64 = 78;
 
 #[path = "topic_context.rs"]
 mod topic_context;
@@ -946,7 +946,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 74] = [
+const MIGRATIONS: [(i64, MigrationStep); 76] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1292,6 +1292,23 @@ const MIGRATIONS: [(i64, MigrationStep); 74] = [
             c,
             "topics",
             r#"limits TEXT NOT NULL DEFAULT '{"max_retries_per_step":3,"max_attempts_per_topic":20}'"#,
+        )
+    }),
+    (77, |c| {
+        Ok(c.execute_batch(
+            "CREATE TABLE durable_send_receipts (
+               session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+               client_msg_id TEXT NOT NULL,
+               outcome TEXT NOT NULL,
+               PRIMARY KEY(session_id, client_msg_id)
+             );",
+        )?)
+    }),
+    (78, |c| {
+        add_column(
+            c,
+            "queued_messages",
+            "no_pending_attachments INTEGER NOT NULL DEFAULT 0 CHECK(no_pending_attachments IN (0,1))",
         )
     }),
 ];
@@ -4064,19 +4081,72 @@ impl Store {
 
     /// Queue a message to start its own Run after the current one (§5.3).
     pub fn enqueue_message(&self, session_id: &str, content: &str) -> Result<()> {
+        self.enqueue_message_with_policy(session_id, content, false)
+    }
+
+    pub(crate) fn enqueue_outbox_message(&self, session_id: &str, content: &str) -> Result<()> {
+        self.enqueue_message_with_policy(session_id, content, true)
+    }
+
+    fn enqueue_message_with_policy(
+        &self,
+        session_id: &str,
+        content: &str,
+        no_pending_attachments: bool,
+    ) -> Result<()> {
         self.ex(
-            "INSERT INTO queued_messages(session_id,content,created_at) VALUES(?1,?2,?3)",
-            params![session_id, content, now()],
+            "INSERT INTO queued_messages(session_id,content,created_at,no_pending_attachments) VALUES(?1,?2,?3,?4)",
+            params![session_id, content, now(), no_pending_attachments],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn durable_send_receipt(
+        &self,
+        session_id: &str,
+        client_msg_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let outcome: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT outcome FROM durable_send_receipts WHERE session_id=?1 AND client_msg_id=?2",
+                params![session_id, client_msg_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        outcome
+            .map(|outcome| serde_json::from_str(&outcome).context("invalid durable send receipt"))
+            .transpose()
+    }
+
+    pub(crate) fn record_durable_send_receipt(
+        &self,
+        session_id: &str,
+        client_msg_id: &str,
+        outcome: &serde_json::Value,
+    ) -> Result<()> {
+        self.ex(
+            "INSERT INTO durable_send_receipts(session_id,client_msg_id,outcome) VALUES(?1,?2,?3)",
+            params![session_id, client_msg_id, outcome.to_string()],
         )?;
         Ok(())
     }
 
     /// Remove and return the Session's oldest queued message.
     pub fn pop_queued_message(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .pop_queued_message_with_policy(session_id)?
+            .map(|(content, _)| content))
+    }
+
+    pub(crate) fn pop_queued_message_with_policy(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, bool)>> {
         Ok(self.ps(
             "DELETE FROM queued_messages WHERE id=(SELECT id FROM queued_messages WHERE session_id=?1
-               ORDER BY COALESCE(position,id),id LIMIT 1) RETURNING content",
-        )?.query_row([session_id], |row| row.get(0)).optional()?)
+               ORDER BY COALESCE(position,id),id LIMIT 1) RETURNING content,no_pending_attachments",
+        )?.query_row([session_id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?)
     }
 
     pub fn list_queued_messages(&self, session_id: &str) -> Result<Vec<String>> {

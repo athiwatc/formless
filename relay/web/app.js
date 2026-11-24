@@ -61,32 +61,54 @@
     set(k, v) {
       try { localStorage.setItem("formless." + k, JSON.stringify(v)); return true; } catch (_) { return false; }
     },
+    remove(k) {
+      try { localStorage.removeItem("formless." + k); return true; } catch (_) { return false; }
+    },
   };
 
-  function loadDrafts() {
-    const drafts = prefs.get("drafts", {});
-    return drafts && typeof drafts === "object" && !Array.isArray(drafts)
-      ? Object.fromEntries(Object.entries(drafts).filter(([, value]) => typeof value === "string"))
-      : {};
+  function outboxStorageKey(scope) { return "outbox:" + encodeURIComponent(scope); }
+  function draftStorageKey(scope, sessionId) { return "draft:" + encodeURIComponent(scope) + ":" + encodeURIComponent(sessionId); }
+  function attachmentStorageKey(scope, sessionId) { return "attachment-inventory:" + encodeURIComponent(scope) + ":" + encodeURIComponent(sessionId); }
+  function sessionCacheKey(scope, sessionId) {
+    return (scope || "") + "\u0000" + sessionId;
   }
-  function loadOutbox() {
-    const saved = prefs.get("outbox", []);
+  function outboxLockName(scope) { return "formless-outbox:" + encodeURIComponent(scope); }
+  function sessionStorageKey(scope) { return scope ? "session:" + encodeURIComponent(scope) : "session"; }
+  function loadDraft(scope, sessionId) {
+    if (!scope || !sessionId) return "";
+    const value = prefs.get(draftStorageKey(scope, sessionId), "");
+    return typeof value === "string" ? value : "";
+  }
+  function loadOutbox(scope) {
+    if (!scope) return [];
+    const saved = prefs.get(outboxStorageKey(scope), []);
     if (!Array.isArray(saved)) return [];
-    const outbox = saved.filter((item) => item && typeof item.session_id === "string"
+    return saved.filter((item) => item && item.scope === scope && typeof item.session_id === "string"
       && typeof item.content === "string" && typeof item.client_msg_id === "string"
       && item.client_msg_id && ["send", "steer", "queue"].includes(item.mode))
-      .map((item) => ({
-        session_id: item.session_id,
-        content: item.content,
-        mode: item.mode,
-        client_msg_id: item.client_msg_id,
-        status: item.status === "failed" ? "failed" : "queued",
-        error: typeof item.error === "string" ? item.error : "",
-      }));
-    if (outbox.length !== saved.length || saved.some((item, index) => item.status === "sending" || item.status !== outbox[index]?.status)) {
-      prefs.set("outbox", outbox);
-    }
-    return outbox;
+      .map((item) => {
+        const validInventory = Array.isArray(item.expected_attachments);
+        let status = ["queued", "sending", "failed"].includes(item.status) ? item.status : "queued";
+        let error = typeof item.error === "string" ? item.error : "";
+        if (!validInventory) { status = "failed"; error = "Attachment inventory is unavailable; review this message before sending."; }
+        if (item.mode === "steer" && (typeof item.expected_run_id !== "string" || !item.expected_run_id)) {
+          status = "failed"; error = "The original Run could not be identified; this message was not sent.";
+        }
+        return {
+          scope,
+          order: Number.isFinite(item.order) ? item.order : 0,
+          session_id: item.session_id,
+          content: item.content,
+          mode: item.mode,
+          expected_attachments: validInventory ? item.expected_attachments : null,
+          expected_run_id: typeof item.expected_run_id === "string" ? item.expected_run_id : null,
+          forecast_pending: item.forecast_pending === true,
+          client_msg_id: item.client_msg_id,
+          status,
+          error,
+        };
+      })
+      .sort((a, b) => a.order - b.order || a.client_msg_id.localeCompare(b.client_msg_id));
   }
 
   // While an IME is composing (Japanese, Chinese, Korean…), Enter and
@@ -126,9 +148,11 @@
     topicRevision: 0,
     topicFocus: null,
     current: null,
-    drafts: loadDrafts(),
-    outbox: loadOutbox(),
+    drafts: {},
+    attachmentInventories: {},
+    outbox: [],
     outboxFlushing: false,
+    outboxFlushRequested: false,
     messages: [],
     sessionLoad: null, // { id, status: pending | failed | loaded }
     streaming: "",
@@ -155,24 +179,101 @@
     enterSends: prefs.get("enterSends", null),
     follow: true,
     editMessageId: null,
+    storageScope: null,
     nextId: Math.floor(Math.random() * 1e9) + 1,
+    submitting: new Set(),
     pending: new Map(),
     subagents: [], // last /agents listing
   };
 
-  function saveDraft(sessionId, value) {
+  function saveDraft(sessionId, value, scope = S.storageScope) {
     if (!sessionId) return true;
     S.drafts = S.drafts || {};
-    if (value) S.drafts[sessionId] = value;
-    else delete S.drafts[sessionId];
-    return prefs.set("drafts", S.drafts);
+    if (scope === S.storageScope) {
+      if (value) S.drafts[sessionId] = value;
+      else delete S.drafts[sessionId];
+    }
+    if (!scope) return true;
+    const key = draftStorageKey(scope, sessionId);
+    return value ? prefs.set(key, value) : typeof prefs.remove === "function" ? prefs.remove(key) : prefs.set(key, "");
   }
   function restoreDraft(sessionId) {
-    $("input").value = (S.drafts && S.drafts[sessionId]) || "";
+    const value = loadDraft(S.storageScope, sessionId);
+    S.drafts[sessionId] = value;
+    $("input").value = value;
     autosize();
   }
-  function persistOutbox() {
-    return prefs.set("outbox", S.outbox || []);
+  function persistOutbox(scope, entries) {
+    return !!scope && prefs.set(outboxStorageKey(scope), entries);
+  }
+  function hasOutboxLock() {
+    return typeof navigator !== "undefined" && !!navigator.locks && typeof navigator.locks.request === "function";
+  }
+  function withOutboxLock(scope, action) {
+    if (!scope || !hasOutboxLock()) return Promise.resolve(false);
+    return navigator.locks.request(outboxLockName(scope), action);
+  }
+  function refreshOutbox(scope = S.storageScope) {
+    if (!scope) return;
+    const entries = loadOutbox(scope);
+    if (scope === S.storageScope) {
+      S.outbox = entries;
+      renderOutbox();
+    }
+    return entries;
+  }
+  function activateStorageScope() {
+    const scope = S.local ? "local:" + location.origin : S.room ? "relay:" + S.room : null;
+    if (!scope) return false;
+    if (scope === S.storageScope) { refreshOutbox(scope); return true; }
+    if (S.current) saveDraft(S.current, $("input").value);
+    S.storageScope = scope;
+    S.drafts = {};
+    S.attachmentInventories = {};
+    S.chips = {};
+    S.outbox = loadOutbox(scope);
+    if (S.current) {
+      S.current = null;
+      $("input").value = "";
+      autosize();
+      renderChips();
+    }
+    renderOutbox();
+    return true;
+  }
+  function loadAttachmentInventory(scope, sessionId) {
+    const value = scope && prefs.get(attachmentStorageKey(scope, sessionId), null);
+    return Array.isArray(value) ? value : null;
+  }
+  function saveAttachmentInventory(scope, sessionId, attachments) {
+    if (!scope || !sessionId || !Array.isArray(attachments)) return false;
+    S.attachmentInventories[sessionId] = attachments;
+    S.chips[sessionId] = attachments;
+    return prefs.set(attachmentStorageKey(scope, sessionId), attachments);
+  }
+  async function refreshAttachmentInventory(sessionId, scope = S.storageScope, requireFresh = false) {
+    if (!scope || !sessionId) return null;
+    if (scope !== S.storageScope) return requireFresh ? null : loadAttachmentInventory(scope, sessionId);
+    if (S.daemonOnline && S.channel) {
+      try {
+        const result = await request({ type: "list_pending_attachments", session_id: sessionId });
+        if (scope !== S.storageScope) return null;
+        const attachments = Array.isArray(result && result.attachments) ? result.attachments : null;
+        if (attachments) {
+          saveAttachmentInventory(scope, sessionId, attachments);
+          if (S.current === sessionId) renderChips();
+          return attachments;
+        }
+      } catch (_) {}
+    }
+    if (requireFresh) return null;
+    const cached = S.attachmentInventories[sessionId] || loadAttachmentInventory(scope, sessionId);
+    if (cached) {
+      S.attachmentInventories[sessionId] = cached;
+      S.chips[sessionId] = cached;
+      if (S.current === sessionId) renderChips();
+    }
+    return cached;
   }
   function renderOutbox() {
     const box = $("outbox");
@@ -186,75 +287,162 @@
           h("strong", { class: "outbox-status" }, status),
           h("div", { class: "outbox-content" }, item.content),
           item.error ? h("div", { class: "outbox-error" }, item.error) : null),
-        h("button", { type: "button", class: "btn ghost", "aria-label": "Discard " + status.toLowerCase() + " message", onclick: () => discardOutbox(item) }, "Discard"));
+          h("button", { type: "button", class: "btn ghost", "aria-label": "Discard " + status.toLowerCase() + " message", onclick: () => discardOutbox(item) }, "Discard"));
     }));
   }
-  function enqueueOutbox(sessionId, content, mode) {
-    if (!sessionId || !content || !["send", "steer", "queue"].includes(mode)) return null;
+  async function enqueueOutbox(sessionId, content, mode, { expectedAttachments, expectedRunId, forecastPending = false, blockedReason = "", storageScope = S.storageScope } = {}) {
+    if (!sessionId || !content || !["send", "steer", "queue"].includes(mode) || !storageScope || !hasOutboxLock()) return null;
+    const scope = storageScope;
     const clientMsgId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2);
-    const item = { session_id: sessionId, content, mode, client_msg_id: clientMsgId, status: "queued", error: "" };
-    S.outbox = S.outbox || [];
-    S.outbox.push(item);
-    if (!persistOutbox()) {
-      S.outbox.pop();
-      return null;
-    }
-    renderOutbox();
-    return item;
+    const inventory = Array.isArray(expectedAttachments) ? expectedAttachments : null;
+    const error = blockedReason || (!inventory ? "Attachment inventory could not be verified; reconnect and review before sending." : "");
+    const item = {
+      scope, order: 0, session_id: sessionId, content, mode,
+      expected_attachments: inventory,
+      expected_run_id: expectedRunId || null,
+      forecast_pending: !!forecastPending,
+      client_msg_id: clientMsgId,
+      status: error ? "failed" : "queued",
+      error,
+    };
+    let saved = false;
+    await withOutboxLock(scope, async () => {
+      const entries = loadOutbox(scope);
+      item.order = entries.reduce((max, entry) => Math.max(max, entry.order), 0) + 1;
+      saved = persistOutbox(scope, [...entries, item]);
+      if (saved && scope === S.storageScope) refreshOutbox(scope);
+    });
+    return saved ? item : null;
   }
-  function canFlushOutbox() {
-    return !!(S.daemonOnline && S.channel && (S.local || S.relayReady));
+  function canFlushOutbox(scope = S.storageScope) {
+    return !!(scope && scope === S.storageScope && hasOutboxLock() && S.daemonOnline && S.channel && (S.local || S.relayReady));
   }
-  function discardOutbox(item) {
-    const previous = S.outbox || [];
-    if (!previous.includes(item)) return false;
-    S.outbox = previous.filter((entry) => entry !== item);
-    if (!persistOutbox()) {
-      S.outbox = previous;
-      renderOutbox();
+  async function discardOutbox(item) {
+    const scope = item && item.scope;
+    if (!scope) return false;
+    let discarded = false;
+    try {
+      await withOutboxLock(scope, async () => {
+        const entries = loadOutbox(scope);
+        const next = entries.filter((entry) => entry.client_msg_id !== item.client_msg_id);
+        if (next.length === entries.length) return;
+        discarded = persistOutbox(scope, next);
+        if (discarded) refreshOutbox(scope);
+      });
+    } catch (_) {}
+    if (!discarded) {
       note("Could not save the outbox change; the message was not discarded.", true);
       return false;
     }
-    renderOutbox();
-    void flushOutbox();
+    if (scope === S.storageScope) void flushOutbox();
     return true;
   }
   async function flushOutbox() {
-    if (S.outboxFlushing || !canFlushOutbox()) return;
+    const scope = S.storageScope;
+    if (S.outboxFlushing) { S.outboxFlushRequested = true; return; }
+    if (!canFlushOutbox(scope)) return;
     S.outboxFlushing = true;
     try {
-      while (canFlushOutbox() && S.outbox && S.outbox.length) {
-        const item = S.outbox[0];
-        if (item.status === "failed") break;
-        item.status = "sending";
-        item.error = "";
-        persistOutbox();
-        renderOutbox();
-        try {
-          await request({ type: "send_message", session_id: item.session_id, content: item.content, mode: item.mode, client_msg_id: item.client_msg_id });
-        } catch (error) {
-          if (!S.outbox.includes(item)) continue;
-          item.status = error.daemonResponse ? "failed" : "queued";
-          item.error = error.message;
-          persistOutbox();
-          renderOutbox();
-          if (error.daemonResponse) { toast(error.message, true); note(error.message, true); }
-          break;
+      S.outboxFlushRequested = false;
+      await withOutboxLock(scope, async () => {
+        if (!canFlushOutbox(scope)) return;
+        let entries = loadOutbox(scope);
+        let recovered = false;
+        for (const item of entries) if (item.status === "sending") { item.status = "queued"; recovered = true; }
+        if (recovered && !persistOutbox(scope, entries)) return;
+        refreshOutbox(scope);
+        while (canFlushOutbox(scope)) {
+          entries = loadOutbox(scope);
+          const item = entries[0];
+          if (!item || item.status === "failed") break;
+          if (item.forecast_pending) {
+            if (S.current !== item.session_id) {
+              item.error = "Open this Session to review and approve its forecast before sending.";
+              persistOutbox(scope, entries); refreshOutbox(scope); break;
+            }
+            try {
+              if (!(await confirmForecast(item.session_id, item.content))) {
+                item.status = S.daemonOnline && S.current === item.session_id ? "failed" : "queued";
+                item.error = item.status === "failed" ? "Forecast approval was declined; this message was not sent." : "Forecast approval is pending; reconnect and review before sending.";
+                persistOutbox(scope, entries); refreshOutbox(scope); break;
+              }
+              item.forecast_pending = false;
+              item.error = "";
+              if (!persistOutbox(scope, entries)) break;
+            } catch (error) {
+              item.status = error.daemonResponse ? "failed" : "queued";
+              item.error = "Forecast approval is pending: " + error.message;
+              persistOutbox(scope, entries); refreshOutbox(scope); break;
+            }
+          }
+          if (!Array.isArray(item.expected_attachments)) {
+            item.status = "failed";
+            item.error = "Attachment inventory is unavailable; this message was not sent.";
+            persistOutbox(scope, entries); refreshOutbox(scope); break;
+          }
+          item.status = "sending";
+          item.error = "";
+          if (!persistOutbox(scope, entries)) break;
+          refreshOutbox(scope);
+          try {
+            await request({
+              type: "send_outbox_message",
+              session_id: item.session_id,
+              content: item.content,
+              mode: item.mode,
+              expected_attachments: item.expected_attachments,
+              expected_run_id: item.expected_run_id,
+              client_msg_id: item.client_msg_id,
+            });
+          } catch (error) {
+            const latest = loadOutbox(scope);
+            const current = latest.find((entry) => entry.client_msg_id === item.client_msg_id);
+            if (!current) continue;
+            current.status = error.daemonResponse ? "failed" : "queued";
+            current.error = error.message;
+            persistOutbox(scope, latest); refreshOutbox(scope);
+            if (error.daemonResponse) { toast(error.message, true); note(error.message, true); }
+            break;
+          }
+          const remaining = loadOutbox(scope).filter((entry) => entry.client_msg_id !== item.client_msg_id);
+          if (!persistOutbox(scope, remaining)) break;
+          refreshOutbox(scope);
+          if (scope === S.storageScope) {
+            const attachments = await refreshAttachmentInventory(item.session_id, scope, true);
+            const mentioned = mentionAttached[sessionCacheKey(scope, item.session_id)];
+            if (Array.isArray(attachments) && mentioned) {
+              const pendingPaths = new Set(attachments.map((attachment) => attachment.path).filter((path) => typeof path === "string"));
+              for (const path of [...mentioned]) if (!pendingPaths.has(path)) mentioned.delete(path);
+              if (!mentioned.size) delete mentionAttached[sessionCacheKey(scope, item.session_id)];
+            }
+          }
+          if (item.mode === "steer") note("steering the original run");
         }
-        const index = S.outbox.indexOf(item);
-        if (index < 0) continue;
-        S.outbox.splice(index, 1);
-        persistOutbox();
-        renderOutbox();
-        delete S.chips[item.session_id];
-        delete mentionAttached[item.session_id];
-        if (S.current === item.session_id) renderChips();
-        if (item.mode === "steer") note("steering the current run");
-      }
+      });
     } finally {
       S.outboxFlushing = false;
+      if (S.outboxFlushRequested && canFlushOutbox()) {
+        S.outboxFlushRequested = false;
+        queueMicrotask(() => { void flushOutbox(); });
+      }
     }
   }
+
+  window.addEventListener("storage", (event) => {
+    const scope = S.storageScope;
+    if (!scope || !event.key) return;
+    if (event.key === "formless." + outboxStorageKey(scope)) {
+      refreshOutbox(scope);
+      if (canFlushOutbox(scope)) void flushOutbox();
+    }
+    const prefix = "formless.draft:" + encodeURIComponent(scope) + ":";
+    if (event.key.startsWith(prefix)) {
+      const sessionId = decodeURIComponent(event.key.slice(prefix.length));
+      const value = typeof event.newValue === "string" ? (() => { try { return JSON.parse(event.newValue); } catch (_) { return ""; } })() : "";
+      if (typeof value === "string") S.drafts[sessionId] = value;
+      if (S.current === sessionId && typeof value === "string") { $("input").value = value; autosize(); }
+    }
+  });
 
   // --------------------------------------------------------------- crypto
   function b64ToBytes(s) {
@@ -3777,6 +3965,7 @@
     t.value = t.value.slice(0, at.start) + insert + t.value.slice(t.selectionStart);
     const caret = at.start + insert.length;
     t.setSelectionRange(caret, caret);
+    saveDraft(S.current, t.value);
     mention.query = null;
     autosize();
     updateMentions();
@@ -3791,8 +3980,10 @@
     if (!sid) return;
     try {
       const a = await request({ type: "attach_path", session_id: sid, path });
-      (mentionAttached[sid] = mentionAttached[sid] || new Set()).add(path);
+      const key = sessionCacheKey(S.storageScope, sid);
+      (mentionAttached[key] = mentionAttached[key] || new Set()).add(path);
       (S.chips[sid] = S.chips[sid] || []).push({ id: a.reference ? a.path : a.id, name: a.name, mime: a.mime || (a.reference ? "reference" : ""), bytes: a.bytes || 0, path });
+      await refreshAttachmentInventory(sid);
       renderChips();
     } catch (e) {
       note("cannot attach @" + path + ": " + e.message, true);
@@ -3839,10 +4030,12 @@
     const t = $("input");
     if (run && !needsArgs(c)) {
       t.value = "/" + c.name;
+      saveDraft(S.current, t.value);
       closePalette();
       return submit(false);
     }
     t.value = "/" + c.name + (c.args ? " " : "");
+    saveDraft(S.current, t.value);
     if (run) note("usage: " + usage(c));
     palette.sel = 0;
     autosize();
@@ -8104,11 +8297,14 @@
     }).catch(() => {});
     rendered.clear(); // a reload may carry edited messages
     renderChips();
-    const draft = Object.prototype.hasOwnProperty.call(attachmentDrafts, id) ? attachmentDrafts[id] : (S.drafts[id] || "");
-    delete attachmentDrafts[id];
+    const draftKey = sessionCacheKey(S.storageScope, id);
+    const draft = Object.prototype.hasOwnProperty.call(attachmentDrafts, draftKey) ? attachmentDrafts[draftKey] : loadDraft(S.storageScope, id);
+    S.drafts[id] = draft;
+    delete attachmentDrafts[draftKey];
     $("input").value = draft;
     saveDraft(id, draft);
     autosize();
+    void refreshAttachmentInventory(id);
     // Live traffic only for the Session on screen: the relay then carries
     // (and bills) one Session's tokens, not every Session's.
     S.others = [];
@@ -8119,7 +8315,7 @@
         S.others = (S.others || []).filter((c) => c.conn !== S.conn);
         renderStatus();
       }).catch(() => {});
-    prefs.set("session", id);
+    prefs.set(sessionStorageKey(S.storageScope), id);
     S.editMessageId = null;
     S.queued = []; renderQueue();
     S.plan = []; S.planState = null; renderPlan();
@@ -8148,6 +8344,7 @@
     }
     if (!isRunning()) S.activity = null;
     renderAll();
+    void flushOutbox();
   }
   async function newSession() {
     const s = await act({ type: "create_session", name: null });
@@ -8790,72 +8987,111 @@
       autosize();
       return slash(text.slice(1).trim());
     }
-    if (!S.current) await newSession();
-    if (!S.current) return;
-    const sid = S.current;
-    if (S.editMessageId && S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null) {
-      try { if (!(await confirmForecast(sid, text))) return; }
-      catch (e) { note("forecast: " + e.message, true); return; }
-    }
-    const mode = queued ? "queue" : isRunning() ? "steer" : "send";
-    if (S.editMessageId) {
-      const id = S.editMessageId;
-      S.editMessageId = null;
-      restoreDraft(sid);
-      renderComposer();
-      await act({ type: "edit_message", session_id: sid, message_id: id, content: text });
+    const submitKey = [S.storageScope || "", text].join("\u0000");
+    if (S.submitting.has(submitKey)) return;
+    if (S.submitting.size) {
+      note("A message is still being prepared; this draft remains in the composer.", true);
       return;
     }
-    askNotifyPermission();
-    // `@path` mentions are attached first (the daemon resolves them in its
-    // working directory); words that aren't files are left as text.
-    closeMentions();
-    const toolNames = new Set((S.tools || []).map((t) => t.name));
-    const already = mentionAttached[sid] || new Set();
-    // A typed or pasted @path is never sent unseen (#863): it becomes a
-    // chip first, and this Send stops so the chips can be checked.
-    const fresh = [];
-    for (const path of mentionsIn(text)) {
-      // Tools are named for the agent; chosen files are attached already.
-      if (toolNames.has(path) || already.has(path)) continue;
-      try {
-        const a = await request({ type: "attach_path", session_id: sid, path });
-        (mentionAttached[sid] = mentionAttached[sid] || new Set()).add(path);
-        (S.chips[sid] = S.chips[sid] || []).push(a);
-        fresh.push(a.name);
-      } catch (e) {
-        if (/^.+:\+?[0-9]+$/.test(path) || !/^no file/.test(e.message)) {
-          note("cannot attach @" + path + ": " + e.message, true);
+    S.submitting.add(submitKey);
+    try {
+      if (!S.current) await newSession();
+      if (!S.current) return;
+      const sid = S.current;
+      const scope = S.storageScope;
+      const mode = queued ? "queue" : S.running.has(sid) ? "steer" : "send";
+      const expectedRunId = mode === "steer" && S.liveRun && !S.liveRun.ended ? S.liveRun.id : null;
+      const editMessageId = S.editMessageId;
+      const needsForecast = !S.running.has(sid) && S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null;
+      if (editMessageId) {
+        if (needsForecast) {
+          if (!S.daemonOnline) { saveDraft(sid, text, scope); note("Reconnect to approve the forecast before editing this message.", true); return; }
+          try {
+            if (!(await confirmForecast(sid, text, { edit_message_id: editMessageId }))) { saveDraft(sid, text, scope); return; }
+          } catch (error) { saveDraft(sid, text, scope); note("forecast: " + error.message, true); return; }
+        }
+        if (scope !== S.storageScope) { saveDraft(sid, text, scope); return; }
+        S.editMessageId = null;
+        restoreDraft(sid);
+        renderComposer();
+        await act({ type: "edit_message", session_id: sid, message_id: editMessageId, content: text });
+        return;
+      }
+      askNotifyPermission();
+      closeMentions();
+      const toolNames = new Set((S.tools || []).map((tool) => tool.name));
+      const sessionKey = sessionCacheKey(scope, sid);
+      const already = mentionAttached[sessionKey] || new Set();
+      const fresh = [];
+      let attachmentError = "";
+      for (const path of mentionsIn(text)) {
+        if (toolNames.has(path) || already.has(path)) continue;
+        if (!S.daemonOnline || !S.channel) {
+          attachmentError = "File mentions could not be attached while offline; review before sending.";
+          continue;
+        }
+        try {
+          const attachment = await request({ type: "attach_path", session_id: sid, path });
+          if (scope !== S.storageScope) { saveDraft(sid, text, scope); return; }
+          (mentionAttached[sessionKey] = mentionAttached[sessionKey] || new Set()).add(path);
+          (S.chips[sid] = S.chips[sid] || []).push(attachment);
+          fresh.push(attachment.name);
+        } catch (error) {
+          if (/^.+:\+?[0-9]+$/.test(path) || !/^no file/.test(error.message)) {
+            note("cannot attach @" + path + ": " + error.message, true);
+            if (!S.daemonOnline) attachmentError = "File mentions could not be attached while offline; review before sending.";
+          }
         }
       }
-    }
-    if (fresh.length) {
-      if (S.current === sid) { saveDraft(sid, input.value); autosize(); renderChips(); }
-      else { attachmentDrafts[sid] = text; saveDraft(sid, text); }
-      note("This message attaches " + fresh.join(", ") + " (shown above the box; × removes one). Press Send again to send.");
-      return;
-    }
-    if (!isRunning() && S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null) {
-      try {
-        if (!(await confirmForecast(sid,text))) {
-          if (S.current !== sid) { attachmentDrafts[sid]=text; saveDraft(sid, text); }
-          autosize();return;
-        }
-      } catch (error) {
-        if (S.current !== sid) { attachmentDrafts[sid]=text; saveDraft(sid, text); }
-        autosize();note("Forecast was not confirmed: "+error.message,true);return;
+      if (fresh.length) {
+        await refreshAttachmentInventory(sid, scope);
+        if (S.current === sid && scope === S.storageScope) { saveDraft(sid, input.value); autosize(); renderChips(); }
+        else { attachmentDrafts[sessionCacheKey(scope, sid)] = text; saveDraft(sid, text, scope); }
+        note("This message attaches " + fresh.join(", ") + " (shown above the box; × removes one). Press Send again to send.");
+        return;
       }
+      let forecastPending = false;
+      if (needsForecast) {
+        if (!S.daemonOnline || !S.channel) forecastPending = true;
+        else {
+          try {
+            if (!(await confirmForecast(sid, text))) {
+              if (scope !== S.storageScope) saveDraft(sid, text, scope);
+              else if (S.current !== sid) { attachmentDrafts[sessionCacheKey(scope, sid)] = text; saveDraft(sid, text, scope); }
+              return;
+            }
+          } catch (error) {
+            if (!S.daemonOnline) forecastPending = true;
+            else { saveDraft(sid, text, scope); note("Forecast was not confirmed: " + error.message, true); return; }
+          }
+        }
+      }
+      if (scope !== S.storageScope) { saveDraft(sid, text, scope); return; }
+      const inventory = await refreshAttachmentInventory(sid, scope);
+      if (scope !== S.storageScope) { saveDraft(sid, text, scope); return; }
+      let blockedReason = attachmentError;
+      if (mode === "steer" && !expectedRunId) blockedReason = "The active Run could not be identified; this Steer was not sent.";
+      if (mode === "queue" && inventory && inventory.length) blockedReason = "Queue mode cannot preserve pending attachments; this message was not sent.";
+      const item = await enqueueOutbox(sid, text, mode, {
+        expectedAttachments: inventory,
+        expectedRunId,
+        forecastPending,
+        blockedReason,
+        storageScope: scope,
+      });
+      if (!item) {
+        note("Could not save this message to the outbox; it is still in the composer.", true);
+        return;
+      }
+      if (S.current === sid && scope === S.storageScope) {
+        if (input.value.trim() === text) { input.value = ""; saveDraft(sid, "", scope); autosize(); }
+        else saveDraft(sid, input.value, scope);
+      } else saveDraft(sid, "", scope);
+      if (item.status === "failed") note(item.error, true);
+      return scope === S.storageScope ? flushOutbox() : undefined;
+    } finally {
+      S.submitting.delete(submitKey);
     }
-    if (!enqueueOutbox(sid, text, mode)) {
-      note("Could not save this message to the outbox; it is still in the composer.", true);
-      return;
-    }
-    if (S.current === sid && input.value.trim() === text) {
-      input.value = "";
-      saveDraft(sid, "");
-      autosize();
-    }
-    return flushOutbox();
   }
   function stop() {
     if (S.topicsAvailable && currentTopicAttempt()) return;
@@ -9412,7 +9648,7 @@
     if (runningPanelExposed()) refreshRunning("exposure");
     await refreshSessions();
     await refreshTopics(true);
-    const saved = prefs.get("session", null);
+    const saved = prefs.get(sessionStorageKey(S.storageScope), null);
     const linked = S.linkedSession && S.sessions.find((s) => s.id === S.linkedSession);
     if (S.linkedSession && !linked) note("That Session link points to a Session that no longer exists.", true);
     S.linkedSession = null;
@@ -9461,6 +9697,8 @@
     // paired across reloads (#908).
     S.key = await crypto.subtle.importKey("raw", keyBytes, "HKDF", false, ["deriveKey", "deriveBits"]);
     S.room = await roomFor(keyBytes);
+    S.local = false;
+    activateStorageScope();
     keyBytes.fill(0);
     S.relayModule = await import("./transport.mjs");
     // This bound covers retained byte-backed transport copies; rendered
@@ -9485,6 +9723,7 @@
     restorePushSubscription(ws);
     markStable();
     note("daemon online");
+    refreshOutbox();
     void flushOutbox();
     loadAll();
   }
@@ -9654,6 +9893,7 @@
     if (S.relayLink) S.relayLink.endpoint.dispose();
     S.relayLink = null; S.relayReady = false;
     S.local = true;
+    activateStorageScope();
     S.userClosed = false;
     if (token) {
       history.replaceState(null, "", location.pathname);
@@ -9676,6 +9916,7 @@
       $("app").classList.remove("hidden");
       renderAll();
       note("connected to the local daemon");
+      refreshOutbox();
       void flushOutbox();
       loadAll();
     };
@@ -9858,6 +10099,7 @@
         if (S.current === sid) renderChips();
       }
     }
+    await refreshAttachmentInventory(sid);
   }
   /** A sent message's attachments by name; one retention removed says
    * so instead of vanishing (#858). */
@@ -9884,9 +10126,9 @@
         const sid = S.current;
         // A referenced file (too big to attach) is named by its path.
         if (await act({ type: "detach_file", session_id: sid, id: a.id || a.path })) {
-          S.chips[sid] = (S.chips[sid] || []).filter((x) => x !== a);
+          await refreshAttachmentInventory(sid);
           // Its @path stays in the text but isn't attached again on send.
-          renderChips();
+          if (S.current === sid) renderChips();
         }
       } }, "×"))));
     if (focusIndex >= 0) {

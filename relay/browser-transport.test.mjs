@@ -47,7 +47,7 @@ async function browser(keyGate=null,decryptGate=null){
   const c=vm.createContext({S,WebSocket:Socket,location:{protocol:'https:',host:'fixture.invalid'},crypto,Uint8Array,TextEncoder,TextDecoder,btoa,atob,
     enc:s=>new TextEncoder().encode(s),aad:(direction,seq)=>new TextEncoder().encode('formless-relay/2 '+direction+' '+seq),FRAME_VERSION:2,HANDSHAKE_MS:8000,HANDSHAKE_TRIES:3,
     $:id=>{if(!elements.has(id))elements.set(id,{textContent:'',classList:{add(){},remove(){},contains(){return true;}}});return elements.get(id);},
-    setTimeout(){return 1;},clearTimeout(){},renderAll(){},renderChrome(){},renderHistory(){},clearLiveState(){},scheduleReconnect(){},note(){},markStable(){},restorePushSubscription(){},loadAll(){loaded++;},flushOutbox(){flushed++;},onMessage(message){messages.push(message);},
+    setTimeout(){return 1;},clearTimeout(){},renderAll(){},renderChrome(){},renderHistory(){},clearLiveState(){},scheduleReconnect(){},note(){},markStable(){},restorePushSubscription(){},loadAll(){loaded++;},refreshOutbox(){},flushOutbox(){flushed++;},onMessage(message){messages.push(message);},
   });
   vm.runInContext(['openRelay','finishRelayReady','startHandshake','sendHello','confirmTag','finishHandshake','bytesToB64','b64ToBytes','decrypt','pushRefused'].map(fn).join('\n'),c);
   S.key=await webcrypto.subtle.importKey('raw',new Uint8Array(32).fill(7),'HKDF',false,['deriveBits','deriveKey']);

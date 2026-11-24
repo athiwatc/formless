@@ -2688,6 +2688,18 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_msg_id: Option<String>,
     },
+    /// Send one durable browser-outbox action. The action is deduplicated for
+    /// the Session for as long as its durable receipt exists. Attachments are
+    /// compared and consumed atomically; a Steer is bound to its original Run.
+    SendOutboxMessage {
+        session_id: String,
+        content: String,
+        mode: SendMode,
+        expected_attachments: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_run_id: Option<String>,
+        client_msg_id: String,
+    },
     /// Append only if the complete, ordered pending metadata still matches
     /// the reviewed inventory. Comparison and consumption share a transaction.
     /// Queue/deferred sends are unsupported. When `reviewed_send_mode_v1` is

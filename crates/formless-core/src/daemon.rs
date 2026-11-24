@@ -757,6 +757,10 @@ enum SendReceiptKind {
     Reviewed,
     ReviewedSteer,
 }
+struct OutboxSend {
+    expected_attachments: Vec<Value>,
+    expected_run_id: Option<String>,
+}
 type SendOutcome = std::result::Result<Value, CachedSendFailure>;
 #[derive(Clone, Debug)]
 struct CachedSendFailure {
@@ -970,7 +974,7 @@ pub struct Daemon {
     config_edit: StdMutex<()>,
     mcp_import_candidates:
         StdMutex<HashMap<String, (std::time::Instant, crate::mcp_catalog::Candidate)>>,
-    /// Legacy/reviewed Send keys seen in the last 10 minutes and their outcome.
+    /// In-flight and reviewed Send keys; successful legacy receipts are durable in Store.
     sent_keys: StdMutex<HashMap<(SendKey, SendReceiptKind), SentEntry>>,
     reference_detaches: reviewed_reference_detach::Receipts,
     /// Per-Session provider context, extended step by step (SPEC §11).
@@ -2795,8 +2799,30 @@ impl Daemon {
                 mode,
                 client_msg_id,
             } => {
-                self.send_message_once(session_id, content, mode, client_msg_id, None)
+                self.send_message_once(session_id, content, mode, client_msg_id, None, None)
                     .await
+            }
+            Request::SendOutboxMessage {
+                session_id,
+                content,
+                mode,
+                expected_attachments,
+                expected_run_id,
+                client_msg_id,
+            } => {
+                reviewed_send::validate_key(&client_msg_id)?;
+                self.send_message_once(
+                    session_id,
+                    content,
+                    mode,
+                    Some(client_msg_id),
+                    None,
+                    Some(OutboxSend {
+                        expected_attachments,
+                        expected_run_id,
+                    }),
+                )
+                .await
             }
             Request::SendReviewedMessage {
                 session_id,
@@ -2815,6 +2841,7 @@ impl Daemon {
                         expected_attachments,
                         run_id: None,
                     }),
+                    None,
                 )
                 .await
             }
@@ -2838,6 +2865,7 @@ impl Daemon {
                         expected_attachments,
                         run_id: Some(run_id),
                     }),
+                    None,
                 )
                 .await
             }
@@ -5849,14 +5877,34 @@ impl Daemon {
         mode: SendMode,
         client_msg_id: Option<String>,
         review: Option<reviewed_send::Review>,
+        outbox: Option<OutboxSend>,
     ) -> Result<Value> {
-        let Some(key) = client_msg_id else {
+        let Some(client_msg_id) = client_msg_id else {
+            if outbox.is_some() {
+                return Err(
+                    RequestFailure::invalid("outbox sends require an action identity").into(),
+                );
+            }
             return self
-                .send_message_with_review(session_id, content, mode, review)
+                .send_message_with_review(session_id, content, mode, review, outbox, None)
                 .await;
         };
+        if outbox.is_some() {
+            if let Some(outcome) =
+                self.with_reader(|st| st.durable_send_receipt(&session_id, &client_msg_id))?
+            {
+                return Ok(outcome);
+            }
+        }
         let who = current_client();
-        let steer_run_id = review.as_ref().and_then(|review| review.run_id.as_deref());
+        let steer_run_id = review
+            .as_ref()
+            .and_then(|review| review.run_id.as_deref())
+            .or_else(|| {
+                outbox
+                    .as_ref()
+                    .and_then(|send| send.expected_run_id.as_deref())
+            });
         // Legacy sends use their Session-scoped action id across reconnects;
         // reviewed operations remain bound to the connection that approved them.
         let key = (
@@ -5867,7 +5915,7 @@ impl Daemon {
                     None
                 },
                 session_id.clone(),
-                key,
+                client_msg_id.clone(),
             ),
             match &review {
                 Some(review) if review.run_id.is_some() => SendReceiptKind::ReviewedSteer,
@@ -5904,6 +5952,7 @@ impl Daemon {
                 (rx, Some(tx))
             }
         };
+        let durable_client_msg_id = outbox.is_some().then_some(client_msg_id);
         if let Some(tx) = owner {
             let this = self.clone();
             // A dropped reply/waiter must not cancel a send after it
@@ -5911,9 +5960,14 @@ impl Daemon {
             tokio::spawn(async move {
                 use futures_util::FutureExt;
                 let execute = async {
-                    match std::panic::AssertUnwindSafe(
-                        this.send_message_with_review(session_id, content, mode, review),
-                    )
+                    match std::panic::AssertUnwindSafe(this.send_message_with_review(
+                        session_id,
+                        content,
+                        mode,
+                        review,
+                        outbox,
+                        durable_client_msg_id,
+                    ))
                     .catch_unwind()
                     .await
                     {
@@ -5959,7 +6013,7 @@ impl Daemon {
         content: String,
         mode: SendMode,
     ) -> Result<serde_json::Value> {
-        self.send_message_with_review(session_id, content, mode, None)
+        self.send_message_with_review(session_id, content, mode, None, None, None)
             .await
     }
 
@@ -5969,6 +6023,8 @@ impl Daemon {
         content: String,
         mode: SendMode,
         review: Option<reviewed_send::Review>,
+        outbox: Option<OutboxSend>,
+        durable_client_msg_id: Option<String>,
     ) -> Result<Value> {
         self.with_reader(|st| st.ensure_topic_chat_writable(&session_id))?;
         if let Some(review) = &review {
@@ -5980,11 +6036,54 @@ impl Daemon {
                 .into());
             }
         }
+        if let Some(send) = &outbox {
+            reviewed_send::validate(&session_id, &send.expected_attachments)?;
+            if send.expected_run_id.is_some() && mode != SendMode::Steer {
+                return Err(RequestFailure::invalid("only a deferred Steer may name a Run").into());
+            }
+            if mode == SendMode::Steer && send.expected_run_id.is_none() {
+                return Err(
+                    RequestFailure::invalid("a deferred Steer must name its target Run").into(),
+                );
+            }
+            if send
+                .expected_run_id
+                .as_deref()
+                .is_some_and(|run_id| !formless_protocol::valid_reviewed_run_id(run_id))
+            {
+                return Err(RequestFailure::invalid("invalid deferred Steer Run identity").into());
+            }
+            if mode == SendMode::Queue && !send.expected_attachments.is_empty() {
+                return Err(RequestFailure::invalid(
+                    "deferred Queue with attachments requires review; nothing was queued",
+                )
+                .into());
+            }
+        }
+        let expected_attachments = review
+            .as_ref()
+            .map(|review| review.expected_attachments.as_slice())
+            .or_else(|| {
+                outbox
+                    .as_ref()
+                    .map(|send| send.expected_attachments.as_slice())
+            });
         self.with_store(|st| st.get_session(&session_id))?
             .context(RequestFailure::not_found("session not found"))?;
         let _admission = self.forecast_admission.locked();
         self.with_reader(|st| Self::ensure_session_description_trust(st, &session_id))?;
         let control = self.runs.locked().get(&session_id).cloned();
+        if let Some(expected_run) = outbox
+            .as_ref()
+            .and_then(|send| send.expected_run_id.as_deref())
+        {
+            if control.as_ref().map(|run| run.run_id.as_str()) != Some(expected_run) {
+                return Err(RequestFailure::busy(
+                    "Steer target Run is no longer active; message was not sent",
+                )
+                .into());
+            }
+        }
         // A Run can start or finish after the client confirms. Classify under
         // the same admission lock as the ensuing append and Run admission.
         if GENERATED_MESSAGE
@@ -6025,36 +6124,81 @@ impl Daemon {
                 )
                 .into());
             }
-            self.with_store(|st| st.enqueue_message(&session_id, &content))?;
-            self.queue_changed(&session_id);
-            return Ok(json!({"queued":true}));
+            if outbox.is_some()
+                && expected_attachments.is_some_and(|attachments| !attachments.is_empty())
+            {
+                return Err(RequestFailure::busy(
+                    "Run cannot accept this attachment-bound outbox message; nothing was queued or consumed",
+                )
+                .into());
+            }
+            let result = json!({"queued":true});
+            let (outcome, inserted) = self.with_store(|st| {
+                st.transaction(|st| {
+                    if let Some(client_msg_id) = durable_client_msg_id.as_deref() {
+                        if let Some(outcome) =
+                            st.durable_send_receipt(&session_id, client_msg_id)?
+                        {
+                            return Ok((outcome, false));
+                        }
+                    }
+                    if let Some(expected) = expected_attachments {
+                        reviewed_send::check(st, &session_id, Some(expected))?;
+                    }
+                    if outbox.is_some() {
+                        st.enqueue_outbox_message(&session_id, &content)?;
+                    } else {
+                        st.enqueue_message(&session_id, &content)?;
+                    }
+                    if let Some(client_msg_id) = durable_client_msg_id.as_deref() {
+                        st.record_durable_send_receipt(&session_id, client_msg_id, &result)?;
+                    }
+                    Ok((result.clone(), true))
+                })
+            })?;
+            if inserted {
+                self.queue_changed(&session_id);
+            }
+            return Ok(outcome);
         }
-        let expected = review
-            .as_ref()
-            .map(|review| review.expected_attachments.as_slice());
         match control {
             Some(control) => {
                 let step = self
                     .with_reader(|st| st.run_steps(&control.run_id))
                     .unwrap_or(0);
                 let extra = Some(("steer", json!({"step":step,"run_id":control.run_id})));
-                let msg = if let Some(expected) = expected {
-                    self.with_store(|st| {
-                        st.transaction(|st| {
+                let run_id = control.run_id.clone();
+                let result = json!({"steered":true,"run_id":run_id});
+                let (message, outcome, inserted) = self.with_store(|st| {
+                    st.transaction(|st| {
+                        if let Some(client_msg_id) = durable_client_msg_id.as_deref() {
+                            if let Some(outcome) =
+                                st.durable_send_receipt(&session_id, client_msg_id)?
+                            {
+                                return Ok((None, outcome, false));
+                            }
+                        }
+                        if let Some(expected) = expected_attachments {
                             reviewed_send::check(st, &session_id, Some(expected))?;
-                            Self::append_user_message_store(st, &session_id, &content, extra)
-                        })
-                    })?
-                } else {
-                    self.append_user_message_meta(&session_id, &content, extra)?
-                };
-                control.steering.accepted(msg.seq);
-                let _ = control.steer_tx.send(msg.seq);
-                self.broadcast(Event::MessageAppended {
-                    session_id: session_id.clone(),
-                    message: msg,
-                });
-                Ok(json!({"steered":true,"run_id":control.run_id}))
+                        }
+                        let message =
+                            Self::append_user_message_store(st, &session_id, &content, extra)?;
+                        if let Some(client_msg_id) = durable_client_msg_id.as_deref() {
+                            st.record_durable_send_receipt(&session_id, client_msg_id, &result)?;
+                        }
+                        Ok((Some(message), result.clone(), true))
+                    })
+                })?;
+                if let Some(message) = message {
+                    control.steering.accepted(message.seq);
+                    let _ = control.steer_tx.send(message.seq);
+                    self.broadcast(Event::MessageAppended {
+                        session_id: session_id.clone(),
+                        message,
+                    });
+                }
+                let _ = inserted;
+                Ok(outcome)
             }
             None => {
                 let _settings = self.config_guard();
@@ -6064,9 +6208,18 @@ impl Daemon {
                     draft: content.clone(),
                     ..Default::default()
                 };
-                let (msg, run_id, admission) = self.with_store(|st| {
+                let (outcome, new_run) = self.with_store(|st| {
                     st.transaction(|st| {
-                        reviewed_send::check(st, &session_id, expected)?;
+                        if let Some(client_msg_id) = durable_client_msg_id.as_deref() {
+                            if let Some(outcome) =
+                                st.durable_send_receipt(&session_id, client_msg_id)?
+                            {
+                                return Ok((outcome, None));
+                            }
+                        }
+                        if let Some(expected) = expected_attachments {
+                            reviewed_send::check(st, &session_id, Some(expected))?;
+                        }
                         let forecast = self.consented_forecast(st, &cfg, &input)?;
                         #[cfg(test)]
                         if let Some(hook) = self.forecast_admission_test.locked().clone() {
@@ -6080,15 +6233,21 @@ impl Daemon {
                             self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
                         let run_id = st.create_run(&session_id)?;
                         st.record_forecast(&run_id, &forecast)?;
-                        Ok((msg, run_id, admission))
+                        let outcome = json!({"started":true,"run_id":run_id});
+                        if let Some(client_msg_id) = durable_client_msg_id.as_deref() {
+                            st.record_durable_send_receipt(&session_id, client_msg_id, &outcome)?;
+                        }
+                        Ok((outcome, Some((msg, run_id, admission))))
                     })
                 })?;
-                self.broadcast(Event::MessageAppended {
-                    session_id: session_id.clone(),
-                    message: msg,
-                });
-                self.launch_prepared_run(session_id, run_id.clone(), admission)?;
-                Ok(json!({"started":true,"run_id":run_id}))
+                if let Some((message, run_id, admission)) = new_run {
+                    self.broadcast(Event::MessageAppended {
+                        session_id: session_id.clone(),
+                        message,
+                    });
+                    self.launch_prepared_run(session_id, run_id, admission)?;
+                }
+                Ok(outcome)
             }
         }
     }
@@ -6883,10 +7042,18 @@ impl Daemon {
                     held_for_confirmation = true;
                     return Ok(None);
                 }
-                let Some(content) = st.pop_queued_message(&session_id)? else {
+                let Some((content, no_pending_attachments)) =
+                    st.pop_queued_message_with_policy(&session_id)?
+                else {
                     return Ok(None);
                 };
-                let msg = Self::append_user_message_store(st, &session_id, &content, None)?;
+                let msg = Self::append_user_message_store_with_policy(
+                    st,
+                    &session_id,
+                    &content,
+                    None,
+                    !no_pending_attachments,
+                )?;
                 let admission = self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
                 let id = st.create_run(&session_id)?;
                 st.record_forecast(&id, &forecast)?;
@@ -12569,7 +12736,21 @@ impl Daemon {
         content: &str,
         extra: Option<(&str, Value)>,
     ) -> Result<MessageInfo> {
-        let atts = st.take_pending_attachments(session_id)?;
+        Self::append_user_message_store_with_policy(st, session_id, content, extra, true)
+    }
+
+    fn append_user_message_store_with_policy(
+        st: &Store,
+        session_id: &str,
+        content: &str,
+        extra: Option<(&str, Value)>,
+        consume_pending_attachments: bool,
+    ) -> Result<MessageInfo> {
+        let atts = if consume_pending_attachments {
+            st.take_pending_attachments(session_id)?
+        } else {
+            Vec::new()
+        };
         let mut meta = json!({});
         if !atts.is_empty() {
             meta["attachments"] = json!(atts);
@@ -15729,6 +15910,7 @@ impl Daemon {
                     }
                     let session = match &env.request {
                         Request::SendMessage { session_id, .. }
+                        | Request::SendOutboxMessage { session_id, .. }
                         | Request::SendReviewedMessage { session_id, .. }
                         | Request::SendReviewedSteer { session_id, .. }
                         | Request::StartPipelineRun { session_id, .. } => Some(session_id.as_str()),
@@ -15743,6 +15925,7 @@ impl Daemon {
                     if matches!(
                         &env.request,
                         Request::SendMessage { .. }
+                            | Request::SendOutboxMessage { .. }
                             | Request::SendReviewedMessage { .. }
                             | Request::SendReviewedSteer { .. }
                             | Request::StartPipelineRun { .. }

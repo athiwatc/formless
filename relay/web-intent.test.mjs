@@ -17,23 +17,41 @@ const fn = (name) => {
   return source.slice(start, end + 4);
 };
 const deferred = () => { let resolve, reject; const promise = new Promise((r, e) => { resolve = r; reject = e; }); return { promise, resolve, reject }; };
+function memoryPrefs(stored = new Map()) {
+  return {
+    stored,
+    get(key, fallback) { return stored.has(key) ? structuredClone(stored.get(key)) : fallback; },
+    set(key, value) { stored.set(key, structuredClone(value)); return true; },
+    remove(key) { return stored.delete(key); },
+  };
+}
+function testLocks() {
+  const queues = new Map();
+  return { request(name, callback) {
+    const previous = queues.get(name) || Promise.resolve();
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const current = previous.then(() => gate);
+    queues.set(name, current);
+    return previous.then(callback).finally(() => {
+      release();
+      if (queues.get(name) === current) queues.delete(name);
+    });
+  } };
+}
 function setup(names, extras = {}) {
   const elements = new Map();
-  const stored = new Map();
-  const prefs = {
-    get(key, fallback) { return stored.has(key) ? stored.get(key) : fallback; },
-    set(key, value) { stored.set(key, structuredClone(value)); return true; },
-  };
+  const prefs = extras.prefs || memoryPrefs();
   const $ = id => {
     if (!elements.has(id)) elements.set(id, { value: '', style: {}, textContent: '', classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } }, attrs: {}, setAttribute(k,v) { this.attrs[k]=v; }, getAttribute(k) { return this.attrs[k] ?? null; }, removeAttribute(k) { delete this.attrs[k]; }, replaceChildren() {}, select() {}, focus() {} });
     return elements.get(id);
   };
-  const context = vm.createContext({ $, tr: text => text, prefs, mentionAttached: {}, S: { approvalHelpSeen: true, current: 'A', chips: {}, drafts: {}, outbox: [], outboxFlushing: false, daemonOnline: true, channel: {}, local: true, messages: [], sessions: [], view: 'chat', tools: [] },
+  const context = vm.createContext({ $, tr: text => text, prefs, navigator: { locks: testLocks() }, queueMicrotask: callback => Promise.resolve().then(callback), mentionAttached: {}, S: { approvalHelpSeen: true, current: 'A', storageScope: 'test-room', chips: {}, attachmentInventories: {}, drafts: {}, outbox: [], outboxFlushing: false, outboxFlushRequested: false, submitting: new Set(), running: new Set(), liveRun: null, daemonOnline: true, channel: {}, local: true, messages: [], sessions: [], view: 'chat', tools: [] },
     forecastRevision: 0, scheduleForecast() {}, invalidateBranchSummary() {}, branchSummaryEvent() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {},
     // These tests isolate intent/data behavior; real focus/inert behavior runs
     // against the complete shipped UI in web-focus.browser-test.py.
     document: { activeElement: null }, popoverTrigger: null, focusBefore: {}, openDialog() {}, closeDialog() {}, activeDialog: () => null,
-    renderChips() {}, note() {}, autosize() {}, currentTopicAttempt: () => null,
+    renderChips() {}, renderOutbox() {}, note() {}, autosize() {}, currentTopicAttempt: () => null,
     renderTopicNavigation() {}, topicSessionIds: () => new Set(),
     ...extras });
   installEventRenderFixture(context, fn);
@@ -41,7 +59,8 @@ function setup(names, extras = {}) {
   if (names.some(name => ['rateButtons', 'retryRun'].includes(name))) {
     vm.runInContext(['currentRunTarget', 'ensureRunTarget'].map(fn).join('\n'), context);
   }
-  const dependencies = [...(names.some(name => ['decide', 'renderApproval'].includes(name)) ? ['approvalHelpSeen', 'rememberApprovalHelp'] : []), ...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput', 'showAskError'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : [])];
+  const storageFunctions = ['outboxStorageKey','draftStorageKey','attachmentStorageKey','sessionCacheKey','outboxLockName','sessionStorageKey','loadDraft','loadOutbox','saveDraft','restoreDraft','persistOutbox','hasOutboxLock','withOutboxLock','refreshOutbox','activateStorageScope','loadAttachmentInventory','saveAttachmentInventory','refreshAttachmentInventory','enqueueOutbox','canFlushOutbox','discardOutbox','flushOutbox'];
+  const dependencies = [...(names.some(name => ['decide', 'renderApproval'].includes(name)) ? ['approvalHelpSeen', 'rememberApprovalHelp'] : []), ...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput', 'showAskError'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : []), ...(names.some(name => storageFunctions.includes(name)) || names.includes('submit') || names.includes('openSession') || names.includes('acceptMention') || names.includes('acceptCommand') ? storageFunctions : [])];
   if (names.includes('showNextAsk')) vm.runInContext(source.slice(source.indexOf('  let askResolve'), source.indexOf('  /** Promise-based prompt')), context);
   if (names.includes('renderApproval') || names.includes('branchSummaryReviewText')) {
     const start = source.indexOf('  const BIDI =');
@@ -217,7 +236,7 @@ test('passwordless PostgreSQL argv authenticates through the actual pg construct
 });
 test('file upload remains in original Session after switching', async () => {
   const wait = deferred(), calls = [];
-  const c = setup(['attachFiles'], { uploadFile: async (sid, file) => { calls.push(sid); await wait.promise; return { name: file.name }; } });
+  const c = setup(['attachFiles'], { uploadFile: async (sid, file) => { calls.push(sid); await wait.promise; return { name: file.name }; }, refreshAttachmentInventory: async () => [] });
   c.S.chips.B = [{ name: 'B-file' }];
   const pending = c.attachFiles([{ name: 'one' }, { name: 'two' }]);
   c.S.current = 'B'; wait.resolve(); await pending;
@@ -236,20 +255,23 @@ test('slow mention attachment does not cross-post or overwrite new Session compo
   c.S.current = 'B'; c.$('input').value = 'B draft'; c.S.chips.B = [{ name: 'B-file' }];
   wait.resolve(); await pending;
   assert.equal(calls[0].session_id, 'A');
-  assert.equal(calls.length, 1); // fresh attachments must be reviewed before sending
+  assert.equal(calls.filter(call => call.type === 'attach_path').length, 1); // fresh attachments must be reviewed before sending
+  assert.equal(calls.filter(call => call.type === 'send_outbox_message').length, 0);
   assert.equal(c.S.chips.A[0].name, 'file');
   assert.equal(c.S.chips.B[0].name, 'B-file');
   assert.equal(c.$('input').value, 'B draft');
-  assert.equal(vm.runInContext('attachmentDrafts.A', c), 'please read @file');
+  assert.equal(vm.runInContext('attachmentDrafts[sessionCacheKey("test-room", "A")]', c), 'please read @file');
+  assert.equal(vm.runInContext('attachmentDrafts[sessionCacheKey("another-room", "A")]', c), undefined);
 });
 test('line citations queue files for review and report missing citations', async () => {
-  const notes = [], calls = [];
+  const notes = [], calls = [], attached = [];
   const c = setup(['submit', 'saveDraft', 'mentionMatches', 'mentionsIn'], {
     isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
     note: (message, failed) => notes.push({ message, failed }),
     request: async (request) => {
       calls.push(request);
-      if (request.path === 'src/main.rs:42:8') return { name: 'main.rs' };
+      if (request.type === 'list_pending_attachments') return { attachments: attached };
+      if (request.path === 'src/main.rs:42:8') { const item = { id: 'file-1', name: 'main.rs' }; attached.push(item); return item; }
       throw new Error("no file '" + request.path + "'");
     },
   });
@@ -257,7 +279,7 @@ test('line citations queue files for review and report missing citations', async
   const draft = 'Compare @src/main.rs:42:8 with @missing.rs:4 and @someone';
   c.$('input').value = draft;
   await c.submit(false);
-  assert.deepEqual(calls.map((request) => request.path), ['src/main.rs:42:8', 'missing.rs:4', 'someone']);
+  assert.deepEqual(calls.filter(request => request.type === 'attach_path').map((request) => request.path), ['src/main.rs:42:8', 'missing.rs:4', 'someone']);
   assert.equal(c.S.chips.A[0].name, 'main.rs');
   assert.equal(c.$('input').value, draft);
   assert.deepEqual(notes.filter((entry) => entry.failed).map((entry) => entry.message), [
@@ -266,14 +288,20 @@ test('line citations queue files for review and report missing citations', async
 });
 
 test('send completion clears only the original Session attachments', async () => {
-  const wait = deferred(), calls = [];
+  const wait = deferred(), calls = []; let inventoryReads = 0;
   const c = setup(['submit','saveDraft','enqueueOutbox','persistOutbox','flushOutbox','canFlushOutbox'], { isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
-    mentionsIn: () => [], crypto: { randomUUID: () => 'key' }, renderOutbox() {}, request: async x => { calls.push(x); await wait.promise; return {}; } });
+    mentionsIn: () => [], crypto: { randomUUID: () => 'key' }, renderOutbox() {}, request: async x => {
+      calls.push(x);
+      if (x.type === 'list_pending_attachments') return { attachments: inventoryReads++ === 0 && x.session_id === 'A' ? [{ id: 'file-a' }] : [] };
+      await wait.promise; return {};
+    } });
   vm.runInContext('const mentionAttached = {}; const attachmentDrafts = {};', c);
   c.$('input').value = 'hello'; c.S.chips.A = [{}]; c.S.chips.B = [{}];
   const pending = c.submit(false); c.S.current = 'B'; wait.resolve(); await pending;
-  assert.equal(calls[0].session_id, 'A'); assert.equal(calls[0].mode, 'send');
-  assert.equal(c.S.chips.A, undefined); assert.equal(c.S.chips.B.length, 1);
+  const send = calls.find(request => request.type === 'send_outbox_message');
+  assert.equal(send.session_id, 'A'); assert.equal(send.mode, 'send');
+  assert.deepEqual(send.expected_attachments, [{ id: 'file-a' }]);
+  assert.equal(c.S.chips.A.length, 0); assert.equal(c.S.chips.B.length, 1);
 });
 test('tool, search and audit ignore out-of-order resolutions', async () => {
   for (const name of ['selectTool', 'search', 'loadAudit']) {
@@ -301,7 +329,7 @@ test('clearing search invalidates an in-flight reply', async () => {
 test('opening Session clears old messages and merges live appended messages into snapshot', async () => {
   const wait = deferred();
   const noop = () => {};
-  const c = setup(['openSession','saveDraft', 'onEvent'], { applySessionLiveState: noop, notifyFor: noop, renderComposer: noop, act: () => wait.promise, request: async () => ({}), prefs: { set() {} },
+  const c = setup(['openSession','saveDraft', 'onEvent'], { applySessionLiveState: noop, notifyFor: noop, renderComposer: noop, act: () => wait.promise, request: async () => ({}), prefs: memoryPrefs(),
     rendered: new Map(), closeSidebar: noop, renderHistory: noop, renderRunTools: noop, renderStatus: noop,
     renderQueue: noop, renderPlan: noop, renderStep: noop, renderRunBanner: noop, renderAll: noop, isRunning: () => false });
   vm.runInContext('let sessionSeq = 0; const CLIENT_LABEL = "test"; const attachmentDrafts = {};', c);
@@ -586,7 +614,7 @@ test('local and relay reconnect rebuild pending prompts/running and reject stale
   for (const transport of ['local', 'relay']) {
     let reply = deferred();
     const c = setup(['openSession', 'onEvent', 'clearQuestions', 'clearLiveState', 'applySessionLiveState', 'addApproval', 'queueQuestion', 'removeQuestion'], {
-      act: () => reply.promise, request: async () => ({}), prefs: { set() {} }, rendered: new Map(),
+      act: () => reply.promise, request: async () => ({}), prefs: memoryPrefs(), rendered: new Map(),
       closeSidebar() {}, renderHistory() {}, renderRunTools() {}, renderStatus() {}, renderQueue() {}, renderPlan() {}, renderStep() {}, renderRunBanner() {}, renderAll() {},
       renderApproval() {}, renderComposer() {}, showQuestion() {}, cancelAsk() {}, notifyFor() {}, setActivity() {},
       isRunning: () => c.S.running.has(c.S.current),
@@ -626,7 +654,7 @@ test('local and relay reconnect rebuild pending prompts/running and reject stale
 function liveSetup(extras = {}) {
   const wait = deferred();
   const c = setup(['openSession', 'onEvent', 'clearQuestions', 'clearLiveState', 'applySessionLiveState', 'addApproval', 'queueQuestion', 'removeQuestion'], {
-    act: () => wait.promise, request: async () => ({}), prefs: { set() {} }, rendered: new Map(),
+    act: () => wait.promise, request: async () => ({}), prefs: memoryPrefs(), rendered: new Map(),
     closeSidebar() {}, renderHistory() {}, renderRunTools() {}, renderStatus() {}, renderQueue() {}, renderPlan() {}, renderStep() {}, renderRunBanner() {}, renderAll() {},
     renderApproval() {}, renderComposer() {}, showQuestion() {}, cancelAsk() {}, notifyFor() {}, setActivity() {},
     isRunning: () => c.S.running.has(c.S.current), ...extras,
@@ -841,34 +869,112 @@ test('declined consent retains composer and allocates no send intent', async () 
   c.S.settings={limits:{forecast_confirm_usd:0}};c.$('input').value='task';await c.submit(false);
   assert.equal(c.$('input').value,'task');assert.deepEqual(calls.map(c=>c.type),['forecast_run']);
 });
-test('per-session drafts survive storage reload and restore independently', () => {
-  const stored = new Map();
-  const prefs = {
-    get(key, fallback) { return stored.has(key) ? stored.get(key) : fallback; },
-    set(key, value) { stored.set(key, structuredClone(value)); return true; },
-  };
-  const first = setup(['loadDrafts','saveDraft'], { prefs });
-  first.S.drafts = first.loadDrafts();
+test('per-session drafts survive reload without clobbering another pairing or Session', () => {
+  const prefs = memoryPrefs();
+  const first = setup(['saveDraft'], { prefs });
   first.saveDraft('A', 'draft for A'); first.saveDraft('B', 'draft for B');
-  const reloaded = setup(['loadDrafts','restoreDraft'], { prefs });
-  reloaded.S.drafts = reloaded.loadDrafts();
+  const reloaded = setup(['restoreDraft'], { prefs });
   reloaded.restoreDraft('A'); assert.equal(reloaded.$('input').value, 'draft for A');
   reloaded.restoreDraft('B'); assert.equal(reloaded.$('input').value, 'draft for B');
+  reloaded.S.storageScope = 'another-room';
+  reloaded.restoreDraft('A'); assert.equal(reloaded.$('input').value, '');
 });
 
-test('a tab discard recovers a sending outbox item as queued', () => {
-  let saved;
-  const c = setup(['loadOutbox'], { prefs: { get: () => [{ session_id: 'A', content: 'message', mode: 'send', client_msg_id: 'same-action', status: 'sending' }],
-    set: (key, value) => { if (key === 'outbox') saved = structuredClone(value); return true; } } });
-  const outbox = c.loadOutbox();
-  assert.equal(outbox[0].status, 'queued');
-  assert.equal(saved[0].status, 'queued');
-  assert.equal(outbox[0].client_msg_id, 'same-action');
+test('a second tab recovers a sending outbox item under the shared lock', async () => {
+  const prefs = memoryPrefs();
+  prefs.set('outbox:test-room', [{ scope: 'test-room', order: 1, session_id: 'A', content: 'message', mode: 'send', expected_attachments: [], client_msg_id: 'same-action', status: 'sending' }]);
+  const calls = [];
+  const c = setup(['loadOutbox','flushOutbox','canFlushOutbox'], { prefs, request: async request => { calls.push(request); return {}; }, renderOutbox() {} });
+  assert.equal(c.loadOutbox('test-room')[0].status, 'sending');
+  await c.flushOutbox();
+  assert.equal(calls[0].client_msg_id, 'same-action');
+  assert.equal(calls[0].type, 'send_outbox_message');
+  assert.deepEqual(prefs.get('outbox:test-room', []), []);
 });
 
-test('outbox rendering exposes each message state, content and discard action', () => {
+test('cross-tab outbox flushes serialize and draft keys do not clobber each other', async () => {
+  const prefs = memoryPrefs(), locks = testLocks(), calls = [], gate = deferred(); let nextId = 0;
+  const extra = { prefs, navigator: { locks }, renderOutbox() {}, crypto: { randomUUID: () => 'tab-' + (++nextId) } };
+  const first = setup(['saveDraft','loadDraft','enqueueOutbox','loadOutbox','flushOutbox','canFlushOutbox'], extra);
+  const second = setup(['saveDraft','loadDraft','enqueueOutbox','loadOutbox','flushOutbox','canFlushOutbox'], extra);
+  first.saveDraft('A', 'draft A');
+  second.saveDraft('B', 'draft B');
+  await Promise.all([
+    first.enqueueOutbox('A', 'one', 'send', { expectedAttachments: [] }),
+    second.enqueueOutbox('B', 'two', 'send', { expectedAttachments: [] }),
+  ]);
+  assert.equal(first.loadDraft('test-room', 'A'), 'draft A');
+  assert.equal(second.loadDraft('test-room', 'B'), 'draft B');
+  assert.equal(first.loadOutbox('test-room').length, 2);
+
+  first.request = second.request = async request => { calls.push(request); await gate.promise; return {}; };
+  const firstFlush = first.flushOutbox();
+  await new Promise(resolve => setImmediate(resolve));
+  const secondFlush = second.flushOutbox();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.filter(req => req.type === 'send_outbox_message').length, 1, 'the second tab waits on the cross-tab Web Lock');
+  gate.resolve();
+  await Promise.all([firstFlush, secondFlush]);
+  assert.equal(calls.filter(req => req.type === 'send_outbox_message').length, 2);
+  assert.equal(first.loadOutbox('test-room').length, 0);
+});
+
+test('outbox contents and drafts stay hidden from a different pairing', async () => {
+  const c = setup(['activateStorageScope','saveDraft','restoreDraft','enqueueOutbox','loadOutbox','loadDraft'], {
+    prefs: memoryPrefs(), location: { origin: 'https://relay.example' }, crypto: { randomUUID: () => 'room-one-action' }, renderOutbox() {},
+  });
+  c.S.local = false; c.S.room = 'room-one'; c.activateStorageScope();
+  c.S.current = 'A'; c.$('input').value = 'room one draft'; c.saveDraft('A', 'room one draft');
+  await c.enqueueOutbox('A', 'room one outbox', 'send', { expectedAttachments: [] });
+  c.S.room = 'room-two'; c.activateStorageScope();
+  assert.equal(c.S.outbox.length, 0);
+  c.S.current = 'A'; c.restoreDraft('A');
+  assert.equal(c.$('input').value, '');
+  assert.equal(c.loadOutbox('relay:room-one').length, 1);
+  assert.equal(c.loadDraft('relay:room-one', 'A'), 'room one draft');
+});
+
+test('finishing an old pairing outbox send does not clear the new pairing cache', async () => {
+  const prefs = memoryPrefs(), started = deferred(), response = deferred();
+  const nextAttachment = { id: 'new-daemon-file', name: 'new.txt' };
+  const c = setup(['activateStorageScope','enqueueOutbox','flushOutbox'], {
+    prefs, crypto: { randomUUID: () => 'old-daemon-action' },
+    request: async () => { started.resolve(); return response.promise; },
+  });
+  c.S.local = false; c.S.room = 'room-one'; c.S.relayReady = true;
+  c.activateStorageScope();
+  await c.enqueueOutbox('A', 'old daemon message', 'send', { expectedAttachments: [] });
+  const flushing = c.flushOutbox();
+  await started.promise;
+  c.S.room = 'room-two'; c.activateStorageScope();
+  c.S.attachmentInventories.A = [nextAttachment]; c.S.chips.A = [nextAttachment];
+  response.resolve({});
+  await flushing;
+  assert.deepEqual(c.S.attachmentInventories.A, [nextAttachment]);
+  assert.deepEqual(c.S.chips.A, [nextAttachment]);
+});
+
+test('programmatic mention and command completions persist the composer draft', () => {
+  const c = setup(['acceptMention','acceptCommand'], {
+    mention: { files: [{ path: 'src/lib.rs', dir: false }], sel: 0 },
+    mentionAtCaret: () => ({ start: 5 }), updateMentions() {}, attachMention() {},
+    palette: { items: [{ name: 'help', args: 'topic' }], sel: 0 },
+    needsArgs: () => true, updatePalette() {},
+  });
+  const input = c.$('input');
+  input.value = 'look @src'; input.selectionStart = input.value.length; input.setSelectionRange = () => {};
+  c.acceptMention();
+  assert.equal(c.prefs.get('draft:test-room:A', ''), 'look @src/lib.rs ');
+  input.value = '/he';
+  c.acceptCommand(false);
+  assert.equal(c.prefs.get('draft:test-room:A', ''), '/help ');
+});
+
+test('outbox rendering exposes each message state, content and discard action', async () => {
+  const item = { scope: 'test-room', session_id: 'A', content: 'message text', mode: 'send', expected_attachments: [], client_msg_id: 'id', status: 'failed', error: 'daemon rejected it' };
+  const prefs = memoryPrefs(); prefs.set('outbox:test-room', [item]);
   const c = setup(['renderOutbox','discardOutbox','persistOutbox','flushOutbox','canFlushOutbox'], {
-    S: { outbox: [{ session_id: 'A', content: 'message text', mode: 'send', client_msg_id: 'id', status: 'failed', error: 'daemon rejected it' }] },
+    prefs, S: { storageScope: 'test-room', local: true, daemonOnline: true, channel: {}, outbox: [item] },
     h: (tag, attrs, ...children) => ({ tag, attrs, children }),
   });
   const box = c.$('outbox'); let rendered;
@@ -879,7 +985,7 @@ test('outbox rendering exposes each message state, content and discard action', 
   assert.match(plainText(rendered[0]), /message text/);
   assert.match(plainText(rendered[0]), /daemon rejected it/);
   assert.match(plainText(rendered[0]), /Discard/);
-  assert.equal(rendered[0].children[1].attrs.onclick(), true);
+  assert.equal(await rendered[0].children[1].attrs.onclick(), true);
   assert.equal(c.S.outbox.length, 0);
   assert.equal(box.hidden, true);
 });
@@ -888,10 +994,11 @@ test('offline submissions persist the selected mode per Session without sending'
   const calls = [];
   const c = setup(['submit','saveDraft','enqueueOutbox','persistOutbox','flushOutbox','canFlushOutbox'], {
     daemonOnline: false, closeMentions() {}, askNotifyPermission() {}, mentionsIn: () => [],
-    isRunning: () => true, request: async req => { calls.push(req); return {}; },
+    request: async req => { calls.push(req); return {}; },
     crypto: { randomUUID: () => 'steer-action' }, renderOutbox() {},
   });
   c.S.daemonOnline = false; c.S.channel = null;
+  c.S.running.add('A'); c.S.liveRun = { id: 'run-a', ended: false }; c.S.attachmentInventories.A = [];
   c.$('input').value = 'keep this queued';
   await c.submit(false);
   assert.equal(c.$('input').value, '');
@@ -902,29 +1009,130 @@ test('offline submissions persist the selected mode per Session without sending'
   assert.equal(c.S.outbox[0].status, 'queued');
 });
 
+test('offline forecast sends wait in the outbox for online consent', async () => {
+  const calls = [];
+  const c = forecastContext(['forecastStamp','confirmForecast','submit'], {
+    ask: async () => true,
+    request: async request => {
+      calls.push(request);
+      if (request.type === 'forecast_run') return { confirmation_required: true, confirmation_id: 'quote', hint: '$1', warnings: [] };
+      if (request.type === 'confirm_forecast') return { confirmed: true };
+      if (request.type === 'list_pending_attachments') return { attachments: [] };
+      return { started: true };
+    },
+    askNotifyPermission() {}, closeMentions() {}, mentionsIn: () => [], renderOutbox() {},
+    crypto: { randomUUID: () => 'forecast-outbox' },
+  });
+  c.S.settings = { limits: { forecast_confirm_usd: 0 } };
+  c.S.daemonOnline = false; c.S.channel = null; c.S.attachmentInventories.A = [];
+  c.$('input').value = 'expensive task';
+  await c.submit(false);
+  assert.deepEqual(calls, []);
+  assert.equal(c.S.outbox[0].status, 'queued');
+  assert.equal(c.S.outbox[0].forecast_pending, true);
+  c.S.daemonOnline = true; c.S.channel = {}; c.S.current = null;
+  await c.flushOutbox();
+  assert.deepEqual(calls, [], 'forecast approval waits until its Session is open');
+  c.S.current = 'A';
+  await c.flushOutbox();
+  assert.deepEqual(calls.map(request => request.type), ['forecast_run','confirm_forecast','send_outbox_message','list_pending_attachments']);
+  assert.equal(c.S.outbox.length, 0);
+});
+
+test('same draft cannot be submitted twice while async work outlives a Session switch', async () => {
+  const pending = deferred(), calls = [];
+  const c = setup(['submit'], {
+    askNotifyPermission() {}, closeMentions() {}, mentionsIn: () => [], renderOutbox() {},
+    crypto: { randomUUID: () => 'switch-action' },
+    request: async request => {
+      calls.push(request);
+      if (request.type === 'list_pending_attachments') return pending.promise;
+      return {};
+    },
+  });
+  c.S.attachmentInventories.A = [];
+  c.$('input').value = 'same draft';
+  const first = c.submit(false);
+  await new Promise(resolve => setImmediate(resolve));
+  c.S.current = 'B';
+  c.$('input').value = 'same draft';
+  await c.submit(false);
+  pending.resolve({ attachments: [] });
+  await first;
+  const sends = calls.filter(request => request.type === 'send_outbox_message');
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].session_id, 'A');
+  assert.equal(c.$('input').value, 'same draft');
+});
+
+test('compose-time Steer stays bound to its original Run through async inventory checks', async () => {
+  const pending = deferred(), calls = [];
+  const c = setup(['submit'], {
+    askNotifyPermission() {}, closeMentions() {}, mentionsIn: () => [], renderOutbox() {},
+    crypto: { randomUUID: () => 'stale-steer' }, toast() {}, note() {},
+    request: async request => {
+      calls.push(request);
+      if (request.type === 'list_pending_attachments') return pending.promise;
+      if (request.type === 'send_outbox_message') { const error = new Error('Steer target Run is no longer active'); error.daemonResponse = true; throw error; }
+      return {};
+    },
+  });
+  c.S.running.add('A'); c.S.liveRun = { id: 'run-original', ended: false }; c.S.attachmentInventories.A = [];
+  c.$('input').value = 'steer this';
+  const sending = c.submit(false);
+  await new Promise(resolve => setImmediate(resolve));
+  c.S.running.delete('A'); c.S.liveRun = { id: 'run-later', ended: true };
+  pending.resolve({ attachments: [] });
+  await sending;
+  const send = calls.find(request => request.type === 'send_outbox_message');
+  assert.equal(send.mode, 'steer');
+  assert.equal(send.expected_run_id, 'run-original');
+  assert.equal(c.S.outbox[0].status, 'failed');
+  assert.match(c.S.outbox[0].error, /no longer active/);
+});
+
 test('outbox retries ambiguous sends in order with the same client IDs and modes', async () => {
   const calls = []; let attempt = 0, nextId = 0;
   const c = setup(['enqueueOutbox','persistOutbox','loadOutbox','flushOutbox','canFlushOutbox'], {
     request: async req => {
       calls.push({ ...req });
-      if (attempt++ === 0) throw new Error('relay connection closed');
+      if (req.type === 'send_outbox_message' && attempt++ === 0) throw new Error('relay connection closed');
       return { accepted: true };
     },
     crypto: { randomUUID: () => 'outbox-' + (++nextId) }, renderOutbox() {},
   });
-  const first = c.enqueueOutbox('A', 'one', 'steer');
-  const second = c.enqueueOutbox('B', 'two', 'queue');
+  const first = await c.enqueueOutbox('A', 'one', 'steer', { expectedAttachments: [], expectedRunId: 'run-a' });
+  const second = await c.enqueueOutbox('B', 'two', 'queue', { expectedAttachments: [] });
   assert.equal(first.status, 'queued'); assert.equal(second.status, 'queued');
-  assert.equal(c.loadOutbox().length, 2, 'outbox is persisted before dispatch');
+  assert.equal(c.loadOutbox('test-room').length, 2, 'outbox is persisted before dispatch');
   await c.flushOutbox();
   assert.equal(first.status, 'queued', 'ambiguous failure remains retryable');
   await c.flushOutbox();
-  assert.deepEqual(calls.map(req => [req.session_id, req.content, req.mode]), [
+  const sends = calls.filter(req => req.type === 'send_outbox_message');
+  assert.deepEqual(sends.map(req => [req.session_id, req.content, req.mode]), [
     ['A', 'one', 'steer'], ['A', 'one', 'steer'], ['B', 'two', 'queue'],
   ]);
-  assert.equal(calls[0].client_msg_id, calls[1].client_msg_id);
-  assert.notEqual(calls[1].client_msg_id, calls[2].client_msg_id);
+  assert.equal(sends[0].client_msg_id, sends[1].client_msg_id);
+  assert.notEqual(sends[1].client_msg_id, sends[2].client_msg_id);
   assert.equal(c.S.outbox.length, 0);
+});
+
+test('outbox success refreshes later pending attachments instead of clearing their inventory', async () => {
+  const calls = [], later = { path: 'later.rs', name: 'later.rs' };
+  const c = setup(['enqueueOutbox','flushOutbox','loadAttachmentInventory'], {
+    request: async req => { calls.push(req); return req.type === 'list_pending_attachments' ? { attachments: [later] } : {}; },
+    crypto: { randomUUID: () => 'queued-action' }, renderOutbox() {},
+  });
+  const key = c.sessionCacheKey('test-room', 'A');
+  c.mentionAttached[key] = new Set(['later.rs', 'consumed.rs']);
+  await c.enqueueOutbox('A', 'queued message', 'queue', { expectedAttachments: [] });
+  await c.flushOutbox();
+  assert.deepEqual(calls.map(req => req.type), ['send_outbox_message', 'list_pending_attachments']);
+  assert.equal(c.S.attachmentInventories.A.length, 1);
+  assert.equal(c.S.chips.A[0].path, 'later.rs');
+  assert.equal(c.loadAttachmentInventory('test-room', 'A').length, 1);
+  assert.equal(c.mentionAttached[key].has('later.rs'), true);
+  assert.equal(c.mentionAttached[key].has('consumed.rs'), false);
 });
 
 test('definite daemon rejection remains visible as failed and blocks later sends', async () => {
@@ -933,11 +1141,11 @@ test('definite daemon rejection remains visible as failed and blocks later sends
     request: async req => { calls.push(req); const error = new Error('stale forecast'); error.daemonResponse = true; throw error; },
     crypto: { randomUUID: () => 'failed-action-' + (++nextId) }, renderOutbox() {}, toast() {}, note() {},
   });
-  const failed = c.enqueueOutbox('A', 'message', 'send');
-  c.enqueueOutbox('A', 'later message', 'send');
+  await c.enqueueOutbox('A', 'message', 'send', { expectedAttachments: [] });
+  await c.enqueueOutbox('A', 'later message', 'send', { expectedAttachments: [] });
   await c.flushOutbox();
-  assert.equal(failed.status, 'failed');
-  assert.equal(failed.error, 'stale forecast');
+  assert.equal(c.S.outbox[0].status, 'failed');
+  assert.equal(c.S.outbox[0].error, 'stale forecast');
   assert.equal(c.S.outbox.length, 2);
   assert.equal(calls.length, 1);
 });
@@ -948,19 +1156,20 @@ test('a definite gate rejection is not retried automatically; uncertain sends re
     const c = forecastContext(['forecastStamp','confirmForecast','submit','saveDraft','enqueueOutbox','persistOutbox','flushOutbox','canFlushOutbox'], { ask:async()=>true, request:async req=>{
       calls.push(req);if(req.type==='forecast_run')return {confirmation_required:true,confirmation_id:'preview',hint:'estimate',warnings:[]};
       if(req.type==='confirm_forecast')return {confirmed:true};
-      if(req.type==='send_message' && ++sends===1){const error=new Error(definite?'stale forecast':'lost response');error.daemonResponse=definite;throw error;}
+      if(req.type==='list_pending_attachments')return {attachments:[]};
+      if(req.type==='send_outbox_message' && ++sends===1){const error=new Error(definite?'stale forecast':'lost response');error.daemonResponse=definite;throw error;}
       return {started:true};
     }, toast(){},askNotifyPermission(){},closeMentions(){},mentionsIn:()=>[],renderOutbox(){},crypto:{randomUUID:()=>`intent-${++intent}`} });
     vm.runInContext('const mentionAttached = {}; const attachmentDrafts = {};', c);
     c.S.settings={limits:{forecast_confirm_usd:0}};c.$('input').value='task';await c.submit(false);
-    const sent=calls.filter(c=>c.type==='send_message');assert.equal(sent.length,1);
+    const sent=calls.filter(c=>c.type==='send_outbox_message');assert.equal(sent.length,1);
     assert.equal(c.$('input').value,'');
     assert.equal(c.S.outbox[0].status,definite?'failed':'queued');
     assert.equal(c.S.outbox[0].mode,'send');
     if (!definite) {
       await c.flushOutbox();
-      assert.equal(calls.filter(c=>c.type==='send_message').length,2);
-      assert.equal(sent[0].client_msg_id,calls.filter(c=>c.type==='send_message')[1].client_msg_id);
+      assert.equal(calls.filter(c=>c.type==='send_outbox_message').length,2);
+      assert.equal(sent[0].client_msg_id,calls.filter(c=>c.type==='send_outbox_message')[1].client_msg_id);
       assert.equal(c.S.outbox.length,0);
     }
   }

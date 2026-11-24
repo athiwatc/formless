@@ -67,7 +67,7 @@ def expose_script(route):
     submit=(...args)=>{fixture815.submits.push(args[0]);return submit815(...args);};
     const reply815=async req=>{
       fixture815.calls.push({...req});
-      if(req.type==='send_message')return {accepted:true};
+      if(req.type==='send_outbox_message')return {accepted:true};
       if(req.type==='suggest_session_name')return {name:'Suggested fixture name'};
       if(req.type==='list_tools'||req.type==='list_modules')return [];
       if(req.type==='list_files')return {files:[{path:'fixture.txt',dir:false},{path:'fixtures/example.txt',dir:false},{path:'files/notes.txt',dir:false}]};
@@ -151,40 +151,40 @@ def input_checks(page,coarse,label):
     check(page.evaluate('matchMedia("(pointer: coarse)").matches')==coarse,label+' primary pointer capability is real browser media')
     check(page.locator('#input').get_attribute('enterkeyhint')==('enter' if coarse else 'send'),label+' composer key hint matches effective default Enter action')
     page.locator('#input').fill('first line');page.keyboard.press('Enter');settle(page)
-    sent=page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message")')
+    sent=page.evaluate('__mobile815.calls.filter(r=>r.type==="send_outbox_message")')
     if coarse:
         check(page.locator('#input').input_value()=='first line\n' and not sent,label+' coarse Enter inserts native newline without sending')
         page.locator('#send-btn').click();settle(page)
-        check(page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message").length')==1,label+' Send button sends the multiline draft once')
+        check(page.evaluate('__mobile815.calls.filter(r=>r.type==="send_outbox_message").length')==1,label+' Send button sends the multiline draft once')
     else:
         check(len(sent)==1 and sent[0]['content']=='first line' and sent[0]['mode']=='send',label+' desktop Enter keeps existing send behavior')
     page.locator('#input').fill('shift line');page.locator('#input').focus();page.evaluate('__mobile815.calls=[]');page.keyboard.press('Shift+Enter');settle(page,30)
-    check(page.locator('#input').input_value()=='shift line\n' and page.evaluate('!__mobile815.calls.some(r=>r.type==="send_message")'),label+' Shift+Enter remains a native line break')
+    check(page.locator('#input').input_value()=='shift line\n' and page.evaluate('!__mobile815.calls.some(r=>r.type==="send_outbox_message")'),label+' Shift+Enter remains a native line break')
     for key in ['Control+Enter','Meta+Enter']:
         page.locator('#input').fill('queued local fixture');page.locator('#input').focus();page.evaluate('__mobile815.calls=[]');page.keyboard.press(key);settle(page)
-        calls=page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message")')
+        calls=page.evaluate('__mobile815.calls.filter(r=>r.type==="send_outbox_message")')
         check(len(calls)==1 and calls[0]['mode']=='queue',label+' '+key+' keeps explicit queue behavior')
     native_alt=None
     if coarse:
         page.evaluate('''()=>{const e=document.createElement('textarea');e.id='native-alt-control';e.style.cssText='position:fixed;left:0;top:0;width:120px;height:32px;z-index:1000';document.body.append(e);}''')
         page.locator('#native-alt-control').fill('alternate fixture');page.keyboard.press('Alt+Enter');native_alt=page.locator('#native-alt-control').input_value();page.locator('#native-alt-control').evaluate('(e)=>e.remove()')
     page.locator('#input').fill('alternate fixture');page.locator('#input').focus();page.evaluate('__mobile815.calls=[]');page.keyboard.press('Alt+Enter');settle(page)
-    calls=page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message")')
+    calls=page.evaluate('__mobile815.calls.filter(r=>r.type==="send_outbox_message")')
     check((page.locator('#input').input_value()==native_alt and not calls) if coarse else (len(calls)==1 and calls[0]['mode']=='send'),label+' Alt+Enter follows pointer policy')
     for kind in ['composition','229']:
         page.locator('#input').fill('IME fixture');page.locator('#input').focus();page.evaluate('__mobile815.calls=[]')
         result=page.locator('#input').evaluate('''(e,kind)=>{const k=new KeyboardEvent('keydown',{key:'Enter',code:'Enter',bubbles:true,cancelable:true,isComposing:kind==='composition',keyCode:kind==='229'?229:13});if(kind==='229'&&k.keyCode!==229)Object.defineProperty(k,'keyCode',{value:229});e.dispatchEvent(k);return {prevented:k.defaultPrevented,value:e.value};}''',kind)
-        check(not result['prevented'] and result['value']=='IME fixture' and page.evaluate('!__mobile815.calls.some(r=>r.type==="send_message")'),label+' IME '+kind+' confirmation performs no app action')
+        check(not result['prevented'] and result['value']=='IME fixture' and page.evaluate('!__mobile815.calls.some(r=>r.type==="send_outbox_message")'),label+' IME '+kind+' confirmation performs no app action')
     if coarse:
         for text in ['/he','@fi']:
             page.locator('#input').fill(text);page.locator('#input').focus();page.wait_for_selector('.compose-popup');page.evaluate('__mobile815.calls=[]');page.keyboard.press('Enter');settle(page)
             check(page.locator('#input').input_value()==text+'\n',label+' Enter with '+text+' palette is still native newline')
-            check(page.evaluate('!__mobile815.calls.some(r=>["send_message","attach_path"].includes(r.type)) && !__mobile815.activeDialog()'),label+' coarse palette Enter neither executes nor attaches')
+            check(page.evaluate('!__mobile815.calls.some(r=>["send_outbox_message","attach_path"].includes(r.type)) && !__mobile815.activeDialog()'),label+' coarse palette Enter neither executes nor attaches')
             page.evaluate('__mobile815.closePalette();__mobile815.closeMentions()')
     # Native multiline handlers must never fall through to the composer form.
     page.evaluate('''()=>{const d=__mobile815;const area=d.h('textarea',{id:'mobile-multiline-fixture',rows:3,'aria-label':'Multiline fixture'});d.ask({title:'Multiline fixture',body:area});}''')
     page.locator('#mobile-multiline-fixture').fill('native area');page.locator('#mobile-multiline-fixture').focus();page.evaluate('__mobile815.calls=[]');page.keyboard.press('Enter');settle(page,30)
-    check(page.locator('#mobile-multiline-fixture').input_value()=='native area\n' and page.evaluate('!__mobile815.calls.some(r=>r.type==="send_message")'),label+' dialog textarea Enter is a native newline only')
+    check(page.locator('#mobile-multiline-fixture').input_value()=='native area\n' and page.evaluate('!__mobile815.calls.some(r=>r.type==="send_outbox_message")'),label+' dialog textarea Enter is a native newline only')
     page.keyboard.press('Escape')
     # Factory-created code/secret/filter fields exercise production metadata and
     # the real highlighted editor, without any save or Tool execution action.
@@ -203,7 +203,7 @@ def input_checks(page,coarse,label):
     page.locator('#mobile-code-fixture').evaluate('(e)=>{e.scrollTop=80;e.scrollLeft=50;e.dispatchEvent(new Event("scroll"));}')
     check(page.locator('.code-editor').evaluate('e=>{const t=e.querySelector("textarea");return [...e.querySelectorAll(".ed-layer")].every(l=>l.scrollTop===t.scrollTop&&l.scrollLeft===t.scrollLeft);}'),label+' code highlight scroll offsets stay aligned')
     page.locator('#mobile-code-fixture').focus();page.keyboard.press('End');page.keyboard.press('Enter');settle(page,30)
-    check(page.evaluate('!__mobile815.calls.some(r=>r.type==="send_message")'),label+' code textarea native Enter never sends a message')
+    check(page.evaluate('!__mobile815.calls.some(r=>r.type==="send_outbox_message")'),label+' code textarea native Enter never sends a message')
     page.keyboard.press('Escape')
     page.evaluate('() => {void __mobile815.openModelPicker();}')
     page.wait_for_selector('.picker input');settle(page)
@@ -214,7 +214,7 @@ def input_checks(page,coarse,label):
     page.evaluate('__mobile815.setReading(1);__mobile815.calls=[]')
     for i in range(3):
         page.locator('#input').fill('Repeated local send '+str(i));page.locator('#send-btn').click();settle(page,30)
-    check(page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message").length')==3,label+' repeated Send uses harmless local replies')
+    check(page.evaluate('__mobile815.calls.filter(r=>r.type==="send_outbox_message").length')==3,label+' repeated Send uses harmless local replies')
     check('user-scalable=no' not in (page.locator('meta[name=viewport]').get_attribute('content') or '').replace(' ',''),label+' zoom remains available')
 
 
@@ -236,19 +236,19 @@ def input_preference_checks(page,coarse,label):
     check('Settings' in page.locator('#compose-hint').inner_text() and 'Enter sends:' in page.locator('.compose-enter-pref').get_attribute('title'),label+' compose hint exposes preference and its Settings location')
     check(page.locator('#compose-hint').is_visible(),label+' compose hint remains visible on narrow layouts')
     page.locator('#input').fill('Preference fixture');page.locator('#input').focus();page.keyboard.press('Enter');settle(page)
-    sent=page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message")')
+    sent=page.evaluate('__mobile815.calls.filter(r=>r.type==="send_outbox_message")')
     check((len(sent)==1 and sent[0]['mode']=='send') if coarse else (not sent and page.locator('#input').input_value()=='Preference fixture\n'),label+' hardware-style Enter follows explicit device preference')
     page.locator('#input').fill('/he');page.locator('#input').focus();page.wait_for_selector('.compose-popup');page.evaluate('__mobile815.calls=[]')
     page.keyboard.press('Shift+Enter');settle(page,30)
-    check(page.locator('#input').input_value()=='/he\n' and page.evaluate('!__mobile815.calls.some(r=>r.type==="send_message")'),label+' Shift+Enter stays native while a palette is open')
+    check(page.locator('#input').input_value()=='/he\n' and page.evaluate('!__mobile815.calls.some(r=>r.type==="send_outbox_message")'),label+' Shift+Enter stays native while a palette is open')
     page.locator('#input').fill('/he');page.wait_for_selector('.compose-popup');page.evaluate('__mobile815.submits=[]');page.keyboard.press('Control+Enter');settle(page)
     # The partial slash command is handled by submit(), not sent as ordinary
     # text. Observe the real submit boundary without changing its semantics.
     check(page.evaluate('__mobile815.submits.length===1 && __mobile815.submits[0]===true'),label+' explicit queue wins over palette selection')
-    before=page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message").length')
+    before=page.evaluate('__mobile815.calls.filter(r=>r.type==="send_outbox_message").length')
     for mod in [False,True]:
         page.locator('#input').evaluate('(e,ctrl)=>e.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true,cancelable:true,repeat:true,ctrlKey:ctrl}))',mod)
-    check(page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message").length')==before and page.evaluate('__mobile815.submits.length')==1,label+' held Enter never duplicates send/queue actions')
+    check(page.evaluate('__mobile815.calls.filter(r=>r.type==="send_outbox_message").length')==before and page.evaluate('__mobile815.submits.length')==1,label+' held Enter never duplicates send/queue actions')
     page.evaluate("__mobile815.closePalette();__mobile815.closeMentions();__mobile815.S.view='settings';__mobile815.renderAll()")
     reset=page.get_by_role('button',name='Use device default',exact=True);reset.focus();page.keyboard.press('Enter');settle(page,30)
     check(reset.evaluate('(e)=>e===document.activeElement'),label+' pointer-default reset retains keyboard focus')
@@ -362,7 +362,7 @@ def hybrid_checks(browser,name,url):
     fine_size=page.locator('#settings-filter').evaluate('(e)=>parseFloat(getComputedStyle(e).fontSize)')
     check(fine_size<16 and not page.evaluate('document.documentElement.hasAttribute("data-input-touch")'),name+' hybrid preserves desktop field size at85%: '+str(fine_size))
     page.locator('#input').fill('Hybrid fixture');page.keyboard.press('Enter');settle(page)
-    check(page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message").at(-1)?.mode')=='send',name+' hybrid retains desktop Enter sends')
+    check(page.evaluate('__mobile815.calls.filter(r=>r.type==="send_outbox_message").at(-1)?.mode')=='send',name+' hybrid retains desktop Enter sends')
     page.evaluate("__mobile815.S.view='settings';__mobile815.renderAll();document.querySelector('#enter-sends').focus();__pointerInput.set(true,true)")
     check(page.evaluate('document.activeElement.id')=='enter-sends',name+' primary-pointer change retains Settings checkbox focus')
     check(page.evaluate('document.documentElement.hasAttribute("data-input-touch")') and page.locator('#settings-filter').evaluate('(e)=>parseFloat(getComputedStyle(e).fontSize)')>=16,name+' coarse change applies the same16px/default signal')
