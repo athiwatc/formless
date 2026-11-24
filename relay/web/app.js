@@ -5389,6 +5389,7 @@
   }
   function captureReadingAnchor() {
     if (!readingVisible()) return null;
+    if (S.sessionLoad?.id === S.current && S.sessionLoad.status === "pending" && !S.messages.length) return null;
     // Take pending records before using the index; observer callbacks may not
     // have run yet for mutations in this task.
     readingGeometryChanged(readingRootChanges.takeRecords());
@@ -5680,6 +5681,7 @@
     settleReadingLayout();
   }
   function readingInput(direction, duration = 1200) {
+    if (S.sessionLoad?.id === S.current && S.sessionLoad.status === "pending" && !S.messages.length) return;
     reading.writeTop = null;
     reading.intentUntil = performance.now() + duration;
     reading.direction = direction;
@@ -5691,7 +5693,7 @@
       if (S.current !== session || !readingVisible()) return;
       const box = $("transcript"), bottom = box.scrollHeight - box.clientHeight - box.scrollTop <= 1;
       if (direction > 0 && bottom) resumeReadingFollow();
-      reading.anchor = captureReadingAnchor();
+      reading.anchor = captureReadingAnchor() || reading.anchor;
       updateReadingPill();
     });
   }

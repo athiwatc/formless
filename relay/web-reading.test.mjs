@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 const source=readFileSync(new URL('./web/app.js',import.meta.url),'utf8');
 function fn(name){const start=source.indexOf('  function '+name+'(');assert.ok(start>=0,name);return source.slice(start,source.indexOf('\n  }',start)+4);}
+function asyncFn(name){const start=source.indexOf('  async function '+name+'(');assert.ok(start>=0,name);return source.slice(start,source.indexOf('\n  }',start)+4);}
 const text='A distinct streamed paragraph. '.repeat(20);
 const stamp=()=>({block:1,length:text.length,head:text.slice(0,128),tail:text.slice(-128),afterSeq:10});
 function fixture(){const roots=[],live={querySelectorAll:()=>[]};const box={contains:n=>roots.some(r=>r===n||r.blocks.includes(n)),querySelector:()=>live,querySelectorAll:()=>roots};
@@ -58,7 +59,7 @@ function captureFixture(rows, bounds, visible = true) {
     rowData.push(row);
     const rect = () => ({ top: transcriptTop + row.top - box.scrollTop + reading.adjustment,
       bottom: transcriptTop + row.bottom - box.scrollTop + reading.adjustment, height: row.height });
-    const inner = { getBoundingClientRect: () => { const r = rect(); return { ...r, top: r.top + 2 }; },
+    const inner = { getBoundingClientRect: () => { const r = rect(); return { ...r, top: r.top + (row.blockOffset ?? 2) }; },
       getClientRects: () => row.height ? [{}] : [], contains: () => false };
     const block = { getBoundingClientRect: rect, getClientRects: () => row.height ? [{}] : [], contains: child => child === inner };
     let root;
@@ -81,7 +82,7 @@ function captureFixture(rows, bounds, visible = true) {
     querySelectorAll: () => { queries++; return roots; },
     contains: node => roots.includes(node) || contained.has(node),
     addEventListener: (type, listener, options) => { listeners.set(type, [...(listeners.get(type) || []), { listener, options }]); },
-    classList: { add() {} },
+    classList: { add() {}, toggle() {} },
     style: { setProperty: () => pendingGeometry.push({ type: "attributes", target: box, attributeName: "style" }) },
   };
   const c = vm.createContext({
@@ -130,6 +131,7 @@ function captureFixture(rows, bounds, visible = true) {
     setFollow(value) { c.S.follow = value; },
     setScrollTop(value) { box.scrollTop = value; },
     input(direction) { c.readingInput(direction); },
+    flushFrames() { while (frames.size) { const [id, callback] = frames.entries().next().value; frames.delete(id); callback(); } },
     saveAnchor() { reading.anchor = c.captureReadingAnchor(); return reading.anchor; },
     restoreAnchor() { return c.restoreReadingAnchor(); },
     savedAnchor(id) {
@@ -155,11 +157,145 @@ function captureFixture(rows, bounds, visible = true) {
     get settles() { return settles; },
     get pendingFrames() { return frames.size; },
     get session() { return reading.session; },
+    context: c,
     get queries() { return queries; },
     get rootCount() { return roots.length; },
   };
 }
 const rect = (top, bottom, height = bottom - top, live = false) => ({ top, bottom, height, live });
+
+function sessionLifecycleFixture(rowsBySession, bounds) {
+  const rows = Object.values(rowsBySession).flat();
+  const fixture = captureFixture([], bounds);
+  const c = fixture.context, box = c.$("transcript"), rowById = new Map(rows.map(row => [row.id, row]));
+  const mutationRecords = [], pending = new Map(), trace = [];
+  const fake = (tag, props = {}, ...kids) => {
+    const node = { tag, props: props || {}, children: [], dataset: {}, hidden: false,
+      append(...children) { this.children.push(...children.flat(Infinity).filter(child => child != null)); },
+      replaceChildren(...children) { this.children = []; this.append(...children); },
+      remove() { this.removed = true; },
+      classList: { add() {}, remove() {}, toggle() {} },
+      getAttribute(name) { return this.props[name] ?? null; },
+    };
+    if (props?.["data-message-id"] != null) node.dataset.messageId = props["data-message-id"];
+    if (props?.["data-live-root"] != null) node.dataset.liveRoot = props["data-live-root"];
+    node.append(...kids);
+    return node;
+  };
+  Object.assign(c.S, { current: "long", messages: [], follow: true, view: "chat", sessions: Object.keys(rowsBySession).map(id => ({ id })),
+    sessionLoad: { id: "long", status: "loaded" }, storageScope: "fixture", drafts: {}, editMessageId: null,
+    liveTools: [], liveRun: null, queued: [], plan: [], planState: null, step: null, recap: null, recapRunId: null,
+    running: new Set(), daemonOnline: true, topicsAvailable: false });
+  Object.assign(c.reading, { session: "long", saved: new Map(), anchor: null });
+  box.scrollHeight = 30000;
+  c.historyRender = { session: null, turns: new Map(), live: null, welcome: null, banner: null, loadNotice: null };
+  c.rendered = new Map();
+  c.WHO = { "system-note": "System note", assistant: "Assistant", user: "User" };
+  c.h = fake;
+  c.welcome = () => fake("div");
+  c.isRunning = () => false;
+  c.uiLocale = () => "en";
+  c.speaker = role => role;
+  c.sentElsewhere = () => null;
+  c.turnTimestamp = () => null;
+  c.currentTopicAttempt = () => false;
+  c.steerStep = () => null;
+  c.withMentions = value => value;
+  c.attachmentTags = () => [];
+  c.markdown = () => fake("div");
+  c.assistantStopNote = () => null;
+  c.toolCallChip = () => fake("div");
+  c.rateButtons = () => fake("div");
+  c.recapBlock = () => fake("div");
+  c.renderLive = () => {};
+  c.renderChrome = () => {};
+  c.renderOutbox = () => {};
+  c.renderComposer = () => {};
+  c.renderView = () => {};
+  c.renderApproval = () => {};
+  c.renderNotes = () => {};
+  c.messageBody = (message, fill) => {
+    const node = fake("div", { "data-message-id": message.id });
+    c.rendered.set(message.id, node);
+    fill?.(node);
+    return node;
+  };
+  c.reconcileChildren = (parent, wanted) => {
+    if (parent === box) parent.children = [...wanted];
+    else parent.replaceChildren(...wanted);
+    if (parent !== box) return;
+    const ids = [];
+    const collect = node => {
+      if (node?.dataset?.messageId) { ids.push(node.dataset.messageId); return; }
+      for (const child of node?.children || []) collect(child);
+    };
+    for (const node of wanted) collect(node);
+    fixture.replaceRows(ids.map(id => rowById.get(id)).filter(Boolean));
+    if (!ids.length && c.S.current === "long" && c.S.sessionLoad?.status === "pending") {
+      box.scrollTop = 0;
+      c.readingInput(-1);
+    }
+    mutationRecords.push({ type: "childList", target: box, addedNodes: [], removedNodes: [] });
+  };
+  c.readingChanges = { takeRecords: () => mutationRecords.splice(0) };
+  c.saveDraft = () => {};
+  c.invalidateBranchSummary = () => {};
+  c.cancelEventRender = () => {};
+  c.closeSidebar = () => {};
+  c.clearLiveText = () => {};
+  c.renderSessions = () => {};
+  c.renderRunTools = () => {};
+  c.renderStatus = () => {};
+  c.renderChips = () => {};
+  c.renderQueue = () => {};
+  c.renderPlan = () => {};
+  c.renderStep = () => {};
+  c.renderRunBanner = () => {};
+  c.restoreSessionRunState = () => {};
+  c.applySessionLiveState = () => {};
+  c.autosize = () => {};
+  c.refreshAttachmentInventory = () => Promise.resolve();
+  c.sessionCacheKey = () => "draft";
+  c.sessionStorageKey = () => "session";
+  c.attachmentDrafts = {};
+  c.loadDraft = () => "";
+  c.CLIENT_LABEL = "fixture";
+  c.prefs = { set() {} };
+  c.request = () => Promise.resolve({ used_tokens: 0, context_tokens: 1, runs: 0, total: {} });
+  c.act = request => {
+    if (request.type !== "get_session") return Promise.resolve({});
+    record(`get_session:${request.id}`);
+    return new Promise(resolve => pending.set(request.id, resolve));
+  };
+  c.flushOutbox = () => Promise.resolve();
+  c.isRunning = () => false;
+  c.sessionSeq = 0;
+  vm.runInContext([fn("sessionLoadNotice"), fn("renderHistory"), fn("renderAll"), asyncFn("openSession")].join("\n"), c);
+  const snapshotAnchor = anchor => anchor && ({ top: anchor.top,
+    candidates: Array.from(anchor.candidates, ({ id, block, offset }) => ({ id, block, offset })) });
+  function record(phase) {
+    trace.push({ phase, current: c.S.current, session: c.reading.session, follow: c.S.follow,
+      scrollTop: box.scrollTop, status: c.S.sessionLoad?.status, messageCount: c.S.messages.length,
+      anchor: snapshotAnchor(c.reading.anchor), saved: Object.fromEntries(Array.from(c.reading.saved, ([id, value]) =>
+        [id, { follow: value.follow, anchor: snapshotAnchor(value.anchor) }])) });
+  }
+  c.record = record;
+  vm.runInContext(`
+    const rawResetReadingSession = resetReadingSession;
+    resetReadingSession = function(id) { record("reset-before:" + id); const result = rawResetReadingSession(id); record("reset-after:" + id); return result; };
+    const rawRenderHistory = renderHistory;
+    renderHistory = function(...args) { record("render-before"); const result = rawRenderHistory(...args); record("render-after"); return result; };
+    const rawRenderAll = renderAll;
+    renderAll = function(...args) { record("renderAll-before"); const result = rawRenderAll(...args); record("renderAll-after"); return result; };
+  `, c);
+  return {
+    c, fixture, trace,
+    messages(id) { return rowsBySession[id].map((row, seq) => ({ id: row.id, seq,
+      role: seq % 2 ? "assistant" : "user", content: row.id, meta: "{}",
+      ...(id === "long" && seq === 234 ? { generated_by: "instructions" } : {}), created_at: "2026-11-24T19:00:00Z" })); },
+    resolve(id) { pending.get(id)({ messages: this.messages(id), session: { id }, queued_items: [] }); pending.delete(id); },
+  };
+}
 
 test("anchor capture reuses indexed geometry for nearby and large jumps, preserving ordered lower-bound candidates", () => {
   const rows = [rect(0, 541), rect(40, 140, 0), rect(300, 700), rect(45, 560),
@@ -310,6 +446,74 @@ test("session navigation does not remeasure a paused bookmark without pending sc
 
   assert.equal(fixture.reads.length, reads);
   assert.equal(fixture.queries, queries);
+});
+
+test("real openSession and renderHistory preserve Long and Short bookmarks across async loads", async () => {
+  const makeRows = (id, count, stride, target, offset) => Array.from({ length: count }, (_, index) => {
+    const top = index * stride;
+    return { ...rect(top, top + 80), id: `${id}-${String(index).padStart(3, "0")}`,
+      blockOffset: index === target ? offset : 2 };
+  });
+  const longRows = makeRows("long", 240, 100, 6, 24.34);
+  const shortRows = makeRows("short", 84, 86, 65, 41.05);
+  const app = sessionLifecycleFixture({ long: longRows, short: shortRows }, { top: 40, bottom: 100 });
+  const { c, fixture, trace } = app;
+  const assertBookmark = (candidate, id, offset) => {
+    assert.equal(candidate.id, id);
+    assert.equal(candidate.block, 1);
+    assert.equal(Number(candidate.offset.toFixed(2)), offset);
+  };
+  c.S.messages = app.messages("long");
+  fixture.replaceRows(longRows);
+  c.renderHistory();
+  fixture.setFollow(false);
+  fixture.setScrollTop(600);
+  fixture.saveAnchor();
+  assertBookmark(fixture.capture().candidates[0], "long-006", 24.34);
+
+  const shortLoad = c.openSession("short");
+  assert.equal(c.S.current, "short");
+  assert.equal(c.S.messages.length, 0);
+  assertBookmark(fixture.savedAnchor("long").candidates[0], "long-006", 24.34);
+  app.resolve("short");
+  await shortLoad;
+  assert.equal(c.S.messages.length, 84);
+  fixture.setFollow(false);
+  fixture.setScrollTop(5604);
+  fixture.saveAnchor();
+  assertBookmark(fixture.capture().candidates[0], "short-065", 27.05);
+
+  const longLoad = c.openSession("long");
+  assert.equal(c.S.current, "long");
+  assert.equal(c.S.messages.length, 0);
+  fixture.flushFrames();
+  assertBookmark(fixture.savedAnchor("short").candidates[0], "short-065", 27.05);
+  const pendingLong = trace.findLast(entry => entry.phase === "get_session:long");
+  assert.equal(pendingLong.status, "pending");
+  assert.equal(pendingLong.anchor.top, 600);
+  assertBookmark(pendingLong.anchor.candidates[0], "long-006", 24.34);
+  assertBookmark(pendingLong.saved.long.anchor.candidates[0], "long-006", 24.34);
+  assertBookmark(pendingLong.saved.short.anchor.candidates[0], "short-065", 27.05);
+  const emptyLongRender = trace.findLast(entry => entry.phase === "render-after" && entry.current === "long" && entry.status === "pending");
+  assertBookmark(emptyLongRender.anchor.candidates[0], "long-006", 24.34);
+  assert.equal(c.reading.inputFrame, 0);
+  assert.equal(c.reading.intentUntil, 0);
+  assert.equal(c.captureReadingAnchor(), null);
+  app.resolve("long");
+  await longLoad;
+  assert.equal(fixture.capture().top, 600, JSON.stringify({ anchor: { top: c.reading.anchor?.top,
+    candidates: c.reading.anchor?.candidates.map(({ id, block, offset }) => ({ id, block, offset })) },
+    inputFrame: c.reading.inputFrame, intentUntil: c.reading.intentUntil, follow: c.S.follow,
+    trace: trace.slice(-6).map(({ phase, current, status, scrollTop, anchor }) => ({ phase, current, status, scrollTop, anchor })) }));
+  assertBookmark(fixture.capture().candidates[0], "long-006", 24.34);
+
+  const returnShort = c.openSession("short");
+  app.resolve("short");
+  await returnShort;
+  assert.equal(fixture.capture().top, 5604);
+  assertBookmark(fixture.capture().candidates[0], "short-065", 27.05);
+  assert.ok(trace.some(entry => entry.phase === "renderAll-after" && entry.current === "long"
+    && entry.status === "loaded" && entry.scrollTop === 600));
 });
 
 test("opening a Session from another view selects and clears it before Chat renders", () => {
