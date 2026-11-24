@@ -8786,6 +8786,7 @@ fn search_words(text: &str) -> impl Iterator<Item = &str> {
 fn search_normalize(text: &str) -> String {
     text.nfc()
         .flat_map(char::to_lowercase)
+        .map(|character| if character == 'ς' { 'σ' } else { character })
         .collect::<String>()
         .nfc()
         .collect()

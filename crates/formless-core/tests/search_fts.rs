@@ -20,6 +20,20 @@ fn fts_queries_are_quoted_prefix_terms() {
 }
 
 #[test]
+fn session_and_audit_search_fold_greek_final_sigma() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(None).unwrap();
+    let message = store.append_message(&session.id, "user", "ος").unwrap();
+    let hits = store.search_sessions("ΟΣ", 10).unwrap();
+    assert!(hits.iter().any(|hit| hit.message_id == message.id));
+
+    store.audit("tester", "greek_search", "ος").unwrap();
+    let entries = store.list_audit(Some("ΟΣ"), None, 10).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].detail, "ος");
+}
+
+#[test]
 fn search_snippets_prefer_nearby_word_prefixes_and_keep_the_original_text() {
     let store = Store::open_in_memory().unwrap();
     let session = store.create_session(None).unwrap();
