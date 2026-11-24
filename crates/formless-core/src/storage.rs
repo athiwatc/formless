@@ -2265,6 +2265,7 @@ impl Store {
         run_id: &str,
         through_seq: i64,
         included_steer_message_ids: &[String],
+        resumed_from: Option<&str>,
         step: i64,
     ) -> Result<bool> {
         if included_steer_message_ids.is_empty() {
@@ -2296,11 +2297,15 @@ impl Store {
                 let Some(steer) = meta.get_mut("steer").and_then(Value::as_object_mut) else {
                     continue;
                 };
-                if steer.get("run_id").and_then(Value::as_str) != Some(run_id)
+                let steer_run_id = steer.get("run_id").and_then(Value::as_str);
+                let belongs_to_run = steer_run_id == Some(run_id)
+                    || resumed_from.is_some_and(|previous| steer_run_id == Some(previous));
+                if !belongs_to_run
                     || steer.get("context_included").and_then(Value::as_bool) == Some(true)
                 {
                     continue;
                 }
+                steer.insert("run_id".into(), json!(run_id));
                 steer.insert("step".into(), json!(step));
                 steer.insert("context_included".into(), json!(true));
                 changed |= st.ex(
@@ -9091,10 +9096,24 @@ mod context_watermark_tests {
         assert!(through_seq >= old_steer.seq);
 
         assert!(store
-            .mark_steering_context_included(&session, "run", through_seq, &included_steer_ids, 2)
+            .mark_steering_context_included(
+                &session,
+                "run",
+                through_seq,
+                &included_steer_ids,
+                None,
+                2,
+            )
             .unwrap());
         assert!(!store
-            .mark_steering_context_included(&session, "run", through_seq, &included_steer_ids, 3)
+            .mark_steering_context_included(
+                &session,
+                "run",
+                through_seq,
+                &included_steer_ids,
+                None,
+                3,
+            )
             .unwrap());
 
         let messages = store.list_messages(&session).unwrap();
@@ -9164,9 +9183,79 @@ mod context_watermark_tests {
                 "run",
                 cache.last_included_seq(),
                 cache.included_steer_message_ids(),
+                None,
                 2,
             )
             .unwrap());
+    }
+
+    #[test]
+    fn resumed_run_rebinds_only_its_unconfirmed_steers() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        let resumed_steer = store
+            .append_message_meta(
+                &session,
+                "user",
+                "pending steer from paused run",
+                Some(json!({"steer":{"run_id":"paused-run"}}).to_string()),
+            )
+            .unwrap();
+        let unrelated_steer = store
+            .append_message_meta(
+                &session,
+                "user",
+                "pending steer from unrelated run",
+                Some(json!({"steer":{"run_id":"unrelated-run"}}).to_string()),
+            )
+            .unwrap();
+        let mut cache = ContextCache::default();
+        cache
+            .build(&store, &session, "private prompt", 100_000, 0.8)
+            .unwrap();
+        let candidates = cache.included_steer_message_ids().to_vec();
+        assert_eq!(
+            candidates,
+            vec![resumed_steer.id.clone(), unrelated_steer.id.clone()]
+        );
+
+        assert!(store
+            .mark_steering_context_included(
+                &session,
+                "resumed-run",
+                cache.last_included_seq(),
+                &candidates,
+                Some("paused-run"),
+                1,
+            )
+            .unwrap());
+
+        let messages = store.list_messages(&session).unwrap();
+        let resumed_meta: Value = serde_json::from_str(
+            messages
+                .iter()
+                .find(|message| message.id == resumed_steer.id)
+                .unwrap()
+                .meta
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        let unrelated_meta: Value = serde_json::from_str(
+            messages
+                .iter()
+                .find(|message| message.id == unrelated_steer.id)
+                .unwrap()
+                .meta
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resumed_meta["steer"]["run_id"], "resumed-run");
+        assert_eq!(resumed_meta["steer"]["step"], 1);
+        assert_eq!(resumed_meta["steer"]["context_included"], true);
+        assert_eq!(unrelated_meta["steer"]["run_id"], "unrelated-run");
+        assert_eq!(unrelated_meta["steer"]["context_included"], Value::Null);
     }
 }
 

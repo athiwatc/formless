@@ -42,10 +42,18 @@ impl Daemon {
         run: &str,
         seq: i64,
         included_steer_message_ids: &[String],
+        resumed_from: Option<&str>,
         step: i64,
     ) -> Result<()> {
         if self.with_store(|st| {
-            st.mark_steering_context_included(session, run, seq, included_steer_message_ids, step)
+            st.mark_steering_context_included(
+                session,
+                run,
+                seq,
+                included_steer_message_ids,
+                resumed_from,
+                step,
+            )
         })? {
             self.broadcast(Event::MessagesEdited {
                 session_id: session.to_string(),

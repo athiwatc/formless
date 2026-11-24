@@ -295,6 +295,59 @@ fn contains(body: &Value, text: &str) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn resumed_run_marks_pending_steer_from_previous_run() {
+    let env = credential_env::EnvGuard::isolated();
+    let (fixture, mut client) = Fixture::new(&env, false, false).await;
+    let previous_run = fixture.store.create_run(&fixture.session).unwrap();
+    fixture
+        .store
+        .set_run_status(&previous_run, "paused")
+        .unwrap();
+    fixture
+        .store
+        .append_message_meta(
+            &fixture.session,
+            "user",
+            "PENDING_STEER_FROM_PAUSED_RUN",
+            Some(json!({"steer":{"run_id":previous_run}}).to_string()),
+        )
+        .unwrap();
+
+    assert_eq!(
+        client
+            .rpc(Request::ResumeRun {
+                session_id: fixture.session.clone(),
+            })
+            .await["started"],
+        true
+    );
+    let started = client
+        .event(|event| matches!(event, Event::RunStarted { session_id, .. } if session_id == &fixture.session))
+        .await;
+    let Event::RunStarted { run_id, .. } = started else {
+        unreachable!()
+    };
+    assert_ne!(run_id, previous_run);
+
+    let call = fixture.next_call().await;
+    assert!(contains(&call.body, "PENDING_STEER_FROM_PAUSED_RUN"));
+    let steer = fixture
+        .store
+        .list_messages(&fixture.session)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.content == "PENDING_STEER_FROM_PAUSED_RUN")
+        .unwrap();
+    let steer_meta: Value = serde_json::from_str(steer.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(steer_meta["steer"]["run_id"], run_id);
+    assert_eq!(steer_meta["steer"]["step"], 1);
+    assert_eq!(steer_meta["steer"]["context_included"], true);
+    call.answer(json!({"content":"resumed answer"}));
+    client.finished(&run_id, "completed").await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn steer_during_real_tool_execution_produces_exactly_one_final_answer() {
     let env = credential_env::EnvGuard::isolated();
     let (mut fixture, mut client) = Fixture::new(&env, false, false).await;

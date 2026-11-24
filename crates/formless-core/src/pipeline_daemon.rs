@@ -304,7 +304,8 @@ impl Daemon {
                     st.mark_last_run_followup(&session_id, "corrected")?;
                 }
                 let message = Self::append_user_message_store(st, &session_id, &content, None)?;
-                let mut admission = self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
+                let mut admission =
+                    self.prepare_run_admission(st, &cfg, &session_id, &forecast, None)?;
                 let owned = Arc::get_mut(&mut admission)
                     .context("new pipeline admission already shared")?;
                 owned.pipeline = Some(policy.clone());

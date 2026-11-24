@@ -794,6 +794,7 @@ struct RunAdmission {
     resolved_model: String,
     effort: Option<String>,
     recovery_messages: Vec<MessageInfo>,
+    resumed_from: Option<String>,
     first_message_seq: i64,
     first: StdMutex<
         Option<(
@@ -6232,7 +6233,7 @@ impl Daemon {
                         }
                         let msg = Self::append_user_message_store(st, &session_id, &content, None)?;
                         let admission =
-                            self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
+                            self.prepare_run_admission(st, &cfg, &session_id, &forecast, None)?;
                         let run_id = st.create_run(&session_id)?;
                         st.record_forecast(&run_id, &forecast)?;
                         let outcome = json!({"started":true,"run_id":run_id});
@@ -6280,7 +6281,13 @@ impl Daemon {
                 };
                 let output = mutation(st)?;
                 // Freeze the same pre-Run request the forecast described.
-                let admission = self.prepare_run_admission(st, cfg, session_id, &forecast)?;
+                let admission = self.prepare_run_admission(
+                    st,
+                    cfg,
+                    session_id,
+                    &forecast,
+                    resumed_from.clone(),
+                )?;
                 let id = st.create_run(session_id)?;
                 st.record_forecast(&id, &forecast)?;
                 if let Some(previous) = resumed_from {
@@ -6297,6 +6304,7 @@ impl Daemon {
         cfg: &Config,
         session_id: &str,
         forecast: &RunForecast,
+        resumed_from: Option<String>,
     ) -> Result<Arc<RunAdmission>> {
         Self::ensure_session_description_trust(st, session_id)?;
         let session = st
@@ -6396,6 +6404,7 @@ impl Daemon {
             resolved_model: forecast.basis.model.clone(),
             effort,
             recovery_messages,
+            resumed_from,
             first_message_seq,
             first: StdMutex::new(Some((
                 ctx,
@@ -6611,7 +6620,8 @@ impl Daemon {
                         },
                     )?,
                 };
-                let admission = self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
+                let admission =
+                    self.prepare_run_admission(st, &cfg, &session_id, &forecast, None)?;
                 let id = st.create_run(&session_id)?;
                 st.record_forecast(&id, &forecast)?;
                 Ok((id, admission))
@@ -7081,7 +7091,8 @@ impl Daemon {
                     None,
                     !no_pending_attachments,
                 )?;
-                let admission = self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
+                let admission =
+                    self.prepare_run_admission(st, &cfg, &session_id, &forecast, None)?;
                 let id = st.create_run(&session_id)?;
                 st.record_forecast(&id, &forecast)?;
                 Ok(Some((msg, id, admission)))
@@ -7406,6 +7417,9 @@ impl Daemon {
         let first_message_seq = admitted
             .as_ref()
             .map_or(0, |admission| admission.first_message_seq);
+        let resumed_from = admitted
+            .as_ref()
+            .and_then(|admission| admission.resumed_from.clone());
         let pipeline = admitted.as_ref().and_then(|a| a.pipeline.clone());
         if pipeline
             .as_ref()
@@ -7657,6 +7671,7 @@ impl Daemon {
                     run_id,
                     consumed_seq,
                     &included_steer_message_ids,
+                    resumed_from.as_deref(),
                     step,
                 )?;
                 self.mark_context_consumed(session_id,run_id,consumed_seq);
@@ -8410,7 +8425,7 @@ impl Daemon {
                     let selected=self.action_model(st,&cfg,&input)?;
                     let forecast=self.forecast_estimate_selected(st,&cfg,&input,Some(&selected))?;
                     if forecast.confirmation_required {return Err(refusal(&forecast));}
-                    let admission=self.prepare_run_admission(st,&cfg,&fork.id,&forecast)?;
+                    let admission = self.prepare_run_admission(st, &cfg, &fork.id, &forecast, None)?;
                     let run=st.create_run(&fork.id)?;st.record_forecast(&run,&forecast)?;
                     prepared.push((fork,message,run,admission,model.clone()));
                 }
