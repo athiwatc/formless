@@ -172,23 +172,36 @@ test("anchor capture reuses indexed geometry for nearby and large jumps, preserv
   assert.equal(fixture.reads.length, rows.length * 2 + 1, "capture drains undelivered structural records before using cached geometry");
 });
 
-test("live stream invalidations do not remeasure roots past the cached history prefix", () => {
+test("live-root mutation invalidation refreshes changed geometry without rescanning the history prefix", () => {
   const rows = [rect(0, 600), rect(10, 610), rect(20, 620), rect(30, 630),
     ...Array(1000).fill(rect(500, 600, 0)), rect(1000, 1200, 200, true)];
   const fixture = captureFixture(rows, { top: 40, bottom: 100 });
   assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0", "1", "2", "3"]);
   const measured = fixture.reads.length;
-  for (let update = 0; update < 4; update++) {
-    fixture.setRow(rows.length - 1, rect(1000, 2300 + update * 100, 1300 + update * 100, true));
-    fixture.streamMutation();
-    assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0", "1", "2", "3"]);
-    fixture.streamResize();
-    assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0", "1", "2", "3"]);
-  }
+  fixture.setRow(rows.length - 1, rect(1500, 2300, 800, true));
+  fixture.streamMutation();
+  assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0", "1", "2", "3"]);
+  assert.equal(fixture.reads.length, measured, "mutation notification does not remeasure roots past the history prefix");
+  assert.deepEqual(fixture.capture({ top: 1200, bottom: 1260 }).candidates,
+    [{ id: null, block: 1, offset: 1002, stream: "live" }]);
+  assert.equal(fixture.reads.length, measured + 1, "mutation notification refreshes only the live root when selection reaches it");
   assert.equal(fixture.queries, 1);
-  assert.equal(fixture.reads.length, measured, "stream mutations and live-root resizes do not trigger a full geometry scan");
-  assert.deepEqual(fixture.capture({ top: 1200, bottom: 1260 }).candidates.map(({ id }) => id), [null]);
-  assert.equal(fixture.reads.length, measured + 1, "the dirty live root is refreshed only when selection reaches it");
+});
+
+test("live-root ResizeObserver invalidation refreshes changed geometry without rescanning the history prefix", () => {
+  const rows = [rect(0, 600), rect(10, 610), rect(20, 620), rect(30, 630),
+    ...Array(1000).fill(rect(500, 600, 0)), rect(1000, 1200, 200, true)];
+  const fixture = captureFixture(rows, { top: 40, bottom: 100 });
+  assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0", "1", "2", "3"]);
+  const measured = fixture.reads.length;
+  fixture.setRow(rows.length - 1, rect(1500, 2300, 800, true));
+  fixture.streamResize();
+  assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0", "1", "2", "3"]);
+  assert.equal(fixture.reads.length, measured, "resize notification does not remeasure roots past the history prefix");
+  assert.deepEqual(fixture.capture({ top: 1200, bottom: 1260 }).candidates,
+    [{ id: null, block: 1, offset: 1002, stream: "live" }]);
+  assert.equal(fixture.reads.length, measured + 1, "resize notification refreshes only the live root when selection reaches it");
+  assert.equal(fixture.queries, 1);
 });
 
 test("viewport layout invalidates synchronously when ResizeObserver has not delivered", () => {
