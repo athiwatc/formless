@@ -8091,6 +8091,9 @@
       S.queued = r.queued_items || [];
       renderQueue();
       restoreSessionRunState(id, r, snapshot.events);
+      if (S.liveRun && !S.liveRun.ended && S.running.has(id)) {
+        announcedRun = { session: id, id: S.liveRun.id, afterSeq: Math.max(-1, ...S.messages.map((message) => message.seq ?? -1)) };
+      }
       renderPlan();
       S.stepMode = !!r.step_mode;
       const i = S.sessions.findIndex((s) => s.id === id);
