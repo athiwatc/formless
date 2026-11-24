@@ -7276,7 +7276,7 @@
       const def = typeof d.default === "string" ? d.default : JSON.stringify(d.default);
       const naming = (S.settings && S.settings.naming) || {};
       const notice = key === "naming.auto_download"
-        ? " First-use download: " + (naming.model || "the configured model") + " (about " + (naming.model_size || "409 MiB") + "). Without it, titles use a heuristic."
+        ? " " + namingDownloadInfo(naming).help
         : "";
       return h("div", { class: "setting-desc muted" }, d.description + notice + (def ? " · default " + def : ""));
     };
@@ -7764,6 +7764,23 @@
     if (!r) return;
     await ask({ title: r.skill.name + " v" + r.skill.version, text: r.body + "\n\nFiles: " + r.files.join(", "), body: descriptionReviewCard(r.skill.description_review, r.skill.description_reviews), ok: "Close" });
   }
+  function namingDownloadInfo(naming) {
+    const model = typeof naming?.model === "string" ? naming.model.trim() : "";
+    const size = typeof naming?.model_size === "string" ? naming.model_size.trim() : "";
+    const supported = Boolean(model && size && size !== "—");
+    if (!supported) {
+      const notice = model
+        ? "Configured naming model " + model + " is not supported; titles use a heuristic. Automatic model downloads are unavailable."
+        : "No supported naming model is configured; titles use a heuristic. Automatic model downloads are unavailable.";
+      return { supported, help: notice, consent: notice };
+    }
+    return {
+      supported,
+      help: "First-use download: " + model + " (about " + size + "). Without it, titles use a heuristic.",
+      consent: "On first use, formless will download " + model + " (about " + size + "). Without it, Session titles use a heuristic.",
+    };
+  }
+
   async function editSetting(key, current, kind, choices = [], settings = null) {
     let value;
     if (kind === "bool") value = !(current === "on" || current === true);
@@ -7788,12 +7805,11 @@
     }
     if (key === "naming.auto_download" && value === true) {
       const naming = (settings && settings.naming) || {};
-      const model = naming.model || "the configured model";
-      const size = naming.model_size || "409 MiB";
+      const download = namingDownloadInfo(naming);
       const accepted = await ask({
-        title: "Allow session-naming model download?",
-        text: "On first use, formless will download " + model + " (about " + size + "). Without it, Session titles use a heuristic.",
-        ok: "Allow download",
+        title: download.supported ? "Allow session-naming model download?" : "No supported session-naming model",
+        text: download.consent,
+        ok: download.supported ? "Allow download" : "Save setting",
       });
       if (!accepted) return;
     }

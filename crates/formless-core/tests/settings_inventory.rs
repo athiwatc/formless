@@ -94,6 +94,10 @@ fn documented_settable_values_choices_and_optional_keys_are_complete() {
     assert_eq!(summary["read_only"]["naming.model_size"], "409 MiB");
     assert_eq!(summary["read_only"]["naming.cache_size"], "0 B");
     assert_eq!(summary["read_only"]["naming.status"], "not installed");
+    assert!(!summary["docs"]["naming.auto_download"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("409 MiB"));
     let text = summary.to_string();
     for secret in [
         "HeaderSentinel822",
@@ -132,12 +136,18 @@ fn legacy_naming_download_default_is_migrated_before_explicit_opt_in() {
     let file_only = Config::load_file_only(&paths).unwrap();
     assert!(!file_only.naming.auto_download);
     assert!(file_only.naming.auto_download_migration_done);
-    assert_eq!(std::fs::read_to_string(paths.config_file()).unwrap(), legacy_text);
+    assert_eq!(
+        std::fs::read_to_string(paths.config_file()).unwrap(),
+        legacy_text
+    );
 
     let mut cfg = Config::load(&paths).unwrap();
     assert!(!cfg.naming.auto_download);
     assert!(cfg.naming.auto_download_migration_done);
-    assert_eq!(std::fs::read_to_string(paths.config_file()).unwrap(), legacy_text);
+    assert_eq!(
+        std::fs::read_to_string(paths.config_file()).unwrap(),
+        legacy_text
+    );
 
     assert!(Config::persist_naming_download_migration(&paths).unwrap());
     let saved = std::fs::read_to_string(paths.config_file()).unwrap();
