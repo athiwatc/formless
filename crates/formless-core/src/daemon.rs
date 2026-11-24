@@ -6832,10 +6832,8 @@ impl Daemon {
         let taint_scope = self.taint_scope(&session_id, &run_id);
         let mut final_status = "completed";
         loop {
-            match self
-                .run_step(&session_id, &run_id, &cancel, &cancel_flag)
-                .await
-            {
+            let step = Box::pin(self.run_step(&session_id, &run_id, &cancel, &cancel_flag));
+            match step.await {
                 Ok(()) => {
                     #[cfg(test)]
                     if let Some(hook) = self.run_final_decision_test.locked().take() {
