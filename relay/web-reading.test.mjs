@@ -48,6 +48,8 @@ function captureFixture(rows, bounds, visible = true) {
   const pendingGeometry = [];
   const contained = new Set();
   const listeners = new Map();
+  const frames = new Map();
+  let frameId = 0;
   let settles = 0;
   let box;
   const transcriptTop = 10;
@@ -55,12 +57,13 @@ function captureFixture(rows, bounds, visible = true) {
     rowData.push(row);
     const rect = () => ({ top: transcriptTop + row.top - box.scrollTop + reading.adjustment,
       bottom: transcriptTop + row.bottom - box.scrollTop + reading.adjustment, height: row.height });
-    const inner = { getBoundingClientRect: () => { const r = rect(); return { ...r, top: r.top + 2 }; }, contains: () => false };
-    const block = { getBoundingClientRect: rect, contains: child => child === inner };
+    const inner = { getBoundingClientRect: () => { const r = rect(); return { ...r, top: r.top + 2 }; },
+      getClientRects: () => row.height ? [{}] : [], contains: () => false };
+    const block = { getBoundingClientRect: rect, getClientRects: () => row.height ? [{}] : [], contains: child => child === inner };
     let root;
     const streamText = { nodeType: 3, parentElement: { closest: selector => selector === "[data-message-id], [data-live-root]" ? root : null } };
     root = {
-      dataset: row.live ? {} : { messageId: String(index) },
+      dataset: row.live ? {} : { messageId: String(row.id ?? index) },
       hasAttribute: attr => row.live && attr === "data-live-root",
       getBoundingClientRect: () => { reads.push(index); return rect(); },
       querySelectorAll: () => [block, inner],
@@ -73,7 +76,7 @@ function captureFixture(rows, bounds, visible = true) {
     pendingContent: false, pendingLive: false, afterSeq: -1, depth: 0, changed: false, adjustment: 0,
     intentUntil: 0, inputFrame: 0, observed: new Set(), roots: null, rootTree: null, rootTreeSize: 0 };
   box = {
-    scrollTop: 500, getBoundingClientRect: () => ({ top: transcriptTop }),
+    scrollTop: 500, scrollHeight: 500, getBoundingClientRect: () => ({ top: transcriptTop }),
     querySelectorAll: () => { queries++; return roots; },
     contains: node => roots.includes(node) || contained.has(node),
     addEventListener: (type, listener, options) => { listeners.set(type, [...(listeners.get(type) || []), { listener, options }]); },
@@ -87,11 +90,15 @@ function captureFixture(rows, bounds, visible = true) {
     readingRootChanges: { takeRecords: () => pendingGeometry.splice(0) },
     readingChanges: { takeRecords: () => [] }, readingResize: { observe() {}, unobserve() {} },
     scheduleViewportSync() {}, viewportGeometryPending: false,
-    restoreReadingAnchor() {}, markNewOutput() {}, updateReadingPill() {}, settleReadingLayout() { settles++; },
-    performance: { now: () => 0 }, Node: { TEXT_NODE: 3 }, cancelAnimationFrame() {},
+    markNewOutput() {}, updateReadingPill() {}, settleReadingLayout() { settles++; },
+    performance: { now: () => 0 }, Node: { TEXT_NODE: 3 },
+    requestAnimationFrame(callback) { const id = ++frameId; frames.set(id, callback); return id; },
+    cancelAnimationFrame(id) { frames.delete(id); },
   });
   vm.runInContext(["invalidateReadingRoots", "setReadingRootMaximum", "markReadingRootDirty", "markLiveReadingRootDirty",
     "readingGeometryChanged", "readingRoots", "refreshReadingRoot", "firstReadingRoot", "captureReadingAnchor",
+    "readingStreamMatches", "remapReadingStream", "resolveReadingBlock", "writeReadingTop", "restoreReadingAnchor",
+    "readingInput",
     "observeReadingNodes", "readingDiagramLoaded", "readingDetailsWillToggle", "watchReadingDetails", "readingResizeChanged",
     "setReadingAdjustment", "resetReadingSession", "withTranscriptLayout", "scheduleViewportGeometrySync"].map(fn).join("\n"), c);
   c.watchReadingDetails(box);
@@ -116,6 +123,11 @@ function captureFixture(rows, bounds, visible = true) {
     root(index) { return roots[index]; },
     setAdjustment(value) { c.setReadingAdjustment(value); },
     switchSession(id) { c.resetReadingSession(id); c.S.current = id; },
+    setFollow(value) { c.S.follow = value; },
+    setScrollTop(value) { box.scrollTop = value; },
+    input(direction) { c.readingInput(direction); },
+    saveAnchor() { reading.anchor = c.captureReadingAnchor(); return reading.anchor; },
+    restoreAnchor() { return c.restoreReadingAnchor(); },
     viewportResize() { c.scheduleViewportGeometrySync(); },
     layout(update, options) { c.withTranscriptLayout(update, options); },
     addContained(node) { contained.add(node); },
@@ -131,6 +143,7 @@ function captureFixture(rows, bounds, visible = true) {
     },
     reads,
     get settles() { return settles; },
+    get pendingFrames() { return frames.size; },
     get queries() { return queries; },
     get rootCount() { return roots.length; },
   };
@@ -221,16 +234,59 @@ test("viewport layout invalidates synchronously when ResizeObserver has not deli
   assert.match(source, /visualViewport\?\.addEventListener\("resize", scheduleViewportGeometrySync\)/);
 });
 
-test("session switch and return cannot reuse the prior Session's root cache", () => {
-  const fixture = captureFixture([rect(0, 520), rect(100, 620)], { top: 40, bottom: 100 });
-  fixture.capture();
+test("paused reading bookmarks restore independently across repeated switches between two Sessions", () => {
+  const rows = (session, top, bottom) => [
+    ...Array.from({ length: 4 }, (_, index) => ({ ...rect(index * 100, index * 100 + 80), id: `${session}-${index}` })),
+    { ...rect(top, bottom), id: `${session}-004` },
+  ];
+  const aRows = rows("A", 450, 650), bRows = rows("B", 900, 1150);
+  const fixture = captureFixture(aRows, { top: 40, bottom: 100 });
+  fixture.setScrollTop(0);
+  fixture.setFollow(false);
+  fixture.saveAnchor();
+  assert.deepEqual(fixture.capture().candidates[0], { id: "A-0", block: 1, offset: 2, stream: null });
+  fixture.input(-1);
+  fixture.setScrollTop(497);
+  assert.deepEqual(fixture.capture().candidates, [{ id: "A-004", block: 1, offset: -45, stream: null }]);
+  assert.equal(fixture.pendingFrames, 1);
+
   fixture.switchSession("B");
-  fixture.replaceRows([rect(300, 650)]);
-  assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0"]);
-  fixture.switchSession("A");
-  fixture.replaceRows([rect(0, 520), rect(100, 620)]);
-  assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["1"]);
-  assert.equal(fixture.queries, 3);
+  assert.equal(fixture.pendingFrames, 0);
+  fixture.replaceRows(bRows);
+  fixture.setScrollTop(812);
+  fixture.setFollow(false);
+  fixture.saveAnchor();
+  assert.deepEqual(fixture.capture().candidates, [{ id: "B-004", block: 1, offset: 90, stream: null }]);
+  fixture.setScrollTop(900);
+  assert.deepEqual(fixture.capture().candidates, [{ id: "B-004", block: 1, offset: 2, stream: null }]);
+
+  for (let round = 0; round < 2; round++) {
+    fixture.switchSession("A");
+    fixture.setScrollTop(0);
+    fixture.replaceRows([]);
+    fixture.restoreAnchor();
+    fixture.replaceRows(aRows);
+    fixture.restoreAnchor();
+    assert.equal(fixture.capture().top, 497);
+    assert.deepEqual(fixture.capture().candidates, [{ id: "A-004", block: 1, offset: -45, stream: null }]);
+
+    fixture.switchSession("B");
+    fixture.setScrollTop(0);
+    fixture.replaceRows([]);
+    fixture.restoreAnchor();
+    fixture.replaceRows(bRows);
+    fixture.restoreAnchor();
+    assert.equal(fixture.capture().top, 900);
+    assert.deepEqual(fixture.capture().candidates, [{ id: "B-004", block: 1, offset: 2, stream: null }]);
+  }
+
+  const image = {};
+  fixture.addContained(image);
+  fixture.setRow(4, rect(1100, 1300));
+  fixture.loadDiagram(image);
+  fixture.restoreAnchor();
+  assert.equal(fixture.capture().top, 1100);
+  assert.deepEqual(fixture.capture().candidates, [{ id: "B-004", block: 1, offset: 2, stream: null }]);
 });
 
 test("details click and keyboard expansion invalidate before synchronous anchor capture", () => {

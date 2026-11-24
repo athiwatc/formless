@@ -5509,7 +5509,8 @@
     if (reading.session === id) return;
     invalidateReadingRoots();
     if (reading.session != null) {
-      const anchor = reading.anchor || (!S.follow && captureReadingAnchor());
+      // Snapshot the old Session before canceling a pending scroll-input frame.
+      const anchor = !S.follow ? captureReadingAnchor() || reading.anchor : reading.anchor;
       const unseenIds = [...reading.unseenIds, ...[...reading.unseen.keys(), ...reading.deferred.keys()].map(node =>
         (node.nodeType === Node.TEXT_NODE ? node.parentElement : node)?.closest("[data-message-id]")?.dataset.messageId).filter(Boolean)];
       const unseenLive = reading.pendingLive || [...reading.unseen.keys(), ...reading.deferred.keys()].some(node =>
@@ -5522,6 +5523,7 @@
       // Reading bookmarks retain IDs/offsets rather than detached transcript DOM.
       if (reading.saved.size > 32) reading.saved.delete(reading.saved.keys().next().value);
     }
+    invalidateReadingRoots();
     const saved = reading.saved.get(id);
     reading.session = id;
     reading.anchor = saved?.anchor || null;
