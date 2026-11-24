@@ -138,6 +138,22 @@ fn emoji_search_does_not_match_messages_by_variation_selector_alone() {
 }
 
 #[test]
+fn thai_search_does_not_end_before_a_combining_tone_mark() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(Some("Thai search".into())).unwrap();
+    store
+        .append_message(&session.id, "user", "ที่")
+        .unwrap();
+    let unmarked = store
+        .append_message(&session.id, "user", "ที")
+        .unwrap();
+
+    let hits = store.search_sessions("ที", 20).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].message_id, unmarked.id);
+}
+
+#[test]
 fn unicode_search_index_backfills_existing_messages() {
     let paths = temp_paths("unicode-index-backfill");
     let session_id;

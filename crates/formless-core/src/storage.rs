@@ -8689,6 +8689,20 @@ fn unicode_search_query(terms: &[UnicodeSearchTerm]) -> Option<String> {
     (!tokens.is_empty()).then(|| tokens.into_iter().collect::<Vec<_>>().join(" AND "))
 }
 
+fn contains_without_splitting_combining_marks(content: &str, term: &str) -> bool {
+    !term.is_empty() && content.match_indices(term).any(|(start, matched)| {
+        let end = start + matched.len();
+        !content[..start]
+            .chars()
+            .next_back()
+            .is_some_and(unicode_normalization::char::is_combining_mark)
+            && !content[end..]
+                .chars()
+                .next()
+                .is_some_and(unicode_normalization::char::is_combining_mark)
+    })
+}
+
 fn session_search_matches(content: &str, unicode_terms: &[UnicodeSearchTerm]) -> bool {
     let content = search_normalize(content);
     let folded_content = unicode_terms
@@ -8696,7 +8710,7 @@ fn session_search_matches(content: &str, unicode_terms: &[UnicodeSearchTerm]) ->
         .any(|term| term.latin_folded.is_some())
         .then(|| fold_search_marks(&content));
     unicode_terms.iter().all(|term| {
-        content.contains(&term.normalized)
+        contains_without_splitting_combining_marks(&content, &term.normalized)
             || term.latin_folded.as_ref().is_some_and(|folded_term| {
                 folded_content.as_ref().is_some_and(|folded_content| {
                     search_words(folded_content).any(|word| word.starts_with(folded_term))
