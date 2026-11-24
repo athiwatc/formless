@@ -5406,7 +5406,7 @@ impl Daemon {
                 let _ = tx.decision.send((action.clone(), arguments));
                 Ok(json!({"step_id": step_id, "action": action}))
             }
-            Request::ImportAll { bundle } => self.import_all(&bundle).await,
+            Request::ImportAll { bundle } => Box::pin(self.import_all(&bundle)).await,
             Request::RunOptimiser { tool_id } => {
                 let this = self.clone();
                 tokio::spawn(async move {
