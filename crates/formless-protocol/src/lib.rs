@@ -3089,8 +3089,8 @@ pub enum Request {
         since: Option<String>,
         #[serde(default)]
         by: Option<String>,
-        /// Shift daily buckets by this caller's UTC offset in minutes.
-        /// Omitted offsets keep the historical UTC grouping.
+        /// Shift daily buckets by this caller's UTC offset in minutes
+        /// (-1439..=1439). Omitted offsets keep the historical UTC grouping.
         #[serde(default)]
         utc_offset_minutes: Option<i32>,
     },

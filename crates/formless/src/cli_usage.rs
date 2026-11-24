@@ -54,9 +54,9 @@ fn offset_label(minutes: i32) -> String {
 
 fn partial_local_day(since: Option<&str>, utc_offset_minutes: i32) -> Option<String> {
     let cutoff = chrono::DateTime::parse_from_rfc3339(since?).ok()?.to_utc();
-    let local_cutoff = cutoff.checked_add_signed(chrono::Duration::minutes(i64::from(utc_offset_minutes)))?;
-    (local_cutoff.time() != chrono::NaiveTime::MIN)
-        .then(|| local_cutoff.date_naive().to_string())
+    let local_cutoff =
+        cutoff.checked_add_signed(chrono::Duration::minutes(i64::from(utc_offset_minutes)))?;
+    (local_cutoff.time() != chrono::NaiveTime::MIN).then(|| local_cutoff.date_naive().to_string())
 }
 
 fn human(
@@ -84,7 +84,7 @@ fn human(
     };
     let day_header = format!("DAY (LOCAL, {})", offset_label(offset));
     let mut table = Table::new(&[
-        if daily { &day_header } else { "KEY" },
+        if daily { day_header.as_str() } else { "KEY" },
         "PROMPT TOKENS",
         "COMPLETION TOKENS",
         "CACHED TOKENS",
@@ -146,7 +146,10 @@ fn human(
     if terminal {
         if let Some(day) = partial {
             // A fitted table can clip the marker at ordinary terminal widths.
-            report.push_str(&format!("Partial local day {day} ({})\n", offset_label(offset)));
+            report.push_str(&format!(
+                "Partial local day {day} ({})\n",
+                offset_label(offset)
+            ));
         }
     }
     Ok(report)
@@ -202,9 +205,8 @@ mod tests {
             {"key":"2026-11-16","prompt_tokens":1,"completion_tokens":0,"cached_tokens":0,"cost":null},
             {"key":"2026-11-17","prompt_tokens":2,"completion_tokens":0,"cached_tokens":0,"cost":null}
         ]);
-        let render = |group, since| {
-            human(&rows, group, since, Some(420), false, false, None).unwrap()
-        };
+        let render =
+            |group, since| human(&rows, group, since, Some(420), false, false, None).unwrap();
         let truncated = render(Group::Day, Some("2026-11-17T03:00:00+07:00"));
         assert!(truncated.contains("DAY (LOCAL, UTC+07:00)"));
         assert!(truncated.contains("2026-11-17 (partial)"));

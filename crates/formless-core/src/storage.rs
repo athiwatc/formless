@@ -665,9 +665,8 @@ fn usage_by_model_sql(bounded: bool) -> String {
 }
 
 fn grouped_usage_sql(by: &str, bounded: bool, utc_offset_minutes: Option<i32>) -> String {
-    let shifted_day = utc_offset_minutes
-        .filter(|offset| (-1439..=1439).contains(offset))
-        .map(|offset| format!("date(u.created_at, '{offset:+} minutes')"));
+    let shifted_day =
+        utc_offset_minutes.map(|offset| format!("date(u.created_at, '{offset:+} minutes')"));
     let key = match by {
         "model" => "u.model",
         "provider" => "CASE u.provider WHEN '' THEN 'default' ELSE u.provider END",
@@ -676,7 +675,9 @@ fn grouped_usage_sql(by: &str, bounded: bool, utc_offset_minutes: Option<i32>) -
         "role" => {
             "COALESCE((SELECT t.role FROM task_stats t WHERE t.run_id=u.run_id LIMIT 1), 'main')"
         }
-        _ => shifted_day.as_deref().unwrap_or("substr(u.created_at, 1, 10)"),
+        _ => shifted_day
+            .as_deref()
+            .unwrap_or("substr(u.created_at, 1, 10)"),
     };
     let (label, order) = if by == "session" {
         (
@@ -768,7 +769,7 @@ fn checkpoint_and_usage_range_queries_use_their_indexes() {
     };
     check_range(&usage_by_model_sql(true));
     for group in ["model", "provider", "purpose", "session", "role", "day"] {
-        check_range(&grouped_usage_sql(group, true));
+        check_range(&grouped_usage_sql(group, true, None));
     }
     assert_eq!(
         store.usage_by_model(None).unwrap()["model"],

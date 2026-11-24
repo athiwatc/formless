@@ -102,12 +102,16 @@ async fn daily_usage_shifts_by_the_request_offset_and_defaults_to_utc() {
     cfg.naming.enabled = false;
     cfg.save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();
-    let session_id = store.create_session(Some("offset fixture".into())).unwrap().id;
+    let session_id = store
+        .create_session(Some("offset fixture".into()))
+        .unwrap()
+        .id;
     let conn = rusqlite::Connection::open(paths.db_file()).unwrap();
     conn.execute(
         "INSERT INTO run_usage (session_id, run_id, model, prompt_tokens, completion_tokens,
                                 reasoning_tokens, cached_tokens, created_at)
-         VALUES (?1, 'offset-run', 'fixture', 5, 0, 0, 0, '2026-11-16T20:00:00Z')",
+         VALUES (?1, 'offset-positive', 'fixture', 5, 0, 0, 0, '2026-11-16T20:00:00Z'),
+                (?1, 'offset-negative', 'fixture', 7, 0, 0, 0, '2026-11-17T02:00:00Z')",
         [&session_id],
     )
     .unwrap();
@@ -121,11 +125,53 @@ async fn daily_usage_shifts_by_the_request_offset_and_defaults_to_utc() {
 
     let local = daemon.handle(request(Some(420))).await.unwrap();
     assert_eq!(local[0]["key"], "2026-11-17");
-    assert_eq!(local[0]["prompt_tokens"], 5);
+    assert_eq!(local[0]["prompt_tokens"], 12);
 
-    let utc = daemon.handle(request(None)).await.unwrap();
+    let negative = daemon.handle(request(Some(-300))).await.unwrap();
+    assert_eq!(negative[0]["key"], "2026-11-16");
+    assert_eq!(negative[0]["prompt_tokens"], 12);
+
+    let legacy_request: Request = serde_json::from_value(serde_json::json!({
+        "type": "usage_by_day",
+        "since": null,
+        "by": null
+    }))
+    .unwrap();
+    assert!(matches!(
+        &legacy_request,
+        Request::UsageByDay {
+            utc_offset_minutes: None,
+            ..
+        }
+    ));
+    let utc = daemon.handle(legacy_request).await.unwrap();
     assert_eq!(utc[0]["key"], "2026-11-16");
     assert_eq!(utc[0]["prompt_tokens"], 5);
+    assert_eq!(utc[1]["key"], "2026-11-17");
+    assert_eq!(utc[1]["prompt_tokens"], 7);
+
+    let model = daemon
+        .handle(Request::UsageByDay {
+            since: None,
+            by: Some("model".into()),
+            utc_offset_minutes: Some(420),
+        })
+        .await
+        .unwrap();
+    assert_eq!(model[0]["key"], "fixture");
+    assert_eq!(model[0]["prompt_tokens"], 12);
+
+    for invalid_offset in [1440, -1440, i32::MIN, i32::MAX] {
+        let err = daemon
+            .handle(request(Some(invalid_offset)))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("usage UTC offset must be between -1439 and 1439 minutes"),
+            "{invalid_offset}: {err}"
+        );
+    }
 
     drop(daemon);
     drop(store);

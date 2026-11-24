@@ -2608,9 +2608,8 @@ fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
             assert_eq!(by.as_deref(), group.filter(|value| *value != "day"));
             assert_eq!(
                 *utc_offset_minutes,
-                (group.is_none() || group == Some("day")).then(|| {
-                    chrono::Local::now().offset().local_minus_utc() / 60
-                })
+                (group.is_none() || group == Some("day"))
+                    .then(|| { chrono::Local::now().offset().local_minus_utc() / 60 })
             );
         }
     }

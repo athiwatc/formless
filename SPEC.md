@@ -4619,8 +4619,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   (migration v38), so ranges only cover history from that version on;
   "all time" still uses the running totals.
 - **Token and cost chart.** `UsageByDay {since, by, utc_offset_minutes}` sums
-  provider token use (prompt, completion, cached, cache write) per UTC day,
-  shifted by the optional caller UTC offset in minutes, or with `by` = "model",
+  provider token use (prompt, completion, cached, cache write) per UTC day when
+  the offset is omitted, or shifted by the supplied caller UTC offset in minutes
+  (`-1439..=1439`; invalid values are rejected), or with `by` = "model",
   "role" or "session" per that key over the range, priced with
   `provider.prices` (no cost when a model in the bucket has no price). Session
   rows carry the stable `session_id` and display the Session name in `key`.
@@ -5405,7 +5406,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless tui` | `--plain`, `-c` / `--continue`, `--new` | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
-| `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. Human UTC day rows mark a truncated cutoff day. |
+| `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. Human daily rows show the applied UTC offset and mark a truncated cutoff day. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
 
 `providers test NAME [--model MODEL] [--json]` lists the available model IDs
