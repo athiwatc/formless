@@ -32,9 +32,11 @@ Readiness sends `initialize` and `session/new` only; it does not inspect adverti
 `authMethods`, send ACP `authenticate`, or launch a terminal-login helper. The
 [ACP v1 authentication flow](https://agentclientprotocol.com/protocol/v1/authentication)
 defines agent-managed and terminal authentication. Cursor's [ACP guide](https://cursor.com/docs/cli/acp)
-documents `cursor_login`, while Cline's [ACP guide](https://docs.cline.bot/usage/acp)
-documents reuse of credentials saved by `cline auth`. Use the vendor CLI
-login/configuration before retrying; no authenticated model turn is verified.
+describes `authenticate` with `cursor_login`; Cline's [ACP guide](https://docs.cline.bot/usage/acp)
+says ACP clients can prompt for sign-in when a session starts and reuse credentials
+saved by `cline auth`. Formless does not implement these authentication flows, so
+probe success does not establish that a later model turn can authenticate. No
+authenticated model turn is verified.
 
 ## Commands, access, and live evidence
 
