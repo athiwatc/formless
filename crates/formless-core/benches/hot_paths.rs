@@ -65,7 +65,7 @@ fn bench_transcript_and_checkpoint(c: &mut Criterion) {
         })
     });
     c.bench_function("compaction/checkpoint_round_trip", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
                 let checkpoint_store = Store::open_in_memory().unwrap();
                 let checkpoint_session = checkpoint_store
