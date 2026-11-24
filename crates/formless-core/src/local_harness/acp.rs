@@ -636,6 +636,43 @@ pub(super) fn agent_environment(request: &HarnessRequest) -> BTreeMap<OsString, 
     environment
 }
 
+fn anchor_relative_search_path(path: &OsStr, base: &Path) -> Result<OsString> {
+    let entries = if path.is_empty() {
+        vec![base.to_path_buf()]
+    } else {
+        std::env::split_paths(path)
+            .map(|entry| {
+                if entry.is_absolute() {
+                    entry
+                } else {
+                    base.join(entry)
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    std::env::join_paths(entries).context("could not anchor relative ACP PATH entries")
+}
+
+fn path_for_agent_directory(path: &OsStr) -> Result<OsString> {
+    let entries = std::env::split_paths(path).collect::<Vec<_>>();
+    if !path.is_empty() && entries.iter().all(|entry| entry.is_absolute()) {
+        return Ok(path.to_os_string());
+    }
+    let base = std::env::current_dir().context("could not resolve daemon working directory")?;
+    anchor_relative_search_path(path, &base)
+}
+
+fn is_path_environment_variable(name: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        name.to_string_lossy().eq_ignore_ascii_case("PATH")
+    }
+    #[cfg(not(windows))]
+    {
+        name == OsStr::new("PATH")
+    }
+}
+
 /// The agent and every process it starts (MCP servers, tools); dropping it kills them all.
 pub(super) struct AgentProcess(SupervisedProcess);
 
@@ -744,25 +781,37 @@ impl AgentProcess {
             use std::os::unix::process::CommandExt;
             command.arg0(argv0);
         }
-        command
-            .args((spec.args)(request))
-            .current_dir(&request.cwd)
-            .env_clear()
-            .envs(std::env::vars_os().filter(|(name, _)| {
+        let mut child_environment = std::env::vars_os()
+            .filter(|(name, _)| {
                 !request
                     .mcp_env_vars
                     .iter()
                     .map(String::as_str)
                     .chain(spec.strip_env.iter().copied())
                     .any(|var| name.as_os_str() == std::ffi::OsStr::new(var))
-            }))
-            .envs(agent_environment(request).into_iter().filter(|(name, _)| {
-                !spec
-                    .strip_env
-                    .iter()
-                    .any(|var| name.as_os_str() == std::ffi::OsStr::new(var))
-            }))
-            .envs(spec.set_env.iter().copied())
+            })
+            .collect::<Vec<_>>();
+        child_environment.extend(agent_environment(request).into_iter().filter(|(name, _)| {
+            !spec
+                .strip_env
+                .iter()
+                .any(|var| name.as_os_str() == std::ffi::OsStr::new(var))
+        }));
+        child_environment.extend(
+            spec.set_env
+                .iter()
+                .map(|(name, value)| (OsString::from(*name), OsString::from(*value))),
+        );
+        for (name, value) in &mut child_environment {
+            if is_path_environment_variable(name) {
+                *value = path_for_agent_directory(value)?;
+            }
+        }
+        command
+            .args((spec.args)(request))
+            .current_dir(&request.cwd)
+            .env_clear()
+            .envs(child_environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -1525,6 +1574,23 @@ mod tests {
             override_path
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn relative_path_entries_are_anchored_to_the_daemon_directory() {
+        let daemon_cwd = std::env::temp_dir().join("formless-daemon-cwd");
+        let relative = PathBuf::from("repository/bin");
+        let absolute = std::env::temp_dir().join("system/bin");
+        let path = std::env::join_paths([relative.as_os_str(), absolute.as_os_str()]).unwrap();
+
+        let anchored = anchor_relative_search_path(&path, &daemon_cwd).unwrap();
+
+        assert_eq!(
+            std::env::split_paths(&anchored).collect::<Vec<_>>(),
+            vec![daemon_cwd.join(relative), absolute]
+        );
+        let anchored_empty = anchor_relative_search_path(OsStr::new(""), &daemon_cwd).unwrap();
+        assert_eq!(anchored_empty.as_os_str(), daemon_cwd.as_os_str());
     }
 
     #[cfg(unix)]
