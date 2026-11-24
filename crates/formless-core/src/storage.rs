@@ -8126,10 +8126,10 @@ pub struct ContextCache {
     tokens: Vec<usize>,
     /// Seqs of the post-checkpoint messages, in order.
     live_seqs: Vec<i64>,
-    /// User-message IDs represented as individual messages in the provider context.
+    /// User-message IDs represented as individual messages in the cached context.
     /// Checkpoint summaries do not retain per-message IDs.
     included_user_message_ids: Vec<String>,
-    /// Unconfirmed steering messages represented as individual provider messages.
+    /// Unconfirmed, non-empty steering messages represented as provider messages.
     included_steer_candidates: Vec<SteerCandidate>,
     /// Indexes into `live_seqs` where a user message starts a turn.
     turn_starts: Vec<usize>,
@@ -8291,21 +8291,23 @@ impl ContextCache {
                 }
             }
             self.push(msg);
-            if m.role == "user" && !empty_user {
+            if m.role == "user" {
                 self.included_user_message_ids.push(m.id.clone());
-                let steer_run_id = m
-                    .meta
-                    .as_deref()
-                    .and_then(|metadata| serde_json::from_str::<Value>(metadata).ok())
-                    .and_then(|meta| {
-                        if meta["steer"]["context_included"].as_bool() == Some(true) {
-                            return None;
-                        }
-                        meta["steer"]["run_id"].as_str().map(str::to_string)
-                    });
-                if let Some(run_id) = steer_run_id {
-                    self.included_steer_candidates
-                        .push(SteerCandidate { id: m.id, run_id });
+                if !empty_user {
+                    let steer_run_id = m
+                        .meta
+                        .as_deref()
+                        .and_then(|metadata| serde_json::from_str::<Value>(metadata).ok())
+                        .and_then(|meta| {
+                            if meta["steer"]["context_included"].as_bool() == Some(true) {
+                                return None;
+                            }
+                            meta["steer"]["run_id"].as_str().map(str::to_string)
+                        });
+                    if let Some(run_id) = steer_run_id {
+                        self.included_steer_candidates
+                            .push(SteerCandidate { id: m.id, run_id });
+                    }
                 }
             }
         }
@@ -9237,7 +9239,7 @@ mod context_watermark_tests {
     }
 
     #[test]
-    fn empty_user_messages_are_not_included_ids_or_steer_candidates() {
+    fn empty_user_messages_are_included_ids_but_not_steer_candidates() {
         let store = Store::open_in_memory().unwrap();
         let session = store.create_session(None).unwrap().id;
         let message = store
@@ -9253,7 +9255,7 @@ mod context_watermark_tests {
             .build(&store, &session, "private prompt", 100_000, 0.8)
             .unwrap();
         assert_eq!(cache.last_included_seq(), message.seq);
-        assert!(cache.included_user_message_ids().is_empty());
+        assert_eq!(cache.included_user_message_ids(), &[message.id.clone()]);
         assert!(cache.included_steer_candidates().is_empty());
         assert!(context
             .iter()
