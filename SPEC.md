@@ -495,6 +495,13 @@ without redesign.
   loopback Ollama endpoint from the daemon user's local model path; this may
   differ from Ollama's actual storage when it runs as another user or in a
   container. Ollama's API does not expose the server's free space.
+  The cancellation wire request is
+  `{"type":"cancel_ollama_pull","pull_id":"PULL_ID"}`. A successful
+  response result is `{"cancel_requested":true,"pull_id":"PULL_ID",
+  "provider":"PROVIDER","model":"MODEL","state":"CURRENT_STATE"}`;
+  this acknowledges the cancellation request, while the attached client
+  receives the terminal progress event separately. Unknown, terminal, or
+  unattached pull IDs return a protocol error.
 
 ### 4.3 Endpoint probe (onboarding gate)
 
