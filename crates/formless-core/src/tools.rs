@@ -1977,6 +1977,40 @@ mod tests {
     }
 
     #[test]
+    fn warm_session_definition_query_count_does_not_scale_with_registry_size() {
+        let warm_query_count = |tool_count: usize| {
+            let store = Store::open_in_memory().unwrap();
+            let caps = formless_runtime::Capabilities::default();
+            for index in 0..tool_count {
+                store
+                    .create_tool_version(
+                        &format!("warm_query_count_{index:03}"),
+                        "warm query count fixture",
+                        r#"{"type":"object"}"#,
+                        "{}",
+                        "function run(){}",
+                        &caps,
+                        64,
+                        "test",
+                    )
+                    .unwrap();
+            }
+            let session = store
+                .create_session(Some("warm query count".into()))
+                .unwrap()
+                .id;
+            // The cold call loads membership and writes one pin per shown Tool; preserve that behavior.
+            tool_definitions(&store, Some(&session), 40).unwrap();
+            let (_, statements) = store.count_forecast_statements(|| {
+                tool_definitions(&store, Some(&session), 40).unwrap()
+            });
+            statements
+        };
+
+        assert_eq!(warm_query_count(1), warm_query_count(50));
+    }
+
+    #[test]
     fn invocation_rollups_track_lifecycle_and_distinct_sessions() {
         let store = Store::open_in_memory().unwrap();
         let first_session = store.create_session(Some("first".into())).unwrap().id;
