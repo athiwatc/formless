@@ -34,7 +34,7 @@ fn find_tools_call(body: &Value, query: &str) -> bool {
     }) && body["messages"].to_string().contains(query)
 }
 
-fn assert_invalid_json_tool_feedback(body: &Value, case: &str) {
+fn assert_tool_feedback(body: &Value, case: &str, expected: &[&str]) {
     let message = body["messages"]
         .as_array()
         .unwrap()
@@ -63,8 +63,7 @@ fn assert_invalid_json_tool_feedback(body: &Value, case: &str) {
         false
     };
     assert!(
-        contains_text("invalid JSON arguments for find_tools")
-            && contains_text("Retry with valid JSON."),
+        expected.iter().all(|expected| contains_text(expected)),
         "{case} error was not fed back in the last tool message: {}",
         serde_json::to_string_pretty(message).unwrap()
     );
@@ -206,10 +205,24 @@ async fn retries_rate_limit_and_dropped_stream_then_repairs_malformed_arguments(
     malformed.malformed_tool_call("find_tools", "{");
 
     let correction = scenario.next_call().await;
-    assert_invalid_json_tool_feedback(&correction.body, "malformed argument");
+    assert_tool_feedback(
+        &correction.body,
+        "malformed argument",
+        &[
+            "invalid JSON arguments for find_tools",
+            "Retry with valid JSON.",
+        ],
+    );
     correction.truncated_tool_call("find_tools", "{\"query\":");
     let repair = scenario.next_call().await;
-    assert_invalid_json_tool_feedback(&repair.body, "truncated argument");
+    assert_tool_feedback(
+        &repair.body,
+        "truncated argument",
+        &[
+            "find_tools call was cut off at the output token limit",
+            "arguments are incomplete and it was not run",
+        ],
+    );
     repair.tool_call(
         "find_tools",
         json!({"query":"no matching offline scenario Tool"}),
