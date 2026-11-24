@@ -594,10 +594,16 @@ fn docs_fish_completions_include_topic_names_and_descriptions() {
 
 #[test]
 fn docs_fish_completions_follow_topic_argument_position() {
-    let fish_version = ProcessCommand::new("fish").arg("--version").output();
-    let Ok(fish_version) = fish_version else {
-        eprintln!("skipping Fish completion behavior checks; fish is not installed");
-        return;
+    let fish_required = std::env::var("FORMLESS_REQUIRE_FISH").is_ok_and(|value| value == "1");
+    let fish_version = match ProcessCommand::new("fish").arg("--version").output() {
+        Ok(fish_version) => fish_version,
+        Err(error) if fish_required => {
+            panic!("FORMLESS_REQUIRE_FISH=1 but fish could not be run: {error}")
+        }
+        Err(_) => {
+            eprintln!("skipping Fish completion behavior checks; fish is not installed");
+            return;
+        }
     };
     assert!(fish_version.status.success(), "fish --version failed");
 
