@@ -155,8 +155,8 @@ More: [docs/capabilities.md](docs/capabilities.md) · [docs/troubleshooting.md](
 ## Contributing
 
 Behaviour changes go in [SPEC.md](SPEC.md) first, and no behaviour lives only
-in a client. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, local checks,
-change recipes, and pull request guidance. See
+in a client. See the [contributor guide](https://github.com/athiwatc/formless/blob/main/CONTRIBUTING.md)
+for setup, local checks, change recipes, and pull request guidance. See
 [Architecture → Development](docs/architecture.md) for development details and
 [packaging/README.md](packaging/README.md) for releases.
 
