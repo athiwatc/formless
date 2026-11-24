@@ -5993,7 +5993,7 @@
       state.replaceChildren(statusRender.spinner, h("span", { "data-status-activity": "" }, statusRender.text));
     }
     const running = isRunning();
-    const stateClass = running ? "state busy" : "state";
+    const stateClass = running ? "state busy" : S.pullActivity ? "state pulling" : "state";
     if (state.className !== stateClass) state.className = stateClass;
     if (statusRender.spinner.hidden !== !running) statusRender.spinner.hidden = !running;
     const activity = running ? S.activity : S.pullActivity;

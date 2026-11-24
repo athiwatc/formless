@@ -7,6 +7,7 @@ import { webcrypto, createHash } from 'node:crypto';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 const source = readFileSync(new URL('./web/app.js', import.meta.url), 'utf8');
+const cssSource = readFileSync(new URL('./web/app.css', import.meta.url), 'utf8');
 test('web actions avoid native synchronous prompt and confirm calls', () => {
   assert.doesNotMatch(source.replace(/^\s*\/\/.*$/gm, ''), /\b(?:prompt|confirm)\s*\(/);
 });
@@ -190,13 +191,14 @@ test('new browser connection clears pull state and invalidates old acknowledgeme
 });
 test('pull status stays compact, details are noted once per pull, and matching terminal clears it', () => {
   let context;
+  let running = false;
   const notices = [];
   const c = setup(['renderStatus', 'handlePullProgress', 'pullTracking', 'completePull'], {
     document: { activeElement: null, createTextNode: () => ({ textContent: '' }) },
     statusRender: { root: null, spinner: null, text: null },
     h: () => ({ hidden: false }),
     updateText: (node, value) => { node.textContent = value; },
-    isRunning: () => false,
+    isRunning: () => running,
     activityText: activity => activity.label,
     note: (text, err) => notices.push({ text, err }),
     storedSessionModel: () => null,
@@ -225,6 +227,7 @@ test('pull status stays compact, details are noted once per pull, and matching t
     pull_id: 'pull-1', completed: 1, total: 2, expected_size: 100, warning: 'low disk',
   });
   assert.equal(c.statusRender.text.textContent, 'pulling llama3 · 50%');
+  assert.equal(c.$('state').className, 'state pulling');
   assert.equal(notices.length, 1);
   assert.match(notices[0].text, /expected size 100 bytes.*low disk/);
   c.handlePullProgress({
@@ -239,15 +242,24 @@ test('pull status stays compact, details are noted once per pull, and matching t
     pull_id: 'pull-2', completed: 1, total: 4, expected_size: 200, warning: 'low disk',
   });
   assert.equal(c.statusRender.text.textContent, 'pulling another-model · 25%');
+  assert.equal(c.$('state').className, 'state pulling');
   assert.equal(notices.length, 2);
   c.handlePullProgress({
     type: 'model_pull_progress', model: 'llama3', status: 'success', done: true,
     pull_id: 'pull-2',
   });
   assert.equal(c.statusRender.text.textContent, '● ready');
+  assert.equal(c.$('state').className, 'state');
   c.S.activity = { label: 'stale unrelated activity', since: 0 };
   c.renderStatus();
   assert.equal(c.statusRender.text.textContent, '● ready');
+  running = true;
+  c.S.activity = { label: 'rate limited · retrying in 8s (2/5) · Esc to stop', since: 0 };
+  c.renderStatus();
+  assert.equal(c.$('state').className, 'state busy');
+  assert.equal(c.statusRender.text.textContent, 'rate limited · retrying in 8s (2/5) · Esc to stop');
+  assert.match(cssSource, /\.state\.pulling \[data-status-activity\] \{[^}]*text-overflow: ellipsis;/s);
+  assert.doesNotMatch(cssSource, /\.state \[data-status-activity\] \{[^}]*text-overflow: ellipsis;/s);
 });
 test('queued edits submit the revision opened by the editor', () => {
   const notices = [];
