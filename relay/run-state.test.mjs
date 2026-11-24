@@ -16,7 +16,7 @@ function setup(){
   let renders=0;
   const c=vm.createContext({S:{current:'s',view:'chat',sessions:[],messages:[],liveTools:[],running:new Set(),approvals:[],questions:[]},h,$,tr:x=>x,uiLocale:()=>"en-US",forecastRevision:0,scheduleForecast(){},branchSummaryEvent(){},notifyFor(){},note(){},invalidateBranchSummary(){},closeSidebar(){},renderHistory(){renders++;},renderRunTools(){},renderStatus(){},renderComposer(){},renderQueue(){},renderChips(){},renderStep(){},renderRunBanner(){},renderAll(){},renderLive(){},renderApproval(){},showQuestion(){},cancelAsk(){},setActivity(){},clearQuestions(){},addApproval(){},queueQuestion(){},rendered:new Map(),prefs:{set(){}},loadDraft:()=>'',refreshAttachmentInventory:async()=>[],sessionCacheKey:(scope,id)=>(scope||'')+'\u0000'+id,sessionStorageKey:scope=>scope?'session:'+scope:'session',flushOutbox(){},request:async()=>({}),act:async()=>snapshot('r1'),isRunning:()=>c.S.running.has(c.S.current)});
   installEventRenderFixture(c, fn);
-  vm.runInContext(['uiFormat','relTime','planStateLabel','renderPlan','runFilesCaveat','recordedDuration','recapBlock','restoreSessionRunState','applySessionLiveState','openSession','onEvent','clearLiveState'].map(fn).join('\n')+'\nlet sessionSeq=0;const CLIENT_LABEL="fixture";const attachmentDrafts={};',c);
+  vm.runInContext(['uiFormat','relTime','planStateLabel','renderPlan','runFilesCaveat','recordedDuration','recapBlock','completedRunAnswer','restoreSessionRunState','applySessionLiveState','openSession','onEvent','clearLiveState'].map(fn).join('\n')+'\nlet sessionSeq=0;const CLIENT_LABEL="fixture";const attachmentDrafts={};',c);
   return{c,elements,renders:()=>renders};
 }
 test('actual openSession restores exact terminal recap and lifecycle; clear and legacy remain honest',async()=>{
@@ -25,6 +25,18 @@ test('actual openSession restores exact terminal recap and lifecycle; clear and 
   assert.match(text(elements.get('plan')),/paused/);assert.match(text(elements.get('plan')),/original step/);
   const block=c.recapBlock(c.S.recap);assert.match(text(block.children[0]),/paused.*7 calls.*2 unfinished calls/);assert.match(text(block),/programs.*MCP tools/);
   c.act=async()=>({...snapshot('r2'),last_recap:null,plan_state:null});await c.openSession('s');assert.equal(c.S.recap,null);assert.equal(c.S.planState,null);
+});
+test('opening an active run seeds final-answer announcement tracking',async()=>{
+  const{c}=setup();const heard=[];
+  c.announceChat=text=>heard.push(text);
+  c.commitReadingStream=()=>{};
+  c.act=async()=>({...snapshot('r-live'),running:true,latest_run:{run_id:'r-live',status:'running'},plan_state:metadata('r-live','running'),messages:[{id:'prior',role:'assistant',seq:4,content:'Earlier answer'}]});
+  await c.openSession('s');
+  assert.equal(vm.runInContext('announcedRun.afterSeq',c),4);
+  c.onEvent({type:'message_complete',session_id:'s',message:{id:'final',role:'assistant',seq:5,content:'The final answer',meta:'{}'}});
+  const finished={type:'run_finished',session_id:'s',run_id:'r-live',status:'completed'};
+  c.onEvent(finished);c.onEvent(finished);
+  assert.deepEqual(heard,['Answer finished. The final answer']);
 });
 test('snapshot races preserve newest plan and recap without replaying or duplicate rendering',async()=>{
   const{c,renders}=setup(),wait=deferred();c.act=()=>wait.promise;

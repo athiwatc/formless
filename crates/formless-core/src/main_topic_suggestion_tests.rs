@@ -824,6 +824,7 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
                         "read-context-framed",
                         READ_TOPIC_CONTEXT,
                         false,
+                        None,
                     )),
                 )?;
                 let raw = st.append_message_meta(
@@ -834,6 +835,7 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
                         "read-context-raw",
                         READ_TOPIC_CONTEXT,
                         false,
+                        None,
                     )),
                 )?;
                 let user_quote = st.append_message_meta(
@@ -844,6 +846,7 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
                         "quoted-read-context",
                         READ_TOPIC_CONTEXT,
                         false,
+                        None,
                     )),
                 )?;
                 let assistant_quote = st.append_message(story_chat, "assistant", &raw_context)?;

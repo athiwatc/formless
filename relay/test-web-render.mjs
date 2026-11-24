@@ -5,6 +5,11 @@ import vm from 'node:vm';
 import assert from 'node:assert/strict';
 
 export function installEventRenderFixture(context, fn) {
+  context.announceChat ??= () => {};
+  context.completedRunAnswer ??= () => '';
+  context.announcedRun ??= null;
+  context.lastAnnouncedFinishedRun ??= null;
+  if (context.S) context.S.messages ??= [];
   // Event/session reducers use the production incremental live-text helpers.
   // Keep their state scoped to this VM, rather than stubbing cache resets.
   vm.runInContext('const liveText = { session: undefined, run: undefined, answer: {}, thinking: {}, answerSource: undefined, thinkingSource: undefined, expanded: false };\n'

@@ -214,7 +214,10 @@ def feedback_checks(page, cdp):
     keyboard_action=page.get_by_role('button',name='Keyboard feedback action',exact=True)
     check(keyboard_action.evaluate('(e)=>{const r=e.getBoundingClientRect();return e.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2));}'),'feedback remains above nested dialog')
     page.locator('.backdrop[aria-label="Nested feedback fixture"] button').last.focus();page.keyboard.press('Tab')
-    check(keyboard_action.evaluate('(e)=>document.activeElement===e'),'Tab from nested modal reaches feedback action')
+    dismissal=page.locator('#toasts .toast.err button[aria-label="Dismiss notification"]')
+    check(dismissal.evaluate('(e)=>document.activeElement===e'),'Tab from nested modal reaches persistent toast dismissal')
+    page.keyboard.press('Tab')
+    check(keyboard_action.evaluate('(e)=>document.activeElement===e'),'Tab from toast dismissal reaches feedback action')
     page.keyboard.press('Enter');check(page.evaluate('__focus817.feedbackActions')==2,'feedback action supports keyboard activation')
     check(page.evaluate('__focus817.calls.length')==0,'feedback fixtures never dispatch approval or Tool requests')
     page.evaluate("""()=>{const d=__focus817;d.closeDialog(d.activeDialog().node);d.S.approvals=[];d.renderApproval();document.querySelector('#toasts').replaceChildren();}""")
@@ -533,6 +536,7 @@ def run():
             page.get_by_role('menuitem',name='Copy link',exact=False).click()
             check(page.locator('#sidebar').evaluate('(e)=>e.classList.contains("open")'),'mobile copy action leaves sidebar open')
             check(page.locator(session_trigger).evaluate('(e)=>e===document.activeElement'),'mobile copy action restores visible menu trigger')
+            page.evaluate("document.querySelector('#toasts').replaceChildren()")
             # Pointer dismissal of an overlay is not an outside click on the
             # drawer behind it, including when a close button removes the modal.
             page.locator(session_trigger).click()
