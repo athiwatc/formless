@@ -221,6 +221,40 @@ test('share inbox read does not apply to a Session selected while IndexedDB is r
   assert.match(notes[0], /changed while the share was loading/);
 });
 
+test('pending share token survives URL replacement and is recoverable only in its bound space', async () => {
+  const values = new Map(), sessionStorage = {
+    getItem: key => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: key => values.delete(key),
+  };
+  let readToken, applied = 0, deleted = 0;
+  const c = setup([
+    'handleLaunchRoute', 'readPendingShareLaunch', 'rememberPendingShareLaunch',
+    'pendingShareLaunchForScope', 'clearPendingShareLaunch',
+  ], {
+    sessionStorage, launchRouteHandled: false, launchAction: null, launchShareError: false,
+    launchShareToken: null, launchView: null, readIncomingShare: async token => { readToken = token; return { files: [] }; },
+    applyIncomingShare: async () => { applied++; return true; },
+    deleteIncomingShare: async () => { deleted++; },
+    stripLaunchParams() {},
+  });
+  c.rememberPendingShareLaunch('share-token', 'space-a');
+  c.S.storageScope = 'space-b';
+  await c.handleLaunchRoute();
+  assert.equal(readToken, undefined);
+  assert.equal(applied, 0);
+  assert.equal(deleted, 0);
+  assert.equal(c.pendingShareLaunchForScope('space-a').token, 'share-token');
+
+  c.launchRouteHandled = false;
+  c.S.storageScope = 'space-a';
+  await c.handleLaunchRoute();
+  assert.equal(readToken, 'share-token');
+  assert.equal(applied, 1);
+  assert.equal(deleted, 1);
+  assert.equal(c.pendingShareLaunchForScope('space-a'), null);
+});
+
 test('share destination write rechecks selection before changing the composer or attaching files', async () => {
   const gate = deferred(), photo = new File(['photo'], 'photo.png', { type: 'image/png' });
   let attached = 0;

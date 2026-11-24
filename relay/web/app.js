@@ -10043,6 +10043,33 @@
   const launchAction = launchParams.get("action");
   const launchView = launchParams.get("view");
   let launchRouteHandled = false;
+  const pendingShareLaunchKey = "formless_pending_share_launch";
+  function readPendingShareLaunch() {
+    try {
+      const pending = JSON.parse(sessionStorage.getItem(pendingShareLaunchKey) || "null");
+      return pending && typeof pending.token === "string" && pending.token
+        && (pending.scope == null || typeof pending.scope === "string") ? pending : null;
+    } catch (_) { return null; }
+  }
+  function rememberPendingShareLaunch(token, scope = S.storageScope) {
+    if (typeof token !== "string" || !token) return false;
+    const previous = readPendingShareLaunch();
+    const boundScope = previous?.token === token && previous.scope ? previous.scope : scope || null;
+    try {
+      sessionStorage.setItem(pendingShareLaunchKey, JSON.stringify({ token, scope: boundScope }));
+      return true;
+    } catch (_) { return false; }
+  }
+  function pendingShareLaunchForScope(scope) {
+    const pending = readPendingShareLaunch();
+    return pending ? { ...pending, scopeMismatch: !!pending.scope && pending.scope !== scope } : null;
+  }
+  function clearPendingShareLaunch(token) {
+    const pending = readPendingShareLaunch();
+    if (!pending || pending.token !== token) return false;
+    try { sessionStorage.removeItem(pendingShareLaunchKey); return true; } catch (_) { return false; }
+  }
+  if (launchShareToken) rememberPendingShareLaunch(launchShareToken, S.storageScope);
 
   function openShareInbox() {
     return new Promise((resolve, reject) => {
@@ -10221,19 +10248,26 @@
       note("Shared content couldn't be saved. Please share it again.", true);
       stripLaunchParams(["share-error"]);
     }
-    if (launchShareToken) {
+    const pendingShare = pendingShareLaunchForScope(S.storageScope);
+    const shareToken = launchShareToken || (pendingShare && !pendingShare.scopeMismatch ? pendingShare.token : null);
+    if (pendingShare?.scopeMismatch && (!launchShareToken || pendingShare.token === launchShareToken)) {
+      note("This pending share belongs to a different Formless space; reopen that space to continue.", true);
+    } else if (shareToken) {
+      rememberPendingShareLaunch(shareToken, S.storageScope);
       const selected = { sessionId: S.current, scope: S.storageScope };
       try {
-        const share = await readIncomingShare(launchShareToken);
+        const share = await readIncomingShare(shareToken);
         if (!share) {
           note("This shared content is no longer available. Share it again.", true);
+          clearPendingShareLaunch(shareToken);
           stripLaunchParams(["share"]);
         }
         else if (S.current !== selected.sessionId || S.storageScope !== selected.scope) {
           note("The selected Session changed while the share was loading; reload to apply it safely.", true);
         }
-        else if (await applyIncomingShare(launchShareToken, share, selected)) {
-          await deleteIncomingShare(launchShareToken);
+        else if (await applyIncomingShare(shareToken, share, selected)) {
+          await deleteIncomingShare(shareToken);
+          clearPendingShareLaunch(shareToken);
           stripLaunchParams(["share"]);
         }
       } catch (error) {
