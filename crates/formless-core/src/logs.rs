@@ -153,6 +153,48 @@ fn promote_alias(source: &std::path::Path, destination: &std::path::Path) -> std
     std::fs::remove_file(source)
 }
 
+#[cfg(windows)]
+fn discard_live_log(path: &std::path::Path) -> std::io::Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfoEx, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_FLAG_DELETE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let log = std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // Unlike delete-pending, closing this handle removes this name immediately,
+    // even while stdio still holds the old log open. Do not truncate on failure:
+    // another name may refer to the same file.
+    // SAFETY: the live handle and complete, fixed-size input remain valid for
+    // the duration of the synchronous call.
+    if unsafe {
+        SetFileInformationByHandle(
+            log.as_raw_handle(),
+            FileDispositionInfoEx,
+            (&disposition as *const FILE_DISPOSITION_INFO_EX).cast(),
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn discard_live_log(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
 /// Enforce retention even below the live size cap, then rotate if needed.
 /// `keep` is bounded to 0..=64; zero discards rotated history.
 pub fn rotate_if_needed(paths: &Paths, max_bytes: u64, keep: usize) -> std::io::Result<bool> {
@@ -204,15 +246,8 @@ pub fn rotate_if_needed(paths: &Paths, max_bytes: u64, keep: usize) -> std::io::
         return Ok(false);
     }
     if keep == 0 {
-        if std::fs::symlink_metadata(&log)?.file_type().is_symlink() {
-            std::fs::remove_file(&log)?;
-            return Ok(true);
-        }
-        std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&log)?;
-        return Ok(false);
+        discard_live_log(&log)?;
+        return Ok(true);
     }
     remove_if_present(rotated(paths, keep))?;
     for n in (1..keep).rev() {

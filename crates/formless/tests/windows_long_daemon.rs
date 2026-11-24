@@ -15,7 +15,7 @@ struct Profile {
 }
 
 impl Profile {
-    fn new(long: bool) -> Self {
+    fn new(long: bool, keep: usize) -> Self {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -31,7 +31,7 @@ impl Profile {
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(
             config.join("config.toml"),
-            "[daemon]\nlog_max_bytes = 4096\nlog_keep = 1\nidle_grace_secs = 600\n[provider]\nbase_url = \"http://127.0.0.1:9\"\n",
+            format!("[daemon]\nlog_max_bytes = 4096\nlog_keep = {keep}\nidle_grace_secs = 600\n[provider]\nbase_url = \"http://127.0.0.1:9\"\n"),
         ).unwrap();
         Self {
             root,
@@ -86,7 +86,16 @@ impl Drop for Profile {
 
 #[test]
 fn detached_daemon_reopens_its_log_after_rotation() {
-    let mut profile = Profile::new(false);
+    assert_detached_daemon_reopens_its_log(1);
+}
+
+#[test]
+fn detached_daemon_reopens_its_log_without_retaining_history() {
+    assert_detached_daemon_reopens_its_log(0);
+}
+
+fn assert_detached_daemon_reopens_its_log(keep: usize) {
+    let mut profile = Profile::new(false, keep);
     let result = profile.start();
     assert!(result.success(), "{result:?}");
     let live = profile.data.join("daemon.log");
@@ -104,11 +113,15 @@ fn detached_daemon_reopens_its_log_after_rotation() {
     let until = Instant::now() + Duration::from_secs(85);
     loop {
         let live_text = std::fs::read_to_string(&live).unwrap_or_default();
-        if old.exists() && live_text.contains("rotated daemon log") {
+        if live_text.contains("rotated daemon log") {
             assert!(!live_text.contains("before-live-rotation"));
-            assert!(std::fs::read_to_string(&old)
-                .unwrap()
-                .contains("before-live-rotation"));
+            if keep == 0 {
+                assert!(!old.exists(), "zero retention must not keep a rotated log");
+            } else {
+                assert!(std::fs::read_to_string(&old)
+                    .unwrap()
+                    .contains("before-live-rotation"));
+            }
             break;
         }
         assert!(
@@ -123,7 +136,7 @@ fn detached_daemon_reopens_its_log_after_rotation() {
 
 #[test]
 fn long_windows_profile_works_or_doctor_names_the_path_limit() {
-    let mut profile = Profile::new(true);
+    let mut profile = Profile::new(true, 1);
     assert!(profile.data.as_os_str().encode_wide().count() > 260);
     if profile.start().success() {
         assert!(profile.data.join("formless.db").is_file());
