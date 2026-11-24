@@ -1693,7 +1693,16 @@ async fn strict_dollar_limits_refuse_unknown_native_input_before_http_or_admissi
             Ok((run, vec![crate::storage::provider_message(&m)]))
         })
         .unwrap();
-    let provider = daemon.provider(&cfg).await.unwrap();
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let dispatched = dispatches.clone();
+    let provider = daemon
+        .provider(&cfg)
+        .await
+        .unwrap()
+        .with_request_dispatch_hook(Arc::new(move || {
+            dispatched.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
     let error = tokio::time::timeout(
         Duration::from_secs(5),
         counted(
