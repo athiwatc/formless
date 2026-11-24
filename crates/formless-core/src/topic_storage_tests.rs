@@ -281,7 +281,11 @@ fn topic_generated_marker_migrates_v73_and_survives_reopen() {
         .unwrap();
     store
         .conn
-        .execute_batch("ALTER TABLE messages DROP COLUMN generated_by;PRAGMA user_version=73;")
+        .execute_batch(
+            "ALTER TABLE messages DROP COLUMN generated_by;
+             DROP TABLE messages_unicode_fts;
+             PRAGMA user_version=73;",
+        )
         .unwrap();
     drop(store);
     let store = Store::open(&path).unwrap();

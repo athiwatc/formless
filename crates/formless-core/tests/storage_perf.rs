@@ -63,6 +63,7 @@ fn opening_a_v67_database_adds_query_indexes_once_without_changing_checkpoint_ro
     raw.execute_batch(
         "DROP INDEX idx_checkpoints_session;
          DROP INDEX idx_run_usage_created;
+         DROP TABLE messages_unicode_fts;
          PRAGMA user_version=67;",
     )
     .unwrap();

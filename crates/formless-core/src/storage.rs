@@ -2252,6 +2252,28 @@ impl Store {
         Ok(())
     }
 
+    fn remove_unicode_search_index_by_rowid(&self, rowid: i64) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS temp.messages_unicode_fts_vocab
+             USING fts5vocab(main, messages_unicode_fts, 'instance');",
+        )?;
+        let terms = {
+            let mut statement = self.conn.prepare(
+                "SELECT DISTINCT term FROM temp.messages_unicode_fts_vocab WHERE doc=?1 ORDER BY term",
+            )?;
+            let rows = statement.query_map([rowid], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !terms.is_empty() {
+            self.conn.execute(
+                "INSERT INTO messages_unicode_fts(messages_unicode_fts,rowid,grams)
+                 VALUES('delete',?1,?2)",
+                params![rowid, terms.join(" ")],
+            )?;
+        }
+        Ok(())
+    }
+
     fn remove_session_unicode_search_index(&self, session_id: &str) -> Result<()> {
         let mut statement = self
             .conn
@@ -2831,8 +2853,13 @@ impl Store {
                 let mut rows = statement.query(params![session_id, msg.seq])?;
                 while let Some(row) = rows.next()? {
                     let rowid: i64 = row.get(0)?;
-                    let content: String = row.get(1)?;
-                    st.remove_unicode_search_index(rowid, &content)?;
+                    match row.get::<_, String>(1) {
+                        Ok(content) => st.remove_unicode_search_index(rowid, &content)?,
+                        Err(rusqlite::Error::InvalidColumnType(_, _, _)) => {
+                            st.remove_unicode_search_index_by_rowid(rowid)?;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
             }
             tx.execute(
