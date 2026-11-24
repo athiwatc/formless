@@ -9319,7 +9319,7 @@
     const draftSnapshot = normalizeTextareaValue(input.value);
     const text = input.value.trim();
     if (!text) return;
-      if (text.startsWith("/") && !S.editMessageId && !isSharedSlashDraft(S.storageScope, S.current, input.value)) {
+    if (text.startsWith("/") && !S.editMessageId && !isSharedSlashDraft(S.storageScope, S.current, input.value)) {
       input.value = "";
       saveDraft(S.current, "");
       autosize();
@@ -10112,10 +10112,9 @@
   const launchAction = launchParams.get("action");
   const launchView = launchParams.get("view");
   let launchRouteHandled = false;
-  const pendingShareLaunchKey = "formless_pending_share_launch";
   function readPendingShareLaunch() {
     try {
-      const pending = JSON.parse(sessionStorage.getItem(pendingShareLaunchKey) || "null");
+      const pending = JSON.parse(sessionStorage.getItem("formless_pending_share_launch") || "null");
       return pending && typeof pending.token === "string" && pending.token
         && (pending.scope == null || typeof pending.scope === "string") ? pending : null;
     } catch (_) { return null; }
@@ -10125,7 +10124,7 @@
     const previous = readPendingShareLaunch();
     const boundScope = previous?.token === token && previous.scope ? previous.scope : scope || null;
     try {
-      sessionStorage.setItem(pendingShareLaunchKey, JSON.stringify({ token, scope: boundScope }));
+      sessionStorage.setItem("formless_pending_share_launch", JSON.stringify({ token, scope: boundScope }));
       return true;
     } catch (_) { return false; }
   }
@@ -10136,7 +10135,7 @@
   function clearPendingShareLaunch(token) {
     const pending = readPendingShareLaunch();
     if (!pending || pending.token !== token) return false;
-    try { sessionStorage.removeItem(pendingShareLaunchKey); return true; } catch (_) { return false; }
+    try { sessionStorage.removeItem("formless_pending_share_launch"); return true; } catch (_) { return false; }
   }
   if (launchShareToken) rememberPendingShareLaunch(launchShareToken, S.storageScope);
 
@@ -10292,14 +10291,14 @@
       if (sharedText) {
         const input = $("input");
         input.value = input.value ? input.value + (input.value.endsWith("\n") ? "" : "\n\n") + sharedText : sharedText;
-          if (!saveDraft(destination.sessionId, input.value, destination.scope)) {
-            note("Shared text couldn't be saved to this draft; reload to retry.", true);
-            return false;
-          }
-          if (sharedText.trimStart().startsWith("/") && input.value.trimStart().startsWith("/")) {
-            rememberSharedSlashDraft(destination.scope, destination.sessionId, input.value);
-          }
-          autosize();
+        if (!saveDraft(destination.sessionId, input.value, destination.scope)) {
+          note("Shared text couldn't be saved to this draft; reload to retry.", true);
+          return false;
+        }
+        if (sharedText.trimStart().startsWith("/") && input.value.trimStart().startsWith("/")) {
+          rememberSharedSlashDraft(destination.scope, destination.sessionId, input.value);
+        }
+        autosize();
         scheduleForecast();
       }
       record.draftApplied = true;
