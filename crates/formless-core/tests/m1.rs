@@ -137,7 +137,7 @@ fn unicode_search_index_backfills_existing_messages() {
     }
     let connection = rusqlite::Connection::open(paths.db_file()).unwrap();
     connection
-        .execute_batch("DROP TABLE messages_unicode_fts; PRAGMA user_version=76;")
+        .execute_batch("DROP TABLE messages_unicode_fts; PRAGMA user_version=78;")
         .unwrap();
     drop(connection);
 

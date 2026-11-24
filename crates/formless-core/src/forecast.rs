@@ -196,6 +196,17 @@ pub(crate) fn estimate_store_with_window(
     cached: Option<&dyn Fn(&str, &ProviderCfg, &str) -> Option<u32>>,
     selected: Option<&str>,
 ) -> Result<RunForecast> {
+    estimate_store_with_window_and_pending_attachments(st, cfg, input, cached, selected, true)
+}
+
+pub(crate) fn estimate_store_with_window_and_pending_attachments(
+    st: &Store,
+    cfg: &Config,
+    input: &ForecastInput,
+    cached: Option<&dyn Fn(&str, &ProviderCfg, &str) -> Option<u32>>,
+    selected: Option<&str>,
+    include_pending_attachments: bool,
+) -> Result<RunForecast> {
     let mut canonical = input.clone();
     if let Some(model) = &input.options.model {
         anyhow::ensure!(
@@ -244,7 +255,14 @@ pub(crate) fn estimate_store_with_window(
             attachments: Vec::new(),
             ..input.clone()
         };
-        let mut result = estimate_store_with_window(&copy, cfg, &projected, cached, selected)?;
+        let mut result = estimate_store_with_window_and_pending_attachments(
+            &copy,
+            cfg,
+            &projected,
+            cached,
+            selected,
+            include_pending_attachments,
+        )?;
         result.fingerprint = hash(&(
             result.fingerprint,
             &input.edit_message_id,
@@ -340,12 +358,16 @@ pub(crate) fn estimate_store_with_window(
     };
     pipeline.project_context(&mut ctx)?;
     let context_hash = hash(&ctx);
-    let held = input
-        .session_id
-        .as_deref()
-        .map(|id| st.pending_attachments(id))
-        .transpose()?
-        .unwrap_or_default();
+    let held = if include_pending_attachments {
+        input
+            .session_id
+            .as_deref()
+            .map(|id| st.pending_attachments(id))
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let mut logical = Vec::new();
     let mut normalized = held.clone();
     let held_markers: Vec<_> = held

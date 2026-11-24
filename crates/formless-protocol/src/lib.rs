@@ -34,6 +34,8 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
 /// A reviewed Send requires idle state and a reviewed Steer requires an active Run.
 pub const REVIEWED_SEND_MODE_FEATURE: &str = "reviewed_send_mode_v1";
+/// Durable session-scoped receipts for the browser's persisted outbox.
+pub const DURABLE_OUTBOX_FEATURE: &str = "durable_outbox_v1";
 /// A Steer review identifies one active Run and dispatch checks that identity.
 pub const REVIEWED_STEER_RUN_FEATURE: &str = "reviewed_steer_run_v1";
 pub const TOPIC_ORCHESTRATION_FEATURE: &str = "topic_orchestration_v2";
@@ -479,6 +481,7 @@ pub const FEATURES: &[&str] = &[
     "dropped_event_kinds",
     "future_transcript_attempts_v1",
     "pending_attachment_inventory_v1",
+    DURABLE_OUTBOX_FEATURE,
     "reviewed_attachment_send_v1",
     REVIEWED_SEND_MODE_FEATURE,
     REVIEWED_STEER_RUN_FEATURE,
@@ -2688,6 +2691,18 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_msg_id: Option<String>,
     },
+    /// Send one durable browser-outbox action. The action is deduplicated for
+    /// the Session for as long as its durable receipt exists. Attachments are
+    /// compared and consumed atomically; a Steer is bound to its original Run.
+    SendOutboxMessage {
+        session_id: String,
+        content: String,
+        mode: SendMode,
+        expected_attachments: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_run_id: Option<String>,
+        client_msg_id: String,
+    },
     /// Append only if the complete, ordered pending metadata still matches
     /// the reviewed inventory. Comparison and consumption share a transaction.
     /// Queue/deferred sends are unsupported. When `reviewed_send_mode_v1` is
@@ -2699,7 +2714,7 @@ pub enum Request {
         content: String,
         mode: SendMode,
         expected_attachments: Vec<serde_json::Value>,
-        /// Required per-action key; same connection-local retention as SendMessage.
+        /// Required per-action key; reviewed sends remain connection-local.
         client_msg_id: String,
     },
     /// Steer one exact Run using the complete ordered inventory from its review.
@@ -5398,6 +5413,7 @@ mod future_attempt_wire_tests {
             old
         );
         assert!(FEATURES.contains(&"future_transcript_attempts_v1"));
+        assert!(FEATURES.contains(&DURABLE_OUTBOX_FEATURE));
     }
     #[test]
     fn attempts_have_explicit_scope_identity_offset_and_terminal_semantics() {

@@ -803,7 +803,7 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 77;
+pub const SCHEMA_VERSION: i64 = 79;
 
 #[path = "topic_context.rs"]
 mod topic_context;
@@ -946,7 +946,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 
 type MigrationStep = fn(&Connection) -> Result<()>;
 
-fn migrate_v77(conn: &Connection) -> Result<()> {
+fn migrate_v79(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE VIRTUAL TABLE messages_unicode_fts USING fts5(
            grams, content='', tokenize='unicode61 remove_diacritics 0'
@@ -969,7 +969,7 @@ fn migrate_v77(conn: &Connection) -> Result<()> {
 }
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 75] = [
+const MIGRATIONS: [(i64, MigrationStep); 77] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1317,7 +1317,24 @@ const MIGRATIONS: [(i64, MigrationStep); 75] = [
             r#"limits TEXT NOT NULL DEFAULT '{"max_retries_per_step":3,"max_attempts_per_topic":20}'"#,
         )
     }),
-    (77, migrate_v77),
+    (77, |c| {
+        Ok(c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS durable_send_receipts (
+               session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+               client_msg_id TEXT NOT NULL,
+               outcome TEXT NOT NULL,
+               PRIMARY KEY(session_id, client_msg_id)
+             );",
+        )?)
+    }),
+    (78, |c| {
+        add_column(
+            c,
+            "queued_messages",
+            "no_pending_attachments INTEGER NOT NULL DEFAULT 0 CHECK(no_pending_attachments IN (0,1))",
+        )
+    }),
+    (79, migrate_v79),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -4257,19 +4274,85 @@ impl Store {
 
     /// Queue a message to start its own Run after the current one (§5.3).
     pub fn enqueue_message(&self, session_id: &str, content: &str) -> Result<()> {
+        self.enqueue_message_with_policy(session_id, content, false)
+    }
+
+    pub(crate) fn enqueue_outbox_message(&self, session_id: &str, content: &str) -> Result<()> {
+        self.enqueue_message_with_policy(session_id, content, true)
+    }
+
+    fn enqueue_message_with_policy(
+        &self,
+        session_id: &str,
+        content: &str,
+        no_pending_attachments: bool,
+    ) -> Result<()> {
         self.ex(
-            "INSERT INTO queued_messages(session_id,content,created_at) VALUES(?1,?2,?3)",
-            params![session_id, content, now()],
+            "INSERT INTO queued_messages(session_id,content,created_at,no_pending_attachments) VALUES(?1,?2,?3,?4)",
+            params![session_id, content, now(), no_pending_attachments],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn durable_send_receipt(
+        &self,
+        session_id: &str,
+        client_msg_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let outcome: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT outcome FROM durable_send_receipts WHERE session_id=?1 AND client_msg_id=?2",
+                params![session_id, client_msg_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        outcome
+            .map(|outcome| serde_json::from_str(&outcome).context("invalid durable send receipt"))
+            .transpose()
+    }
+
+    pub(crate) fn record_durable_send_receipt(
+        &self,
+        session_id: &str,
+        client_msg_id: &str,
+        outcome: &serde_json::Value,
+    ) -> Result<()> {
+        self.ex(
+            "INSERT INTO durable_send_receipts(session_id,client_msg_id,outcome) VALUES(?1,?2,?3)",
+            params![session_id, client_msg_id, outcome.to_string()],
         )?;
         Ok(())
     }
 
     /// Remove and return the Session's oldest queued message.
     pub fn pop_queued_message(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .pop_queued_message_with_policy(session_id)?
+            .map(|(content, _)| content))
+    }
+
+    pub(crate) fn pop_queued_message_with_policy(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, bool)>> {
         Ok(self.ps(
             "DELETE FROM queued_messages WHERE id=(SELECT id FROM queued_messages WHERE session_id=?1
-               ORDER BY COALESCE(position,id),id LIMIT 1) RETURNING content",
-        )?.query_row([session_id], |row| row.get(0)).optional()?)
+               ORDER BY COALESCE(position,id),id LIMIT 1) RETURNING content,no_pending_attachments",
+        )?.query_row([session_id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?)
+    }
+
+    pub(crate) fn peek_queued_message_with_policy(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, bool)>> {
+        Ok(self
+            .ps(
+                "SELECT content,no_pending_attachments FROM queued_messages WHERE session_id=?1
+               ORDER BY COALESCE(position,id),id LIMIT 1",
+            )?
+            .query_row([session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?)
     }
 
     pub fn list_queued_messages(&self, session_id: &str) -> Result<Vec<String>> {
@@ -4876,6 +4959,35 @@ impl Store {
             },
         )?;
         Ok(Some((info, v)))
+    }
+
+    pub(crate) fn current_input_schemas_for(
+        &self,
+        tool_ids: &[&str],
+    ) -> Result<HashMap<String, (i64, String)>> {
+        let mut schemas = HashMap::new();
+        for chunk in tool_ids.chunks(128) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT t.id, v.version, v.input_schema FROM tools AS t
+                 JOIN tool_versions AS v ON v.tool_id=t.id AND v.version=t.current_version
+                 WHERE t.retired=0 AND t.disabled=0 AND t.id IN ({placeholders})"
+            );
+            let mut stmt = self.ps(&sql)?;
+            let rows =
+                stmt.query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+            for row in rows {
+                let (id, version, schema) = row?;
+                schemas.insert(id, (version, schema));
+            }
+        }
+        Ok(schemas)
     }
 
     pub fn list_tools(&self, include_retired: bool) -> Result<Vec<ToolInfo>> {
