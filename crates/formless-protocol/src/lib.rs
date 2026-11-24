@@ -1873,6 +1873,9 @@ pub struct ForecastComparable {
 pub struct RunForecast {
     pub fingerprint: String,
     pub basis: ForecastBasis,
+    /// The model selected by automatic routing, if this request was routed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_pick: Option<String>,
     pub comparable_runs: usize,
     #[serde(default)]
     pub comparables: Vec<ForecastComparable>,

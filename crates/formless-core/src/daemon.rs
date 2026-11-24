@@ -6421,19 +6421,7 @@ impl Daemon {
             .rsplit_once(':')
             .map(|(name, _)| name)
             .unwrap_or(crate::config::DEFAULT_PROVIDER);
-        let routing_pick = if let Some(role_name) = forecast.basis.role.strip_prefix("role:") {
-            let role = cfg.role(role_name)?;
-            let role_provider = cfg.provider_cfg(role.provider.as_deref())?;
-            let role_model = role_provider.resolve_alias(if role.model.is_empty() {
-                &role_provider.model
-            } else {
-                &role.model
-            });
-            ProviderCfg::is_auto_model(&role_model).then(|| forecast.basis.model.clone())
-        } else {
-            let model = cfg.provider.resolve_alias(&cfg.provider.model);
-            ProviderCfg::is_auto_model(&model).then(|| forecast.basis.model.clone())
-        };
+        let routing_pick = forecast.routing_pick.clone();
         let mut fixed = cfg.clone();
         let requested = if forecast.basis.role.starts_with("role:") {
             let role = forecast.basis.role.trim_start_matches("role:");
