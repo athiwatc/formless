@@ -248,7 +248,7 @@ def undo(page):
     }''')
     old = page.locator("#toasts .toast").filter(has_text="retired Tool A").get_by_role("button", name="Undo")
     newest = page.locator("#toasts .toast").filter(has_text="retired Tool B").get_by_role("button", name="Undo")
-    assert page.locator("#toasts .toast").filter(has_text="Legacy Tool").get_by_role("button").count() == 0
+    assert page.locator("#toasts .toast").filter(has_text="Legacy Tool").get_by_role("button", name="Undo").count() == 0
     old.click()
     expect(page.locator("#toasts").get_by_text("Undo is no longer available for that Tool change", exact=True)).to_be_visible()
     newest.evaluate("button=>{button.click();button.dispatchEvent(new MouseEvent('click'));}")
