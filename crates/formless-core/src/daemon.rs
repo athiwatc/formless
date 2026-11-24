@@ -5056,12 +5056,16 @@ impl Daemon {
                 draft.version = ver.version + 1;
                 let mut out = json!({ "diff": crate::diff::version_diff(&ver, &draft), "ok": true, "description_review":crate::descriptions::screen(&info.description) });
                 // The same gate as saving, without the save.
-                let checked = match ToolDraft::parse(&edit_args(&info, &ver, &code), &cfg, true) {
-                    Err(e) => Err(("syntax", e.to_string())),
-                    Ok(d) => self
-                        .smoke_gate(&d, &cfg, None)
-                        .await
-                        .map_err(|e| ("smoke", e.to_string())),
+                let args = edit_args(&info, &ver, &code);
+                let checked = match toolreg::validate_object_input_schema(&args["input_schema"]) {
+                    Err(e) => Err(("schema", e.to_string())),
+                    Ok(()) => match ToolDraft::parse(&args, &cfg, true) {
+                        Err(e) => Err(("syntax", e.to_string())),
+                        Ok(d) => self
+                            .smoke_gate(&d, &cfg, None)
+                            .await
+                            .map_err(|e| ("smoke", e.to_string())),
+                    },
                 };
                 match checked {
                     Ok(note) => out["smoke_note"] = json!(note),

@@ -145,7 +145,7 @@ fn legacy_object_input_schemas_are_omitted_from_provider_definitions() {
     config.provider.model = "private-unused".into();
     config.naming.enabled = false;
     config.save(&paths).unwrap();
-    let daemon = Daemon::new(paths).unwrap();
+    let daemon = std::sync::Arc::new(Daemon::new(paths).unwrap());
     let (fresh_session, pinned_session, inactive_session) = daemon
         .with_store(|st| {
             let fresh_session = st.create_session(None)?.id;
@@ -362,6 +362,62 @@ fn find_tools_does_not_claim_incompatible_legacy_tools_are_callable() {
         }),
         "incompatible legacy Tool appeared in next-step definitions: {next_step:?}"
     );
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn preview_tool_code_classifies_legacy_input_schema_rejection() {
+    let _env = crate::credential_env::EnvGuard::isolated();
+    let root =
+        std::env::temp_dir().join(format!("formless-preview-schema-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+    let mut config = Config::default();
+    config.naming.enabled = false;
+    config.save(&paths).unwrap();
+    let daemon = std::sync::Arc::new(Daemon::new(paths).unwrap());
+    let id = daemon
+        .with_store(|st| {
+            st.create_tool_version(
+                "legacy_preview_schema",
+                "legacy preview fixture",
+                r#"{"type":"string"}"#,
+                "{}",
+                "function run(input){return input;}",
+                &Capabilities::default(),
+                64,
+                "agent",
+            )
+            .map(|(info, _)| info.id)
+        })
+        .unwrap();
+    let preview = daemon
+        .handle(Request::PreviewToolCode {
+            id: id.clone(),
+            code: "function run(input){return input;}".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(preview["stage"], "schema", "{preview}");
+    assert!(preview["error"].as_str().unwrap().contains("input_schema"));
+    daemon
+        .handle(Request::UpdateToolSpec {
+            id: id.clone(),
+            expected_current_version: None,
+            description: None,
+            input_schema: Some(json!({"type": "object"})),
+            output_schema: None,
+        })
+        .await
+        .unwrap();
+    let updated = daemon
+        .handle(Request::UpdateToolCode {
+            id,
+            code: "function run(input){return input;}".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated["tool"]["name"], "legacy_preview_schema");
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
 }
