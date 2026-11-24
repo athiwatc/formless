@@ -10815,8 +10815,24 @@ impl Daemon {
                 .unwrap_or_default()
         };
         let mut job_identities = self.with_reader(|st| {
+            let jobs = st.list_jobs()?;
+            let live_session_ids = if jobs.iter().any(|job| job.session_id.is_some()) {
+                st.list_sessions()?
+                    .into_iter()
+                    .map(|session| session.id)
+                    .collect::<std::collections::BTreeSet<_>>()
+            } else {
+                std::collections::BTreeSet::new()
+            };
             let mut identities = std::collections::BTreeSet::new();
-            for job in st.list_jobs()? {
+            for job in jobs {
+                if job
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|target| !live_session_ids.contains(target))
+                {
+                    continue;
+                }
                 if let Some(cron) = job.cron {
                     identities.insert((
                         job.source_session_id.or(job.session_id),

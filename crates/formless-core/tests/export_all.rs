@@ -751,7 +751,12 @@ async fn session_bound_jobs_reimport_without_duplicates() {
         .await
         .unwrap();
     assert_eq!(first["added"]["jobs"], 2, "{first}");
-    let second = target.handle(Request::ImportAll { bundle }).await.unwrap();
+    let second = target
+        .handle(Request::ImportAll {
+            bundle: bundle.clone(),
+        })
+        .await
+        .unwrap();
     assert_eq!(second["added"]["jobs"], 0, "{second}");
     assert_eq!(second["skipped_existing"]["jobs"], 2, "{second}");
     let imported_jobs = Store::open(&target_paths.db_file())
@@ -768,4 +773,25 @@ async fn session_bound_jobs_reimport_without_duplicates() {
     assert!(imported_jobs
         .iter()
         .any(|job| job.source_session_id.as_deref() == Some(second_session.id.as_str())));
+
+    assert!(source_store.delete_session(&session.id).unwrap());
+    let recovered = source
+        .handle(Request::ImportAll {
+            bundle: bundle.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recovered["added"]["jobs"], 1, "{recovered}");
+    assert_eq!(recovered["skipped_existing"]["jobs"], 1, "{recovered}");
+    let repeated_recovery = source.handle(Request::ImportAll { bundle }).await.unwrap();
+    assert_eq!(repeated_recovery["added"]["jobs"], 0, "{repeated_recovery}");
+    assert_eq!(
+        repeated_recovery["skipped_existing"]["jobs"], 2,
+        "{repeated_recovery}"
+    );
+    assert!(source_store.list_jobs().unwrap().iter().any(|job| {
+        job.source_session_id.as_deref() == Some(session.id.as_str())
+            && job.session_id.is_none()
+            && !job.enabled
+    }));
 }
