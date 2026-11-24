@@ -2194,6 +2194,12 @@
     const focused = document.activeElement;
     const focusedRow = focused?.closest("#sessions [data-session-id]");
     const focusedControl = focusedRow && ["mark", "session-open", "menu"].find((name) => focused.classList.contains(name));
+    const dialogSessionTriggers = dialogStack.map((entry) => {
+      const trigger = entry.trigger;
+      const row = trigger?.closest("#sessions [data-session-id]");
+      const control = trigger && ["mark", "session-open", "menu"].find((name) => trigger.classList.contains(name));
+      return row && control ? { entry, id: row.dataset.sessionId, control } : null;
+    }).filter(Boolean);
     const menuSession = popoverTrigger?.closest("#sessions [data-session-id]")?.dataset.sessionId;
     let replacementMenu = null, replacementFocus = null;
     list.replaceChildren();
@@ -2265,6 +2271,13 @@
         onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); S.showArchived = !S.showArchived; renderSessions(); } } },
       (S.showArchived ? "▾ " : "▸ ") + "Archived (" + archived.length + ")"));
       if (S.showArchived) appendRows(archived);
+    }
+    if (dialogSessionTriggers.length) {
+      const sessionRowsById = new Map([...list.querySelectorAll("[data-session-id]")].map((row) => [row.dataset.sessionId, row]));
+      for (const { entry, id, control } of dialogSessionTriggers) {
+        const trigger = sessionRowsById.get(id)?.querySelector("." + control);
+        if (trigger) entry.trigger = trigger;
+      }
     }
     if (replacementMenu) {
       const { menu, session } = replacementMenu;
