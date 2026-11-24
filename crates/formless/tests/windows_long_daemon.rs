@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct Profile {
@@ -41,22 +41,32 @@ impl Profile {
         }
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_formless"))
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_formless"));
+        command
             .args(args)
             .env("FORMLESS_DATA_DIR", &self.data)
             .env("FORMLESS_CONFIG_DIR", &self.config)
             .env_remove("FORMLESS_API_KEY")
             .env_remove("FORMLESS_BASE_URL")
             .env_remove("FORMLESS_MODEL")
-            .env("RUST_LOG", "info")
-            .output()
-            .unwrap()
+            .env("RUST_LOG", "info");
+        command
     }
 
-    fn start(&mut self) -> Output {
-        let result = self.run(&["daemon", "start"]);
-        self.started = result.status.success();
+    fn run(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
+    }
+
+    fn start(&mut self) -> ExitStatus {
+        // Avoid capture pipes that a detached child may inherit and hold open.
+        let result = self
+            .command(&["daemon", "start"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        self.started = result.success();
         result
     }
 }
@@ -78,7 +88,7 @@ impl Drop for Profile {
 fn detached_daemon_reopens_its_log_after_rotation() {
     let mut profile = Profile::new(false);
     let result = profile.start();
-    assert!(result.status.success(), "{result:?}");
+    assert!(result.success(), "{result:?}");
     let live = profile.data.join("daemon.log");
     let old = profile.data.join("daemon.log.1");
     assert!(!old.exists(), "rotation must happen after daemon start");
@@ -117,7 +127,7 @@ fn detached_daemon_reopens_its_log_after_rotation() {
 fn long_windows_profile_works_or_doctor_names_the_path_limit() {
     let mut profile = Profile::new(true);
     assert!(profile.data.as_os_str().encode_wide().count() > 260);
-    if profile.start().status.success() {
+    if profile.start().success() {
         assert!(profile.data.join("formless.db").is_file());
         assert!(profile
             .run(&["daemon", "status", "--json"])

@@ -295,8 +295,7 @@ pub fn reopen_stdio(paths: &Paths) -> std::io::Result<()> {
         if !old_output.is_null() && old_output != INVALID_HANDLE_VALUE {
             CloseHandle(old_output);
         }
-        if !old_errors.is_null() && old_errors != INVALID_HANDLE_VALUE && old_errors != old_output
-        {
+        if !old_errors.is_null() && old_errors != INVALID_HANDLE_VALUE && old_errors != old_output {
             CloseHandle(old_errors);
         }
     }
