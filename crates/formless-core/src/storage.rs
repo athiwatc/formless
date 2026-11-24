@@ -9305,6 +9305,64 @@ mod context_watermark_tests {
         assert_eq!(cache.included_user_message_ids(), &[message.id]);
         assert!(cache.included_steer_message_ids().is_empty());
     }
+
+    #[test]
+    fn context_cache_steer_ids_follow_turn_compaction() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        let messages: Vec<_> = (0..6)
+            .map(|index| {
+                store
+                    .append_message_meta(
+                        &session,
+                        "user",
+                        &format!("turn {index}"),
+                        Some(json!({"steer":{"run_id":"run"}}).to_string()),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let mut cache = ContextCache::default();
+        let (before, needs_compaction, cut) = cache
+            .build(&store, &session, "private prompt", 1, 0.8)
+            .unwrap();
+        assert!(needs_compaction);
+        assert_eq!(cut, messages[2].seq);
+        assert_eq!(
+            before
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .count(),
+            6
+        );
+        let expected_before: Vec<_> = messages.iter().map(|message| message.id.clone()).collect();
+        assert_eq!(cache.included_user_message_ids(), expected_before);
+        assert_eq!(cache.included_steer_message_ids(), expected_before);
+
+        store
+            .save_checkpoint(&session, "summary of the compacted turns", cut)
+            .unwrap();
+        let (after, _, _) = cache
+            .build(&store, &session, "private prompt", 100_000, 0.8)
+            .unwrap();
+        let expected_after: Vec<_> = messages[3..]
+            .iter()
+            .map(|message| message.id.clone())
+            .collect();
+        assert_eq!(
+            after
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .count(),
+            expected_after.len()
+        );
+        assert_eq!(cache.included_user_message_ids(), expected_after);
+        assert_eq!(cache.included_steer_message_ids(), expected_after);
+        assert!(after[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("summary of the compacted turns"));
+    }
 }
 
 #[cfg(test)]
