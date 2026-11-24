@@ -6116,8 +6116,9 @@ during its snapshot fetch, deduplicated by message id.
     and a push service refusing our signature (400/401/403) shows there
     and in the log.
   - The service worker shows "An approval or a question is waiting for
-    you". A generic push click focuses the currently selected pending approval
-    or question when that item is available in the app; if the app is closed,
+    you". A generic push click focuses an approval from the app-wide approval
+    queue, or the app-wide pending question if there is no approval; this
+    pending work is not filtered by the selected Session. If the app is closed,
     it opens the saved Session and asks it to focus pending work. Pushes carry
     no Session identifier, so they cannot select a waiting item in another
     Session. Notifications raised by the connected page carry the relevant

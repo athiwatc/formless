@@ -623,6 +623,25 @@ test('cold generic push route focuses pending work after the saved Session opens
   assert.deepEqual(calls, ['pending', ['strip', 'action']]);
 });
 
+test('focusPending uses the app-wide approval queue before the global question', () => {
+  let approvalsShown = 0, questionsShown = 0;
+  const c = setup(['focusPending'], {
+    renderApproval: () => { approvalsShown++; },
+    showQuestion: () => { questionsShown++; },
+  });
+  c.S.current = 'session-b';
+  c.S.approvals = [{ session_id: 'session-a' }];
+  c.S.pendingQuestion = { session_id: 'session-a' };
+  c.focusPending();
+  assert.equal(approvalsShown, 1);
+  assert.equal(questionsShown, 0);
+  assert.equal(c.S.approvalLater, false);
+
+  c.S.approvals = [];
+  c.focusPending();
+  assert.equal(questionsShown, 1);
+});
+
 test('environment approvals distinguish credential words from ordinary name fragments', () => {
   const c = setup(['broadWhy']);
   for (const name of ['SSH_AUTH_SOCK', 'ssh_auth_sock', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL',
