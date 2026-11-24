@@ -62,7 +62,9 @@ async fn list_models_returns_provider_models_roles_and_recent() {
             efforts: Some(vec!["ultra".into()]),
         },
     );
-    cfg.provider.aliases.insert("gpt5-custom".into(), "openai/gpt-5-mini".into());
+    cfg.provider
+        .aliases
+        .insert("gpt5-custom".into(), "openai/gpt-5-mini".into());
     cfg.provider.model_meta.insert(
         "openai/gpt-5-mini".into(),
         ModelMetaCfg {

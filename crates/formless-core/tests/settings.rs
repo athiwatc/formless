@@ -253,10 +253,7 @@ fn provider_model_meta_default_setter_and_validation() {
 
     let before = cfg.provider.model_meta.clone();
     assert!(cfg
-        .set_key(
-            "provider.model_meta.gpt-5-custom",
-            json!({"vision":"true"})
-        )
+        .set_key("provider.model_meta.gpt-5-custom", json!({"vision":"true"}))
         .is_err());
     assert_eq!(cfg.provider.model_meta, before);
 
