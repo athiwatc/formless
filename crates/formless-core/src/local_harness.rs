@@ -257,8 +257,10 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
             if let Some(model) = &request.model {
                 args.extend(["--model".into(), model.into()]);
             }
-            args.push("--".into());
-            args.push(request.prompt.as_str().into());
+            if request.has_mcp() {
+                args.push("--".into());
+                args.push(request.prompt.as_str().into());
+            }
         }
         HarnessKind::Codex => {
             args.extend([
@@ -314,7 +316,14 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
                 args.extend(["--model".into(), model.into()]);
             }
             args.push("--".into());
-            args.push(request.prompt.as_str().into());
+            args.push(
+                if request.has_mcp() {
+                    request.prompt.as_str()
+                } else {
+                    "-"
+                }
+                .into(),
+            );
         }
         _ => unreachable!("unsupported adapters rejected above"),
     }

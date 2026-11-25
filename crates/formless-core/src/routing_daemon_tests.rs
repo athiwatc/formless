@@ -323,7 +323,8 @@ test "$(stat -c %a . 2>/dev/null || stat -f %Lp .)" = 700 || exit 10
 test -z "${FORMLESS_TOPIC_CAPABILITY:-}" || exit 11
 test "$5" = "--mcp-config" && test "$6" = '{"mcpServers":{}}' || exit 12
 test "$7" = "--permission-mode" && test "$8" = "plan" || exit 13
-for prompt; do :; done
+test "$#" = 10 || exit 16
+prompt=$(cat)
 case "$prompt" in *"Earlier Main reply"*"Next Main request"*) ;; *) exit 14 ;; esac
 case "$prompt" in *"Other session text"*) exit 15 ;; esac
 echo '{"result":"Harness Main reply","session_id":"fixture-main"}'

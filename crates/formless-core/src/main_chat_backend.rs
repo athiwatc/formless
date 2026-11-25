@@ -335,11 +335,15 @@ async fn run_cli(
     private: &Path,
     cancel: &CancellationToken,
 ) -> Result<HarnessResult> {
+    use std::io::Write;
+
     let stdout = private.join("stdout");
+    let prompt = private.join("prompt");
+    topic_orchestrator::private_file(&prompt)?.write_all(request.prompt.as_bytes())?;
     let mut command = local_harness::command_spec(&request)?.command();
     command
         .env_remove(local_harness::TOPIC_CAPABILITY_ENV)
-        .stdin(Stdio::null())
+        .stdin(std::fs::File::open(prompt)?)
         .stdout(topic_orchestrator::private_file(&stdout)?)
         .stderr(Stdio::null());
     if cancel.is_cancelled() {
