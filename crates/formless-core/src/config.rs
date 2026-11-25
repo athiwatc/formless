@@ -269,6 +269,7 @@ pub fn documented_shape() -> Config {
     let s = |v: &str| v.to_string();
     let mut cfg = Config::default();
     let p = &mut cfg.provider;
+    p.preset = Some(s("openai"));
     p.reasoning_effort = Some(s("low"));
     p.api_key_header = Some(s("api-key"));
     p.vision = Some(true);
@@ -297,6 +298,7 @@ pub fn documented_shape() -> Config {
     );
     p.auth.extra_authorize_params.insert(s("*"), s("b"));
     p.auth.extra_token_params.insert(s("*"), s("b"));
+    p.auth.revocation_url = s("https://oauth.example.com/revoke");
     cfg.compaction.model = Some(s("m"));
     cfg.compaction.trigger_fraction = Some(0.8);
     cfg.limits.daily_usd = Some(1.0);
@@ -355,6 +357,159 @@ pub fn documented_shape() -> Config {
     let provider = cfg.provider.clone();
     cfg.providers.insert(s("*"), provider);
     cfg
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownConfigKey {
+    pub key: String,
+    pub suggestion: Option<String>,
+}
+
+impl std::fmt::Display for UnknownConfigKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.suggestion {
+            Some(suggestion) => write!(
+                f,
+                "unknown configuration key '{}'; did you mean '{}'?",
+                self.key, suggestion
+            ),
+            None => write!(f, "unknown configuration key '{}'", self.key),
+        }
+    }
+}
+
+pub fn unknown_keys_from_file(file: &Path) -> Result<Vec<UnknownConfigKey>> {
+    let text = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+    unknown_keys_from_text(&text).with_context(|| format!("inspect {}", file.display()))
+}
+
+pub fn unknown_keys_from_text(text: &str) -> Result<Vec<UnknownConfigKey>> {
+    let config: toml::Value = toml::from_str(text).context("parse config.toml")?;
+    let mut shape =
+        toml::Value::try_from(documented_shape()).context("serialize configuration key schema")?;
+    if let Some(naming) = shape.get_mut("naming").and_then(toml::Value::as_table_mut) {
+        naming.insert(
+            "auto_download_migration_done".into(),
+            toml::Value::Boolean(true),
+        );
+    }
+    let mut unknown = Vec::new();
+    collect_unknown_keys(&config, &shape, "", &mut unknown);
+    unknown.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(unknown)
+}
+
+fn collect_unknown_keys(
+    value: &toml::Value,
+    schema: &toml::Value,
+    prefix: &str,
+    unknown: &mut Vec<UnknownConfigKey>,
+) {
+    match (value, schema) {
+        (toml::Value::Table(values), toml::Value::Table(fields)) => {
+            for (key, value) in values {
+                let (field, is_map_entry) = match fields.get(key) {
+                    Some(field) => (Some(field), false),
+                    None => (fields.get("*"), true),
+                };
+                let path = config_key_path(prefix, key);
+                let Some(field) = field else {
+                    unknown.push(UnknownConfigKey {
+                        key: path,
+                        suggestion: nearest_config_key(key, fields)
+                            .map(|suggestion| config_key_path(prefix, &suggestion)),
+                    });
+                    continue;
+                };
+                if is_map_entry && !matches!(field, toml::Value::Table(_)) {
+                    continue;
+                }
+                collect_unknown_keys(value, field, &path, unknown);
+            }
+        }
+        (toml::Value::Array(values), toml::Value::Array(fields)) => {
+            if let Some(field) = fields.first() {
+                for value in values {
+                    collect_unknown_keys(value, field, &format!("{prefix}[]"), unknown);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn config_key_path(prefix: &str, segment: &str) -> String {
+    let segment = if !segment.is_empty()
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        segment.to_string()
+    } else {
+        toml_basic_string_key(segment)
+    };
+    if prefix.is_empty() {
+        segment
+    } else {
+        format!("{prefix}.{segment}")
+    }
+}
+
+fn toml_basic_string_key(segment: &str) -> String {
+    let mut key = String::with_capacity(segment.len() + 2);
+    key.push('"');
+    for character in segment.chars() {
+        match character {
+            '"' => key.push_str("\\\""),
+            '\\' => key.push_str("\\\\"),
+            '\u{8}' => key.push_str("\\b"),
+            '\t' => key.push_str("\\t"),
+            '\n' => key.push_str("\\n"),
+            '\u{c}' => key.push_str("\\f"),
+            '\r' => key.push_str("\\r"),
+            character
+                if matches!(
+                    character as u32,
+                    0x0000..=0x0008 | 0x000B..=0x001F | 0x007F..=0x009F
+                ) =>
+            {
+                key.push_str(&format!("\\u{:04X}", character as u32));
+            }
+            character => key.push(character),
+        }
+    }
+    key.push('"');
+    key
+}
+
+fn nearest_config_key(key: &str, fields: &toml::map::Map<String, toml::Value>) -> Option<String> {
+    let mut nearest: Option<(usize, &str)> = None;
+    for candidate in fields.keys().filter(|candidate| candidate.as_str() != "*") {
+        let distance = config_key_edit_distance(key, candidate);
+        if nearest.is_none_or(|(best, best_key)| {
+            distance < best || (distance == best && candidate.as_str() < best_key)
+        }) {
+            nearest = Some((distance, candidate));
+        }
+    }
+    let (distance, candidate) = nearest?;
+    let limit = (key.chars().count() / 4).clamp(2, 3);
+    (distance <= limit).then(|| candidate.to_string())
+}
+
+fn config_key_edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (i, left) in left.chars().enumerate() {
+        let mut current = vec![i + 1; right.len() + 1];
+        for (j, right) in right.iter().enumerate() {
+            current[j + 1] = (previous[j + 1] + 1)
+                .min(current[j] + 1)
+                .min(previous[j] + (left != *right) as usize);
+        }
+        previous = current;
+    }
+    previous[right.len()]
 }
 
 /// The role an old global `provider.model = "auto"` migrates to.

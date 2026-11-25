@@ -1090,6 +1090,11 @@ impl Daemon {
         // tell every client that connects this lifetime.
         let mut startup_warnings = Vec::new();
         if !offline && paths.config_file().exists() {
+            if let Ok(unknown) = crate::config::unknown_keys_from_file(&paths.config_file()) {
+                for key in unknown {
+                    tracing::warn!("{}: {}", paths.config_file().display(), key);
+                }
+            }
             let _ = Config::persist_naming_download_migration(&paths);
             if let Ok(mut cfg) = Config::load_file_only(&paths) {
                 if let Some(w) = cfg.migrate_global_auto() {

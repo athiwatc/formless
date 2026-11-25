@@ -3690,6 +3690,13 @@ enum Fix {
 /// The daemon and file checks `--fix` can act on.
 fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
     let mut out = Vec::new();
+    if let Ok(unknown) = formless_core::config::unknown_keys_from_file(&paths.config_file()) {
+        out.extend(unknown.into_iter().map(|key| Problem {
+            what: format!("{}: {key}", paths.config_file().display()),
+            next: Some(format!("review {}", paths.config_file().display())),
+            fix: None,
+        }));
+    }
     // Jobs that will not fire on schedule (SPEC §9.7).
     if let (Ok(cfg), true) = (Config::load(paths), paths.db_file().exists()) {
         let active = formless_core::Store::open(&paths.db_file())
@@ -6958,6 +6965,9 @@ fn config_edit(paths: &Paths) -> Result<()> {
                 .map(|(_, unmarked_auto_download)| (text, unmarked_auto_download))
         }) {
             Ok((text, unmarked_auto_download)) => {
+                for key in formless_core::config::unknown_keys_from_text(&text)? {
+                    eprintln!("warning: {}: {key}", file.display());
+                }
                 formless_core::config::write_atomic(&file, text.as_bytes())?;
                 if unmarked_auto_download {
                     eprintln!("warning: unmarked naming.auto_download = true is treated as false; use `formless config set naming.auto_download true` to opt in");
