@@ -7332,6 +7332,7 @@ impl Store {
             return Ok(None);
         };
         let revalidate_text_and_scope = text.is_some() || scope.is_some();
+        let text_was_provided = text.is_some();
         let text = text.unwrap_or(&cur.text);
         let scope = scope.unwrap_or(&cur.scope);
         if revalidate_text_and_scope {
@@ -7344,6 +7345,11 @@ impl Store {
             crate::memory::validate_scope(scope)?;
         }
         let dedup_key = crate::memory::dedup_key(text);
+        let stored_text = if text_was_provided {
+            crate::memory::clean(text)
+        } else {
+            cur.text.clone()
+        };
         self.transaction(|st| {
             let duplicate: Option<String> = st
                 .conn
@@ -7362,7 +7368,7 @@ impl Store {
                 "UPDATE memories SET text=?2, dedup_key=?3, scope=?4, enabled=?5, updated_at=?6 WHERE id=?1",
                 params![
                     id,
-                    crate::memory::clean(text),
+                    stored_text,
                     dedup_key,
                     scope,
                     enabled.unwrap_or(cur.enabled),

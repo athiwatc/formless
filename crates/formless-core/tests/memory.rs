@@ -180,6 +180,42 @@ fn ordinary_memory_edits_enforce_the_300_character_limit() {
     assert_eq!(store.get_memory(&note.id).unwrap().unwrap().text, max_text);
 }
 
+#[test]
+fn metadata_only_memory_edits_preserve_legacy_optimizer_text() {
+    let paths = temp_paths("legacy-memory");
+    let db_path = paths.db_file();
+    let store = Store::open(&db_path).unwrap();
+    let (note, _) = store
+        .add_memory("Temporary note", "global", "optimiser", None)
+        .unwrap();
+    drop(store);
+
+    let legacy_text = "Keep this line.\n  Preserve this continuation.";
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute(
+        "UPDATE memories SET text=?2, dedup_key=?3 WHERE id=?1",
+        rusqlite::params![
+            note.id,
+            legacy_text,
+            formless_core::memory::dedup_key(legacy_text)
+        ],
+    )
+    .unwrap();
+    drop(db);
+
+    let store = Store::open(&db_path).unwrap();
+    let scoped = store
+        .update_memory(&note.id, None, Some("project:/legacy"), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(scoped.text, legacy_text);
+    let disabled = store
+        .update_memory(&note.id, None, None, Some(false))
+        .unwrap()
+        .unwrap();
+    assert_eq!(disabled.text, legacy_text);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn remember_and_forget_built_ins_feed_the_next_session() {
     let paths = temp_paths("memory");
