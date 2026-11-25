@@ -59,6 +59,8 @@ function setup(names, extras = {}) {
       : extras.request ? extras.request(req) : {},
   });
   installEventRenderFixture(context, fn);
+  context.renderWakeLock = () => {};
+  context.syncAppBadge = () => {};
   if (names.includes('renderHistory')) installHistoryFixture(context, fn);
   if (names.some(name => ['rateButtons', 'retryRun'].includes(name))) {
     vm.runInContext(['currentRunTarget', 'ensureRunTarget'].map(fn).join('\n'), context);

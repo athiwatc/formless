@@ -1486,7 +1486,7 @@
     navigator.serviceWorker.addEventListener("message", handleServiceWorkerMessage);
   }
   window.addEventListener("offline", () => renderAll());
-  window.addEventListener("online", () => { renderAll(); if (S.reconnect) retryNow(); });
+  window.addEventListener("online", () => { renderAll(); if (S.reconnect) retryNow(); else void resumeRelayAfterReturn(); });
 
   function renderView() {
     if (S.view === "tools") renderTools();
@@ -1503,6 +1503,7 @@
       cancelEventRender();
     }
     S.view = view;
+    renderWakeLock();
     prefs.set("view", view);
     if (view === "tools") { refreshTools(); refreshModules(); }
     if (view === "metrics") { refreshTools(); refreshModelStats(); refreshForecastMetrics(); }
@@ -5712,6 +5713,7 @@
     note(result.abandoned ? "This run has ended; it cannot be resumed." : "There is no paused run to abandon.");
   }
   function renderRunBanner() {
+    renderWakeLock();
     const box = $("run-banner");
     const u = S.unfinished;
     const resumable = u && ["paused", "interrupted"].includes(u.status);
@@ -5732,6 +5734,58 @@
       } }, tr("Resume")),
       h("button", { class: "btn small", type: "button", onclick: () => abandonRun() }, tr("Abandon")));
   }
+
+  let wakeLockEnabled = false;
+  let wakeLockPending = null;
+  let screenWakeLock = null;
+  function releaseScreenWakeLock() {
+    wakeLockPending = null;
+    const lock = screenWakeLock;
+    screenWakeLock = null;
+    if (lock) {
+      try { Promise.resolve(lock.release()).catch(() => {}); } catch (_) {}
+    }
+  }
+  async function acquireScreenWakeLock() {
+    if (screenWakeLock || wakeLockPending) return;
+    const pending = wakeLockPending = {};
+    try {
+      const lock = await navigator.wakeLock.request("screen");
+      if (wakeLockPending !== pending || !wakeLockEnabled || document.hidden || S.view !== "chat" || !isRunning()) {
+        await lock.release();
+        return;
+      }
+      screenWakeLock = lock;
+      lock.addEventListener("release", () => {
+        if (screenWakeLock !== lock) return;
+        screenWakeLock = null;
+        if (wakeLockEnabled && !document.hidden && S.view === "chat" && isRunning()) void acquireScreenWakeLock();
+      }, { once: true });
+    } catch (error) {
+      if (wakeLockPending === pending) {
+        wakeLockEnabled = false;
+        note("Could not keep the screen awake: " + error.message, true);
+      }
+    } finally {
+      if (wakeLockPending === pending) wakeLockPending = null;
+    }
+  }
+  function renderWakeLock() {
+    const button = $("keep-awake");
+    const supported = typeof navigator.wakeLock?.request === "function";
+    const watching = S.view === "chat" && !!S.current && isRunning();
+    button.hidden = !supported || !watching;
+    if (!watching) wakeLockEnabled = false;
+    button.setAttribute("aria-pressed", String(wakeLockEnabled));
+    button.textContent = wakeLockEnabled ? "Screen awake" : "Keep awake";
+    if (!supported || !wakeLockEnabled || !watching || document.hidden) releaseScreenWakeLock();
+    else void acquireScreenWakeLock();
+  }
+  $("keep-awake").onclick = () => {
+    if (S.view !== "chat" || !S.current || !isRunning()) return;
+    wakeLockEnabled = !wakeLockEnabled;
+    renderWakeLock();
+  };
 
   /** Step mode (SPEC §5.9): the call waiting for a decision. */
   function renderStep() {
@@ -6179,7 +6233,18 @@
       S.approvalHelpSeen = true;
     }
   }
+  function syncAppBadge() {
+    if (typeof navigator === "undefined") return;
+    const count = (S.approvals || []).length;
+    let result;
+    try {
+      if (count && typeof navigator.setAppBadge === "function") result = navigator.setAppBadge(count);
+      else if (!count && typeof navigator.clearAppBadge === "function") result = navigator.clearAppBadge();
+    } catch (_) { return; }
+    if (result && typeof result.catch === "function") result.catch(() => {});
+  }
   function renderApproval() {
+    syncAppBadge();
     const req = S.approvals[0];
     if (!req) S.approvalLater = false;
     const alert = $("modal-confirm");
@@ -8599,6 +8664,7 @@
     S.activity = null;
     clearLiveText();
     S.liveTools = []; S.liveRun = null;
+    renderWakeLock();
     renderApproval();
   }
   function restoreSessionRunState(id, result, events) {
@@ -9738,7 +9804,11 @@
   }
   document.addEventListener("visibilitychange", () => {
     syncRunningExposure();
-    if (!document.hidden) { unseen = 0; document.title = baseTitle; }
+    renderWakeLock();
+    if (!document.hidden) {
+      unseen = 0; document.title = baseTitle;
+      void resumeRelayAfterReturn();
+    }
   });
   /** Ask once, from a user gesture (sending a message). */
   function askNotifyPermission() {
@@ -10811,9 +10881,42 @@
     renderChrome();
   }
   setInterval(() => { if (S.reconnect) renderChrome(); }, 1000);
-  // A heartbeat, so the daemon can tell a vanished browser from an idle
-  // one and drop it from its device list (#910).
-  setInterval(() => { if (S.channel && !S.local) request({ type: "ping" }, 20000).catch(() => {}); }, 60000);
+  const RELAY_PROBE_INTERVAL_MS = 15000;
+  const RELAY_PROBE_TIMEOUT_MS = 5000;
+  let relayProbe = null;
+  let relayResume = null;
+  function probeRelay() {
+    if (!S.channel || S.local || !S.relayReady || S.userClosed || S.ws?.readyState !== 1 || navigator.onLine === false) return Promise.resolve(false);
+    if (relayProbe) return relayProbe;
+    const ws = S.ws, channel = S.channel;
+    relayProbe = request({ type: "ping" }, RELAY_PROBE_TIMEOUT_MS)
+      .then(() => S.ws === ws && S.channel === channel)
+      .catch(() => {
+        if (S.ws === ws && S.channel === channel && ws.readyState === 1) {
+          note("relay probe failed; reconnecting", true);
+          try { ws.close(4003, "heartbeat timeout"); } catch (_) {}
+        }
+        return false;
+      })
+      .finally(() => { relayProbe = null; });
+    return relayProbe;
+  }
+  function resumeRelayAfterReturn() {
+    if (relayResume) return relayResume;
+    relayResume = (async () => {
+      if (document.hidden || S.local || S.userClosed || navigator.onLine === false) return;
+      if (S.reconnect) { retryNow(); return; }
+      if (S.key && (!S.ws || S.ws.readyState === 3)) { openRelay(); return; }
+      const ws = S.ws, channel = S.channel, session = S.current;
+      if (!await probeRelay() || S.ws !== ws || S.channel !== channel || document.hidden || S.current !== session) return;
+      if (session) await openSession(session, true);
+      else await loadAll();
+    })().finally(() => { relayResume = null; });
+    return relayResume;
+  }
+  setInterval(() => {
+    if (!document.hidden && S.channel && !S.local && S.relayReady) void probeRelay();
+  }, RELAY_PROBE_INTERVAL_MS);
 
   function showPair() {
     $("app").classList.add("hidden");
