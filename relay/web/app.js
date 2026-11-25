@@ -5767,6 +5767,7 @@
       if (wakeLockPending === pending) {
         wakeLockEnabled = false;
         note("Could not keep the screen awake: " + error.message, true);
+        renderWakeLock();
       }
     } finally {
       if (wakeLockPending === pending) wakeLockPending = null;

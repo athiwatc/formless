@@ -205,3 +205,28 @@ test('screen wake lock is opt-in, released when hidden or no longer watching, an
   assert.equal(button.attrs['aria-pressed'], 'false');
   assert.equal(released.length, 2);
 });
+
+test('wake-lock rejection resets the button without retrying automatically', async () => {
+  let requests = 0;
+  const button = {
+    hidden: true, textContent: '', attrs: {},
+    setAttribute(key, value) { this.attrs[key] = value; },
+  };
+  const S = { view: 'chat', current: 'session-1', running: new Set(['session-1']) };
+  const context = vm.createContext({
+    S, document: { hidden: false },
+    navigator: { wakeLock: { request: async () => { requests++; throw new Error('permission denied'); } } },
+    $: id => { assert.equal(id, 'keep-awake'); return button; },
+    isRunning: () => S.running.has(S.current), note() {},
+  });
+  vm.runInContext(wakeLockLifecycle, context);
+  context.renderWakeLock();
+  button.onclick();
+  await settle();
+  assert.equal(requests, 1);
+  assert.equal(button.attrs['aria-pressed'], 'false');
+  assert.equal(button.textContent, 'Keep awake');
+  context.renderWakeLock();
+  await settle();
+  assert.equal(requests, 1);
+});
