@@ -5922,6 +5922,20 @@ responses; clearing search invalidates outstanding results. Opening a Session
 clears the previous transcript immediately and merges live messages received
 during its snapshot fetch, deduplicated by message id.
 
+When a Relay browser returns to a visible page or comes back online, it probes
+the authenticated encrypted connection immediately and refreshes the selected
+Session (or all Sessions) from daemon state after success. While visible, it
+sends an encrypted health probe every 15 seconds and replaces an unresponsive
+socket after a five-second timeout without waiting for a close event. Mobile
+platforms may suspend a hidden page and its probes; on return the browser
+rechecks or reopens the connection and reloads state rather than assuming the
+subscription survived. An installed PWA uses the Badging API, when available,
+to show the count of pending approvals and clears the badge when none remain.
+While watching a running Session, a user may opt in to Keep awake; the screen
+wake lock is released when the page is hidden or the Run is no longer active
+and reacquired on return if the user opted in. Unsupported or rejected
+platform APIs leave the feature inactive and do not retry automatically.
+
 - `formless relay enable|disable|status` controls the hosted Relay: the
   daemon dials out to `relay.url` (default
   `wss://formless.athiwat.xyz`) and browsers meet it there — no inbound
@@ -6044,10 +6058,11 @@ during its snapshot fetch, deduplicated by message id.
   after a link has stayed up (daemon 60 s, page 30 s after the
   handshake), so a relay that accepts and drops at once is not hammered.
   **Teardown:** the Relay sends `client_close` / `daemon_offline` once
-  per socket whether it closed or errored. Browsers send a `Ping` every
-  minute; the daemon drops a browser it has heard nothing from for 5
-  minutes (code 4002), so a vanished tab never stays an approval
-  subscriber.
+  per socket whether it closed or errored. Mobile platforms may suspend a
+  hidden page before its application probes run; the browser therefore
+  rechecks or reopens its authenticated connection and reloads state when it
+  becomes visible or online, rather than promising that a hidden subscription
+  stays alive.
   **Pairing by QR code:** `formless relay enable` (and `formless relay
   status --qr`) print the browser link as a terminal QR code (error
   correction level M, a 4-module quiet zone drawn light), white on
