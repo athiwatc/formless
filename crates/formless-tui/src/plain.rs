@@ -941,10 +941,9 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
     let _ = Config::persist_naming_download_migration(&paths);
     let cfg = Config::load(&paths)?;
     if !cfg.provider.is_configured() {
-        eprintln!(
-            "Formless isn't set up yet: run `formless` once without --plain to choose a provider."
-        );
-        return Ok(());
+        return Err(anyhow::anyhow!(
+            formless_core::profile_setup::missing_setup_message(&paths)
+        ));
     }
     formless_core::daemon::ensure_daemon(&paths)?;
     // Told in words here too: an older or rebuilt daemon, or one without

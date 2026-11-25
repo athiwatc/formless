@@ -4,15 +4,15 @@ use crate::{Config, Paths};
 
 pub fn setup_command(profile: &str) -> String {
     if profile == "default" {
-        "formless".into()
+        "formless setup".into()
     } else {
-        format!("formless --profile {profile}")
+        format!("formless --profile {profile} setup")
     }
 }
 
 pub fn missing_setup_message(paths: &Paths) -> String {
     let mut message = format!(
-        "Profile '{}' is not configured; run `{}` for the wizard.",
+        "Profile '{}' is not configured; run `{}` for line-mode setup.\nFor headless use, set FORMLESS_BASE_URL, FORMLESS_MODEL, and FORMLESS_API_KEY before `formless run`.",
         paths.profile,
         setup_command(&paths.profile)
     );
@@ -71,6 +71,10 @@ mod tests {
         for active in [&base, &scratch] {
             let message = missing_setup_message(active);
             assert!(message.contains(&format!("Profile '{}'", active.profile)));
+            assert!(message.contains(&setup_command(&active.profile)));
+            assert!(message.contains("FORMLESS_BASE_URL"));
+            assert!(message.contains("FORMLESS_MODEL"));
+            assert!(message.contains("FORMLESS_API_KEY"));
             assert!(message.contains("formless --profile work"));
             assert!(message.contains("formless profiles list"));
             assert!(!active.config_file().exists());

@@ -24,6 +24,7 @@ mod cli_session_org;
 mod cli_session_report;
 mod cli_session_templates;
 mod cli_session_usage;
+mod cli_setup;
 mod cli_subagents;
 mod cli_tool_detail;
 mod cli_tool_diff;
@@ -483,6 +484,9 @@ enum Cmd {
         #[command(subcommand)]
         action: SessionsAction,
     },
+    /// Accessible line-mode first-time provider setup
+    #[command(after_help = "Examples:\n  formless setup\n  formless --profile work setup")]
+    Setup,
     /// Skills: SKILL.md know-how the agent loads on demand (SPEC §7.10)
     #[command(
         after_help = "Examples:\n  formless skills list\n  formless skills show example-skill"
@@ -2613,6 +2617,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Providers { action }) => providers_cmd(paths, action),
+        Some(Cmd::Setup) => cli_setup::run(&paths),
         Some(Cmd::Prices { action }) => match action {
             PricesAction::Import {
                 provider,
@@ -4703,7 +4708,7 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
                 next: Some(if cfg.provider.oauth() {
                     "formless auth login".into()
                 } else {
-                    "formless (the wizard stores the key), or set FORMLESS_API_KEY".into()
+                    "formless setup, or set FORMLESS_API_KEY".into()
                 }),
                 fix: None,
             });

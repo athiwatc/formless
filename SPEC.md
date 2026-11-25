@@ -3953,6 +3953,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   stored credential. Enter at an empty key step can reuse the stored
   credential for fetching/probing only when the endpoint matches the
   on-disk provider; it is never reused for a changed endpoint.
+- **Accessible first-time setup.** `formless setup` is a numbered, line-mode
+  alternative: choose a provider preset, enter an API key without echo, pick a
+  listed model or type its ID, and see the endpoint probe verdict. It saves the
+  provider and entered key only after a successful probe. Plain mode, `chat`,
+  and headless `run` name this command when setup is missing; their guidance
+  also names `FORMLESS_BASE_URL`, `FORMLESS_MODEL`, and `FORMLESS_API_KEY` as
+  the environment-based path for headless Runs without setup.
 - **Moving around.** Esc goes back one step at every step (effort →
   model → key → URL → provider), keeping what was typed; the header shows
   "step N of 5". Going back invalidates outstanding model-list/probe
@@ -5095,6 +5102,9 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
 - **Plain mode for screen readers.** `formless --plain` (or
   `tui.screen_reader = true`) runs a line-oriented client instead of the
   full-screen TUI: no alternate screen, redraws, spinners or box drawing.
+  When no provider is configured, it exits non-zero and points to
+  `formless setup` (or the active profile's equivalent) and the documented
+  environment variables for headless Runs.
   - Each event prints once, as a sentence, in order: the streamed answer
     after "Formless:", "Tool started: name.", "Run paused: why. Next: what
     to do.", and notes.
@@ -5438,6 +5448,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless runs` | No action: list; `show`, `cancel`, `running` | List recent Runs, inspect/cancel an exact Run, or read a live Invocation snapshot. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
 | `formless sessions` | `subagents`, `subagent`, `fork`, `compare`, `list`, `show`, `usage`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `pin`, `unpin`, `tag`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
+| `formless setup` | No arguments | Configure a first provider in line mode for screen readers; choose a preset and model, enter a hidden API key, then verify the endpoint. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `diff`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |

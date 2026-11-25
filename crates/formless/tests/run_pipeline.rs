@@ -306,13 +306,21 @@ impl Fixture {
         self.start_with_env(&[]);
     }
     fn start_with_env(&mut self, overrides: &[(&str, &str)]) {
+        self.start_profile_with_env("p", overrides);
+    }
+    fn start_profile_with_env(&mut self, profile: &str, overrides: &[(&str, &str)]) {
         let stderr = std::fs::File::create(self.root.join("daemon.stderr")).unwrap();
-        let mut command = self.command(&["daemon", "serve", "--stay"]);
+        let mut command = self.command_profile(profile, &["daemon", "serve", "--stay"]);
         command.envs(overrides.iter().copied());
         command.stdout(Stdio::null()).stderr(stderr);
         self.daemon = Some(Owned(Some(command.spawn().unwrap())));
+        let paths = Paths {
+            data_dir: self.root.join("d").join(profile),
+            config_dir: self.root.join("c").join(profile),
+            profile: profile.into(),
+        };
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !formless_core::daemon::daemon_reachable(&self.paths) {
+        while !formless_core::daemon::daemon_reachable(&paths) {
             let child = self.daemon.as_mut().unwrap().0.as_mut().unwrap();
             assert!(
                 child.try_wait().unwrap().is_none(),
@@ -637,9 +645,13 @@ fn unconfigured_run_names_the_profile_and_offers_saved_setup_elsewhere() {
             "{message}"
         );
         assert!(
-            message.contains("formless --profile p") && message.contains("formless profiles list"),
+            message.contains("formless --profile p setup")
+                && message.contains("formless profiles list"),
             "{message}"
         );
+        for variable in ["FORMLESS_BASE_URL", "FORMLESS_MODEL", "FORMLESS_API_KEY"] {
+            assert!(message.contains(variable), "{message}");
+        }
     }
     assert_eq!(
         f.provider.count(),
@@ -648,6 +660,95 @@ fn unconfigured_run_names_the_profile_and_offers_saved_setup_elsewhere() {
     );
     assert!(!formless_core::daemon::daemon_reachable(&f.paths));
     assert_eq!(std::fs::read(f.paths.config_file()).unwrap(), before);
+}
+
+#[test]
+fn plain_and_chat_refuse_missing_setup_with_nonzero_status_and_accessible_guidance() {
+    let f = Fixture::new();
+    for args in [&["--plain"][..], &["chat"][..]] {
+        let output = f.run_profile("scratch", args, None);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        let message = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            message.contains("formless --profile scratch setup"),
+            "{message}"
+        );
+        for variable in ["FORMLESS_BASE_URL", "FORMLESS_MODEL", "FORMLESS_API_KEY"] {
+            assert!(message.contains(variable), "{message}");
+        }
+    }
+
+    let paths = Paths {
+        data_dir: f.root.join("d/scratch"),
+        config_dir: f.root.join("c/scratch"),
+        profile: "scratch".into(),
+    };
+    let mut cfg = formless_core::Config::load_file_only(&paths).unwrap();
+    cfg.tui.screen_reader = true;
+    cfg.save(&paths).unwrap();
+    let output = f.run_profile("scratch", &[], None);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        message.contains("formless --profile scratch setup"),
+        "{message}"
+    );
+    for variable in ["FORMLESS_BASE_URL", "FORMLESS_MODEL", "FORMLESS_API_KEY"] {
+        assert!(message.contains(variable), "{message}");
+    }
+}
+
+#[test]
+fn documented_environment_variables_run_headless_without_saved_setup() {
+    let mut f = Fixture::new();
+    let base_url = f.provider.url.to_string();
+    let environment = [
+        ("FORMLESS_BASE_URL", base_url.as_str()),
+        ("FORMLESS_MODEL", "model"),
+        ("FORMLESS_API_KEY", "private-environment-run-key"),
+    ];
+    let paths = Paths {
+        data_dir: f.root.join("d/scratch"),
+        config_dir: f.root.join("c/scratch"),
+        profile: "scratch".into(),
+    };
+    assert!(!paths.config_file().exists());
+    f.provider.queue("environment configured answer");
+    f.start_profile_with_env("scratch", &environment);
+    let output = f.run_profile_env(
+        "scratch",
+        &["run", "task", "--output", "final", "--quiet"],
+        None,
+        &environment,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("environment configured answer"));
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("formless setup"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        f.provider.count() > 0,
+        "Run did not contact the configured endpoint"
+    );
 }
 
 #[test]
