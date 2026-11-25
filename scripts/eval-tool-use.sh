@@ -3,6 +3,8 @@
 # when a task needs one? Each task runs RUNS times in a fresh profile with
 # `formless run --yes --json`, and a Run counts when it calls find_tools or
 # create_tool. Compare a model with the nudge on and off:
+# This manual real-model companion to the offline behavior scenarios requires
+# provider credentials and is not part of the automated test suite.
 #
 #   FORMLESS_API_KEY=... scripts/eval-tool-use.sh https://api.openai.com/v1 gpt-4.1
 #   FORMLESS_API_KEY=... NUDGE=false scripts/eval-tool-use.sh https://api.openai.com/v1 gpt-4.1
