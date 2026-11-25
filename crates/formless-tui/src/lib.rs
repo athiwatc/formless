@@ -2495,13 +2495,20 @@ impl App {
 
     /// Answer the call waiting in step mode.
     fn step_decide(&mut self, action: &str, arguments: Option<String>) {
-        let Some(step) = self.step.clone() else {
+        let Some(step_id) = self.step.as_mut().map(|step| {
+            if action == "edit" {
+                if let Some(arguments) = &arguments {
+                    step.arguments = arguments.clone();
+                }
+            }
+            step.step_id.clone()
+        }) else {
             return;
         };
         self.request(
             Pending::StepDecision,
             Request::StepDecision {
-                step_id: step.step_id,
+                step_id,
                 action: action.into(),
                 arguments,
             },
@@ -20874,6 +20881,27 @@ mod tests {
             "memory fixture [project:test\\u{202e}, off] note\\r\\n\\u{1b}\\u{9b} · agent\\u{9b}"
         );
     }
+
+    #[test]
+    fn rejected_step_edit_preserves_draft_for_retry() {
+        let mut app = test_app();
+        app.step = Some(PendingStep {
+            step_id: "step-1".into(),
+            tool_name: "echo".into(),
+            arguments: r#"{"value":1}"#.into(),
+            index: 0,
+            count: 1,
+        });
+
+        let draft = r#"{"value":"invalid"}"#;
+        app.step_decide("edit", Some(draft.into()));
+        assert_eq!(app.step.as_ref().unwrap().arguments, draft);
+
+        app.input.clear();
+        app.key(key(KeyCode::Char('e')));
+        assert_eq!(app.input.expanded(), pretty_json(draft));
+    }
+
     include!("hunk_tests.rs");
     include!("run_file_coverage_tests.rs");
     include!("invocation_progress_tests.rs");
