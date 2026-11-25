@@ -322,6 +322,12 @@ const RECENT_SEARCH_SQL: &str =
 
 const SEARCH_READ_BYTES: usize = 16 * 1024;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MessageSearchIndex {
+    Words,
+    Unicode,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum SearchEncoding {
     Utf8,
@@ -3249,28 +3255,32 @@ impl Store {
         Ok(self.search_sessions_with_scope(query, limit)?.hits)
     }
 
-    pub(crate) fn optimize_message_search(&self) -> Result<()> {
-        for (index, sql) in [
-            (
-                "messages_fts",
+    pub(crate) fn optimize_message_search_step(
+        &self,
+        index: MessageSearchIndex,
+        start: bool,
+    ) -> Result<bool> {
+        const MERGE_PAGES: i64 = 64;
+        let (merge, optimize) = match index {
+            MessageSearchIndex::Words => (
+                "INSERT INTO messages_fts(messages_fts,rank) VALUES('merge',?1)",
                 "INSERT INTO messages_fts(messages_fts) VALUES('optimize')",
             ),
-            (
-                "messages_unicode_fts",
+            MessageSearchIndex::Unicode => (
+                "INSERT INTO messages_unicode_fts(messages_unicode_fts,rank) VALUES('merge',?1)",
                 "INSERT INTO messages_unicode_fts(messages_unicode_fts) VALUES('optimize')",
             ),
-        ] {
-            let started = std::time::Instant::now();
-            let result = self.conn.execute(sql, []);
-            tracing::info!(
-                index,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                success = result.is_ok(),
-                "optimize message search"
-            );
-            result.with_context(|| format!("optimize {index}"))?;
+        };
+        let before = self.conn.total_changes();
+        self.conn
+            .execute(merge, [if start { -MERGE_PAGES } else { MERGE_PAGES }])?;
+        let changed = self.conn.total_changes() - before >= 2;
+        if start && !changed {
+            // A negative merge found nothing to optimize, so the full FTS
+            // command can finish without holding the writer for a merge.
+            self.conn.execute(optimize, [])?;
         }
-        Ok(())
+        Ok(changed)
     }
 
     pub fn search_sessions_with_scope(
@@ -9615,7 +9625,17 @@ mod message_search_maintenance_tests {
         for table in ["messages_fts", "messages_unicode_fts"] {
             assert!(segments(table) > 1, "{table}");
         }
-        store.optimize_message_search().unwrap();
+        for index in [MessageSearchIndex::Words, MessageSearchIndex::Unicode] {
+            let mut start = true;
+            for step in 0..10 {
+                let changed = store.optimize_message_search_step(index, start).unwrap();
+                if start && !changed {
+                    break;
+                }
+                start = !changed;
+                assert!(step < 9, "{index:?} did not finish merging");
+            }
+        }
         for table in ["messages_fts", "messages_unicode_fts"] {
             assert_eq!(segments(table), 1, "{table}");
         }

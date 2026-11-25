@@ -16739,17 +16739,42 @@ impl Daemon {
     }
 
     async fn database_maintenance_loop(self: Arc<Self>) {
+        use crate::storage::MessageSearchIndex;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-            let daemon = self.clone();
-            match tokio::task::spawn_blocking(move || {
-                daemon.with_store(Store::optimize_message_search)
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "database maintenance"),
-                Err(error) => tracing::warn!(%error, "database maintenance worker failed"),
+            for index in [MessageSearchIndex::Words, MessageSearchIndex::Unicode] {
+                let started = std::time::Instant::now();
+                let mut start = true;
+                let mut complete = false;
+                for _ in 0..1024 {
+                    let daemon = self.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        daemon.with_store(|store| store.optimize_message_search_step(index, start))
+                    })
+                    .await
+                    {
+                        Ok(Ok(false)) if start => {
+                            complete = true;
+                            break;
+                        }
+                        Ok(Ok(changed)) => start = !changed,
+                        Ok(Err(error)) => {
+                            tracing::warn!(?index, %error, "database maintenance");
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::warn!(?index, %error, "database maintenance worker failed");
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                tracing::info!(
+                    ?index,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    complete,
+                    "optimize message search"
+                );
             }
         }
     }
