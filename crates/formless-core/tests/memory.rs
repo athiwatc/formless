@@ -193,12 +193,8 @@ fn metadata_only_memory_edits_preserve_legacy_optimizer_text() {
     let legacy_text = "Keep this line.\n  Preserve this continuation.";
     let db = rusqlite::Connection::open(&db_path).unwrap();
     db.execute(
-        "UPDATE memories SET text=?2, dedup_key=?3 WHERE id=?1",
-        rusqlite::params![
-            note.id,
-            legacy_text,
-            formless_core::memory::dedup_key(legacy_text)
-        ],
+        "UPDATE memories SET text=trim(?2), dedup_key=lower(trim(?2)), proposal_id='history-proposal' WHERE id=?1",
+        rusqlite::params![note.id, legacy_text],
     )
     .unwrap();
     drop(db);
