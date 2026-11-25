@@ -49,6 +49,7 @@ jobs:
       - name: GUI-free model and transport tests
         run: cargo test --no-default-features --lib --locked
       - name: Private daemon and fake provider integration
+        # Give debug daemon Tokio workers 8 MiB stacks; this override is step-scoped.
         env:
           RUST_MIN_STACK: '8388608'
         run: cargo test --no-default-features --features daemon-tests --test daemon --locked
