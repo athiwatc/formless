@@ -960,7 +960,7 @@ test('a later mention rejection still displays the files already staged for revi
   assert.deepEqual(calls, ['attach_path', 'attach_path', 'list_pending_attachments']);
   assert.equal(c.$('input').value, draft);
   assert.equal(chips[0].id, 'first');
-  assert.match(notes.at(-1), /first.txt.*Press Send again/);
+  assert.match(notes.at(-1), /first\.txt.*Fix or remove @second\.txt before sending/);
 });
 
 test('send completion clears only the original Session attachments', async () => {

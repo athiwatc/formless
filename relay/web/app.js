@@ -9692,6 +9692,7 @@
       const already = mentionAttached[sessionKey] || new Set();
       const fresh = [];
       let attachmentError = "";
+      let failedMention;
       for (const path of mentionsIn(text)) {
         if (toolNames.has(path) || already.has(path)) continue;
         if (!S.daemonOnline || !S.channel) {
@@ -9708,7 +9709,10 @@
           if (/^.+:\+?[0-9]+$/.test(path) || !/^no file/.test(error.message)) {
             note("cannot attach @" + path + ": " + error.message, true);
             if (S.daemonOnline && !/^no file/.test(error.message)) {
-              if (fresh.length) break;
+              if (fresh.length) {
+                failedMention = path;
+                break;
+              }
               saveCurrentDraft(text);
               return;
             }
@@ -9720,7 +9724,10 @@
         await refreshAttachmentInventory(sid, scope);
         if (S.current === sid && scope === S.storageScope) { saveCurrentDraft(input.value); autosize(); renderChips(); }
         else { attachmentDrafts[sessionCacheKey(scope, sid)] = text; saveCurrentDraft(text); }
-        note("This message attaches " + fresh.join(", ") + " (shown above the box; × removes one). Press Send again to send.");
+        const next = failedMention
+          ? " Fix or remove @" + failedMention + " before sending."
+          : " Press Send again to send.";
+        note("This message attaches " + fresh.join(", ") + " (shown above the box; × removes one)." + next);
         return;
       }
       let forecastPending = false;
