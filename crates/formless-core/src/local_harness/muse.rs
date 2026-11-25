@@ -589,7 +589,8 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                 continue;
             }
             if method == "turn/completed" && params["turnId"] == turn {
-                tokio::time::timeout(START_TIMEOUT, async {
+                let turn_result = output.complete(params);
+                let decision_result = tokio::time::timeout(START_TIMEOUT, async {
                     while !pending.is_empty() {
                         let event = self.receive().await?;
                         if event.get("method").is_none() {
@@ -601,8 +602,19 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                     Ok(())
                 })
                 .await
-                .context("Muse Code completed the turn with unconfirmed decisions")??;
-                return output.complete(params);
+                .context("Muse Code completed the turn with unconfirmed decisions")
+                .and_then(|result| result);
+                return match turn_result {
+                    Ok(message) => decision_result.map(|()| message),
+                    Err(turn_error) => {
+                        if let Err(error) = decision_result {
+                            tracing::warn!(
+                                "Muse Code decision failed after a failed turn: {error}"
+                            );
+                        }
+                        Err(turn_error)
+                    }
+                };
             }
             if let Some(message) = output.message(method, params, turn) {
                 handler.on_update(HarnessUpdate::Message {
@@ -1392,10 +1404,11 @@ fi
     }
 
     #[tokio::test]
-    async fn msp_saves_late_accepted_clarification_even_without_a_final_answer() {
-        for (terminal, error) in [
-            ("failed", "did not complete the turn"),
-            ("completed", "did not return a final answer"),
+    async fn msp_drains_clarification_acknowledgement_without_masking_turn_errors() {
+        for (terminal, status, error) in [
+            ("failed", "accepted", "did not complete the turn"),
+            ("completed", "accepted", "did not return a final answer"),
+            ("failed", "rejected", "did not complete the turn"),
         ] {
             let (client, server) = tokio::io::duplex(4096);
             let (client_input, client_output) = tokio::io::split(client);
@@ -1422,7 +1435,12 @@ fi
                 let answer = server.receive().await.unwrap();
                 assert_eq!(answer["method"], "userInput/answer");
                 server.send(json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {"sessionId": "session", "turnId": "turn", "terminal": terminal}})).await.unwrap();
-                server.send(json!({"jsonrpc": "2.0", "id": answer["id"], "result": {"status": "accepted"}})).await.unwrap();
+                server
+                    .send(
+                        json!({"jsonrpc": "2.0", "id": answer["id"], "result": {"status": status}}),
+                    )
+                    .await
+                    .unwrap();
             };
             let (result, ()) = tokio::time::timeout(START_TIMEOUT, async {
                 tokio::join!(
@@ -1433,7 +1451,12 @@ fi
             .await
             .unwrap();
             assert!(result.unwrap_err().to_string().contains(error));
-            assert_eq!(*hooks.accepted.lock().unwrap(), ["CSV"]);
+            let accepted = hooks.accepted.lock().unwrap();
+            if status == "accepted" {
+                assert_eq!(*accepted, ["CSV"]);
+            } else {
+                assert!(accepted.is_empty());
+            }
         }
     }
 
