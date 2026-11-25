@@ -259,8 +259,8 @@ mod tests {
 
     #[test]
     fn setup_picks_numbered_preset_and_model_probes_then_saves_without_echoing_key() {
-        let root = std::env::temp_dir().join(format!("fl-cli-setup-{}", uuid::Uuid::new_v4()));
-        let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::from_dirs(root.path().join("data"), root.path().join("config")).unwrap();
         let mut input = io::Cursor::new(b"1\nprivate-setup-test-key\n2\n".to_vec());
         let mut output = Vec::new();
         let listed = AtomicBool::new(false);
@@ -307,13 +307,12 @@ mod tests {
         assert!(output.contains("2. custom-model"));
         assert!(output.contains("Probe verdict: passed"));
         assert!(!output.contains("private-setup-test-key"));
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn failed_probe_reports_verdict_without_saving_provider_or_key() {
-        let root = std::env::temp_dir().join(format!("fl-cli-setup-{}", uuid::Uuid::new_v4()));
-        let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::from_dirs(root.path().join("data"), root.path().join("config")).unwrap();
         let mut input = io::Cursor::new(b"1\nprivate-setup-test-key\n1\n".to_vec());
         let mut output = Vec::new();
 
@@ -332,6 +331,5 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Probe verdict: failed (fixture probe failure)"));
         assert!(!output.contains("private-setup-test-key"));
-        let _ = std::fs::remove_dir_all(root);
     }
 }
