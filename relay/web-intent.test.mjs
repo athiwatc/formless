@@ -46,7 +46,7 @@ function setup(names, extras = {}) {
     if (!elements.has(id)) elements.set(id, { value: '', style: {}, textContent: '', classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } }, attrs: {}, setAttribute(k,v) { this.attrs[k]=v; }, getAttribute(k) { return this.attrs[k] ?? null; }, removeAttribute(k) { delete this.attrs[k]; }, replaceChildren() {}, select() {}, focus() {} });
     return elements.get(id);
   };
-  const context = vm.createContext({ $, tr: text => text, prefs, navigator: { locks: testLocks() }, queueMicrotask: callback => Promise.resolve().then(callback), mentionAttached: {}, S: { approvalHelpSeen: true, current: 'A', storageScope: 'test-room', chips: {}, attachmentInventories: {}, drafts: {}, outbox: [], outboxFlushing: false, outboxFlushRequested: false, submitting: new Set(), shareApplyPending: false, running: new Set(), liveRun: null, daemonOnline: true, channel: {}, local: true, messages: [], sessions: [], view: 'chat', tools: [] },
+  const context = vm.createContext({ $, TextEncoder, tr: text => text, prefs, navigator: { locks: testLocks() }, queueMicrotask: callback => Promise.resolve().then(callback), mentionAttached: {}, S: { approvalHelpSeen: true, current: 'A', storageScope: 'test-room', chips: {}, attachmentInventories: {}, drafts: {}, outbox: [], outboxFlushing: false, outboxFlushRequested: false, submitting: new Set(), shareApplyPending: false, running: new Set(), liveRun: null, daemonOnline: true, channel: {}, local: true, messages: [], sessions: [], view: 'chat', tools: [] },
     forecastRevision: 0, scheduleForecast() {}, invalidateBranchSummary() {}, branchSummaryEvent() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {},
     // These tests isolate intent/data behavior; real focus/inert behavior runs
     // against the complete shipped UI in web-focus.browser-test.py.
@@ -59,6 +59,8 @@ function setup(names, extras = {}) {
       : extras.request ? extras.request(req) : {},
   });
   installEventRenderFixture(context, fn);
+  context.renderWakeLock = () => {};
+  context.syncAppBadge = () => {};
   if (names.includes('renderHistory')) installHistoryFixture(context, fn);
   if (names.some(name => ['rateButtons', 'retryRun'].includes(name))) {
     vm.runInContext(['currentRunTarget', 'ensureRunTarget'].map(fn).join('\n'), context);
@@ -1417,6 +1419,124 @@ function liveSetup(extras = {}) {
   c.S.running = new Set(); c.S.approvals = []; c.S.questions = []; c.S.liveTools = [];
   return { c, wait };
 }
+test('same-session foreground refresh preserves unsent text in a message edit', async () => {
+  const { c, wait } = liveSetup();
+  c.S.current = 'A';
+  c.S.editMessageId = 'message-being-edited';
+  c.$('input').value = 'unsent correction';
+  const load = c.openSession('A');
+  assert.equal(c.S.editMessageId, 'message-being-edited');
+  assert.equal(c.$('input').value, 'unsent correction');
+  wait.resolve({ messages: [], running: true, pending_events: [], pending_steps: { prompts: [], more: false } });
+  await load;
+  assert.equal(c.S.editMessageId, 'message-being-edited');
+  assert.equal(c.$('input').value, 'unsent correction');
+});
+
+test('same-session foreground refresh preserves partial live output and racing deltas', async () => {
+  const { c, wait } = liveSetup();
+  c.S.current = 'A';
+  c.S.liveRun = { id: 'run-1' };
+  c.S.streaming = 'answer prefix';
+  c.S.thinking = 'reasoning prefix';
+  c.S.liveTools = [{ tool_name: 'reader' }];
+  const tools = c.S.liveTools;
+  const load = c.openSession('A');
+  assert.equal(c.S.streaming, 'answer prefix');
+  assert.equal(c.S.thinking, 'reasoning prefix');
+  c.onEvent({ type: 'message_delta', session_id: 'A', delta: ' tail' });
+  c.onEvent({ type: 'reasoning_delta', session_id: 'A', delta: ' tail' });
+  wait.resolve({ messages: [], running: true, pending_events: [], pending_steps: { prompts: [], more: false }, latest_run: { run_id: 'run-1', status: 'running' } });
+  await load;
+  assert.equal(c.S.streaming, 'answer prefix tail');
+  assert.equal(c.S.thinking, 'reasoning prefix tail');
+  assert.equal(c.S.liveTools, tools);
+});
+
+test('same-session GetSession refresh restores a pending step from its prompt preview', async () => {
+  const { c, wait } = liveSetup();
+  c.S.current = 'A';
+  const existing = { step_id: 'previous', tool_name: 'old-tool' };
+  c.S.step = existing;
+  const load = c.openSession('A');
+  assert.equal(c.S.step, existing, 'keep the current controls while the snapshot is in flight');
+  wait.resolve({ messages: [], running: true, pending_events: [], pending_steps: { prompts: [
+    { session_id: 'A', run_id: 'run-1', step_id: 'step-1', tool_name: 'reader', arguments_preview: '{"path":"src"}', arguments_bytes: 14, index: 1, count: 2 },
+  ], more: false } });
+  await load;
+  assert.equal(c.S.step.step_id, 'step-1');
+  assert.equal(c.S.step.arguments, '{"path":"src"}');
+  assert.equal(c.S.step.argumentsComplete, true);
+  assert.equal(c.S.step.index, 1);
+  assert.equal(c.S.step.count, 2);
+});
+
+test('same-session GetSession refresh marks an oversized pending-step preview incomplete', async () => {
+  const { c, wait } = liveSetup();
+  c.S.current = 'A';
+  const preview = 'x'.repeat(4096);
+  const load = c.openSession('A');
+  wait.resolve({ messages: [], running: true, pending_events: [], pending_steps: { prompts: [
+    { session_id: 'A', run_id: 'run-1', step_id: 'step-1', tool_name: 'reader', arguments_preview: preview, arguments_bytes: 5000, index: 0, count: 1 },
+  ], more: false } });
+  await load;
+  assert.equal(c.S.step.arguments, preview);
+  assert.equal(c.S.step.argumentsComplete, false);
+});
+
+test('same-session GetSession refresh preserves full arguments for the same pending step', async () => {
+  const { c, wait } = liveSetup();
+  c.S.current = 'A';
+  const fullArguments = JSON.stringify({ path: 'src', filter: 'x'.repeat(5000) });
+  c.S.step = {
+    session_id: 'A', run_id: 'run-1', step_id: 'step-1', tool_name: 'reader',
+    arguments: fullArguments, index: 1, count: 2,
+  };
+  const load = c.openSession('A');
+  wait.resolve({ messages: [], running: true, pending_events: [], pending_steps: { prompts: [
+    {
+      session_id: 'A', run_id: 'run-1', step_id: 'step-1', tool_name: 'reader',
+      arguments_preview: fullArguments.slice(0, 4096), arguments_bytes: fullArguments.length,
+      index: 1, count: 2,
+    },
+  ], more: false } });
+  await load;
+  assert.equal(c.S.step.arguments, fullArguments);
+  assert.equal(c.S.step.argumentsComplete, true);
+});
+
+test('step Edit is disabled with an explanation only when full arguments are unavailable', () => {
+  const c = setup(['renderStep'], { h: (tag, attrs, ...children) => ({ tag, attrs, children }) });
+  const box = c.$('step');
+  box.replaceChildren = (...children) => { box.children = children; };
+  for (const [complete, disabled] of [[false, true], [true, false], [undefined, false]]) {
+    c.S.step = { step_id: 'step-1', tool_name: 'reader', arguments: '{}', argumentsComplete: complete, index: 0, count: 1 };
+    c.renderStep();
+    const edit = box.children.find(node => node?.tag === 'button' && node.children[0] === 'Edit');
+    const labels = box.children.filter(node => node?.tag === 'button').map(node => node.children[0]);
+    assert.equal(!!edit.attrs.disabled, disabled);
+    assert.ok(labels.includes('Run'));
+    assert.ok(labels.includes('Skip'));
+    const reason = box.children.find(node => node?.attrs?.class === 'muted step-edit-reason');
+    assert.equal(!!reason, disabled);
+    if (disabled) assert.match(reason.children[0], /full arguments are unavailable/i);
+  }
+});
+
+test('live step events received during a same-session refresh supersede its older prompt snapshot', async () => {
+  const { c, wait } = liveSetup();
+  c.S.current = 'A';
+  const load = c.openSession('A');
+  c.onEvent({ type: 'step_resolved', session_id: 'A', step_id: 'snapshot-step' });
+  c.onEvent({ type: 'step_pending', session_id: 'A', run_id: 'run-2', step_id: 'live-step', tool_name: 'writer', arguments: '{"path":"out"}', index: 1, count: 3 });
+  wait.resolve({ messages: [], running: true, pending_events: [], pending_steps: { prompts: [
+    { session_id: 'A', run_id: 'run-1', step_id: 'snapshot-step', tool_name: 'reader', arguments_preview: '{}', arguments_bytes: 2, index: 0, count: 1 },
+  ], more: false } });
+  await load;
+  assert.equal(c.S.step.step_id, 'live-step');
+  assert.equal(c.S.step.arguments, '{"path":"out"}');
+});
+
 test('global attention snapshot preserves another Session question and entered dialog', async () => {
   const cancelled = [], { c, wait } = liveSetup({ cancelAsk: tag => cancelled.push(tag) });
   c.onEvent({ type: 'user_question', question_id: 'qa', session_id: 'A', question: 'A?' });
@@ -1463,6 +1583,7 @@ test('relay daemon_offline clears live state and rejects pending requests withou
   c.S.running.add('A'); c.S.approvals = [{ id: 'old' }]; c.S.streaming = 'old partial';
   let rejected = 0; c.S.pending = new Map([[1, { reject: e => { assert.match(e.message, /offline/); rejected++; } }]]);
   const start = source.indexOf('    async function onFrame(ws, frame) {');
+  vm.runInContext(fn('resetRelayConnection'), c);
   vm.runInContext(source.slice(start, source.indexOf('\n    ws.onclose =', start)), c);
   await c.onFrame(socket, '{"relay":"daemon_offline"}');
   assert.equal(c.S.channel, null); assert.equal(c.S.approvals.length, 0);
@@ -1801,6 +1922,33 @@ test('only a fresh idle text send retains direct legacy compatibility', async ()
   await duplicate.submit(false);
   assert.equal(duplicateCalls.some(req => req.type === 'send_message' || req.type === 'send_outbox_message'), false);
   assert.equal(duplicate.$('input').value, 'already queued');
+});
+
+test('sending the first chat message does not request browser notification permission', async () => {
+  const calls = []; let permissionRequests = 0;
+  const Notification = {
+    permission: 'default',
+    requestPermission() { permissionRequests++; return Promise.resolve('granted'); },
+  };
+  const c = setup(['submit', 'loadOutbox'], {
+    pingFeatures: [],
+    crypto: { randomUUID: () => 'first-message' },
+    Notification, window: { Notification },
+    askNotifyPermission() {
+      if (Notification.permission === 'default') Notification.requestPermission();
+    },
+    closeMentions() {}, mentionsIn: () => [], renderOutbox() {},
+    request: async req => {
+      calls.push(req);
+      return req.type === 'list_pending_attachments' ? { attachments: [] } : {};
+    },
+  });
+  c.S.settings = { limits: {} };
+  c.S.attachmentInventories.A = [];
+  c.$('input').value = 'first chat message';
+  await c.submit(false);
+  assert.equal(calls.some(req => req.type === 'send_message'), true);
+  assert.equal(permissionRequests, 0);
 });
 
 test('legacy fresh sends require an empty pairing outbox under the outbox lock', async () => {

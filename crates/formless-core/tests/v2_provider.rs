@@ -939,7 +939,15 @@ fn model_metadata_comes_from_the_listing_or_the_table() {
          "architecture": {"input_modalities": ["text", "image"]},
          "supported_parameters": ["tools", "reasoning"]},
         {"id": "plain", "supported_parameters": ["temperature"]},
-        {"id": "gpt-5-mini"}
+        {"id": "gpt-5-mini", "supported_parameters": ["tools"]},
+        {"id": "my-gemini-embed"},
+        {"id": "gemini-embedding-001"},
+        {"id": "vendor/prefix-gpt-5"},
+        {"id": "vendor/prefix-claude-3-haiku"},
+        {"id": "claude-3-7-sonnet", "max_tokens": 64000,
+         "architecture": {"input_modalities": ["text", "image"]},
+         "supported_parameters": ["tools"]},
+        {"id": "anthropic/claude-2.1"}
     ]});
     let meta = parse_model_meta(&body);
     let v = &meta["vendor/visionary"];
@@ -956,16 +964,31 @@ fn model_metadata_comes_from_the_listing_or_the_table() {
         (Some(3.0), Some(15.0))
     );
     assert_eq!(v["efforts"], json!(["low", "medium", "high"]));
-    assert_eq!(
-        meta["plain"]["efforts"],
-        json!([]),
-        "no reasoning parameter: effort has no effect"
-    );
-    assert_eq!(meta["plain"]["tools"], false);
+    assert_eq!(v["source"], "endpoint");
+    assert_eq!(v["inferred"], json!(["efforts"]));
+    assert!(meta["plain"].get("efforts").is_none());
+    assert!(meta["plain"].get("tools").is_none());
+    assert_eq!(meta["plain"]["source"], "endpoint");
     assert_eq!(
         meta["gpt-5-mini"]["efforts"],
         json!(["minimal", "low", "medium", "high"])
     );
+    assert_eq!(meta["gpt-5-mini"]["source"], "mixed");
+    assert_eq!(meta["gpt-5-mini"]["inferred"], json!(["vision", "efforts"]));
+    assert_eq!(meta["my-gemini-embed"]["source"], "endpoint");
+    assert_eq!(meta["gemini-embedding-001"]["source"], "endpoint");
+    assert_eq!(meta["vendor/prefix-gpt-5"]["source"], "endpoint");
+    assert_eq!(meta["vendor/prefix-claude-3-haiku"]["source"], "endpoint");
+    assert!(meta["vendor/prefix-gpt-5"].get("vision").is_none());
+    assert!(meta["vendor/prefix-claude-3-haiku"].get("tools").is_none());
+    assert_eq!(meta["claude-3-7-sonnet"]["source"], "endpoint");
+    assert_eq!(meta["claude-3-7-sonnet"]["vision"], true);
+    assert_eq!(meta["claude-3-7-sonnet"]["tools"], true);
+    assert_eq!(meta["claude-3-7-sonnet"]["max_output"], 64000);
+    assert!(meta["claude-3-7-sonnet"].get("inferred").is_none());
+    assert_eq!(known_model_meta("gpt-5-mini")["source"], "builtin");
+    assert_eq!(known_model_meta("anthropic/claude-2.1")["vision"], false);
+    assert_eq!(known_model_meta("openai/o3-mini")["vision"], false);
     assert!(
         known_model_meta("some-unknown").get("efforts").is_none(),
         "unknown: all offered"
