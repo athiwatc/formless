@@ -60,7 +60,7 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use formless_core::auth::has_provider_credential;
-use formless_core::config::{save_api_key, Config};
+use formless_core::config::Config;
 use formless_core::daemon::ensure_daemon;
 use formless_core::onboarding::{load as load_seen, Seen};
 use formless_core::provider::{list_models_blocking, probe_blocking, ProbeResult};
@@ -9314,13 +9314,16 @@ impl App {
         w.apply_provider_endpoint(&mut cfg.provider);
         cfg.provider.model = w.model();
         cfg.provider.reasoning_effort = EFFORTS[w.effort_idx].map(str::to_string);
-        if w.prompt_fallback {
-            cfg.provider.tool_mode = "prompt".into();
-        }
-        cfg.save(&self.paths)?;
-        if let WizardKeyUpdate::Save(key) = key_update {
-            save_api_key(&self.paths, &key)?;
-        }
+        let save_key = match key_update {
+            WizardKeyUpdate::Save(key) => Some(key),
+            _ => None,
+        };
+        formless_core::profile_setup::save_verified_provider(
+            &self.paths,
+            &mut cfg,
+            w.prompt_fallback,
+            save_key.as_deref(),
+        )?;
         let w = self.wizard.take().expect("wizard");
         let _ = formless_core::setup_draft::discard(&self.paths);
         // A guided first task, offered once (#393).
