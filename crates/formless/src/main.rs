@@ -3069,7 +3069,7 @@ fn update_cmd(check: bool, json: bool) -> Result<()> {
         json,
         env!("CARGO_PKG_VERSION"),
         upgrade_command(),
-        || update_http::get("https://api.github.com/repos/athiwatc/formless/releases?per_page=50"),
+        update_http::get_releases,
     )
 }
 

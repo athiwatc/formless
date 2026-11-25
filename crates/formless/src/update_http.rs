@@ -1,24 +1,54 @@
 //! Bounded release metadata lookup; never downloads or installs an executable.
-use anyhow::{anyhow, Result};
-use reqwest::blocking::{Client, ClientBuilder};
-use std::time::Duration;
+use anyhow::{anyhow, Context, Result};
+use reqwest::blocking::{ClientBuilder, RequestBuilder};
+use serde_json::Value;
+use std::time::{Duration, Instant};
 
 const RELEASES_PAGE: &str = "https://github.com/athiwatc/formless/releases";
+const RELEASES_API: &str = "https://api.github.com/repos/athiwatc/formless/releases";
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
+const PAGE_SIZE: usize = 100;
 
 fn builder(connect: Duration, total: Duration) -> ClientBuilder {
-    Client::builder()
+    ClientBuilder::new()
         .user_agent(concat!("formless/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(connect)
         .timeout(total)
 }
 
-pub(super) fn get(url: &str) -> Result<String> {
-    let client = builder(Duration::from_secs(5), Duration::from_secs(15)).build()?;
-    fetch(&client, url)
+pub(super) fn get_releases() -> Result<String> {
+    let client = builder(Duration::from_secs(5), LOOKUP_TIMEOUT).build()?;
+    collect_pages(|page, remaining| {
+        fetch(
+            client
+                .get(RELEASES_API)
+                .query(&[("per_page", PAGE_SIZE), ("page", page)])
+                .timeout(remaining),
+        )
+    })
 }
 
-fn fetch(client: &Client, url: &str) -> Result<String> {
-    let response = client.get(url).send().map_err(lookup_error)?;
+fn collect_pages(mut get_page: impl FnMut(usize, Duration) -> Result<String>) -> Result<String> {
+    let started = Instant::now();
+    let mut releases = Vec::new();
+    for page in 1.. {
+        let remaining = LOOKUP_TIMEOUT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(timeout_error());
+        }
+        let batch: Vec<Value> =
+            serde_json::from_str(&get_page(page, remaining)?).context("parse releases")?;
+        let last = batch.len() < PAGE_SIZE;
+        releases.extend(batch);
+        if last {
+            break;
+        }
+    }
+    Ok(serde_json::to_string(&releases)?)
+}
+
+fn fetch(request: RequestBuilder) -> Result<String> {
+    let response = request.send().map_err(lookup_error)?;
     let headers = response.headers();
     if matches!(response.status().as_u16(), 403 | 429)
         && (headers
@@ -93,10 +123,14 @@ fn retry_time(
 
 fn lookup_error(error: reqwest::Error) -> anyhow::Error {
     if error.is_timeout() {
-        anyhow!("GitHub release lookup timed out; try again or open {RELEASES_PAGE}")
+        timeout_error()
     } else {
         error.into()
     }
+}
+
+fn timeout_error() -> anyhow::Error {
+    anyhow!("GitHub release lookup timed out; try again or open {RELEASES_PAGE}")
 }
 
 #[cfg(test)]
@@ -112,6 +146,28 @@ mod tests {
     const READ_TIMEOUT: Duration = Duration::from_secs(1);
     const FIXTURE_DEADLINE: Duration = Duration::from_secs(3);
     const REQUEST: &[u8] = b"GET /releases HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n";
+
+    #[test]
+    fn stable_release_is_reported_after_a_page_of_previews() {
+        let previews =
+            vec![serde_json::json!({"tag_name": "main-fixture", "prerelease": true}); PAGE_SIZE];
+        let stable =
+            serde_json::json!([{"tag_name": "v1.2.0", "body": "notes", "html_url": "url"}]);
+        let result = collect_pages(|page, remaining| {
+            assert!(remaining <= LOOKUP_TIMEOUT);
+            Ok(match page {
+                1 => serde_json::to_string(&previews)?,
+                2 => stable.to_string(),
+                _ => panic!("unexpected page {page}"),
+            })
+        })
+        .unwrap();
+        let releases = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            super::super::newer_releases(&releases, "1.0.0"),
+            vec![("v1.2.0".into(), "notes".into(), "url".into())]
+        );
+    }
 
     #[derive(Debug)]
     enum HeadError {
@@ -264,7 +320,7 @@ mod tests {
             .build()
             .unwrap();
         let started = Instant::now();
-        let result = fetch(&client, &format!("http://{addr}/releases"));
+        let result = fetch(client.get(format!("http://{addr}/releases")));
         let elapsed = started.elapsed();
         let _ = stop.send(());
         if let Err(error) = server.join().unwrap() {
