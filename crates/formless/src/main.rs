@@ -10316,6 +10316,10 @@ mod tests {
 
     #[test]
     fn uninstall_inventory_change_preserves_default_and_new_child_before_any_erase() {
+        isolated_maintenance_assertions("inventory");
+    }
+
+    fn uninstall_inventory_change_assertions() {
         let (_fixture, base) = MaintenanceFixture::new();
         std::fs::write(base.db_file(), "default sentinel").unwrap();
         let initial = base.list_profiles();
@@ -10336,10 +10340,11 @@ mod tests {
                 })
             },
         );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("inventory changed"));
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("inventory changed"),
+            "expected an inventory-change refusal, got: {error:#}"
+        );
         assert!(!erased.get());
         assert_eq!(
             std::fs::read_to_string(base.db_file()).unwrap(),
@@ -10353,6 +10358,10 @@ mod tests {
 
     #[test]
     fn uninstall_never_erases_parent_after_child_failure_and_preparation_failure_erases_nothing() {
+        isolated_maintenance_assertions("failure");
+    }
+
+    fn uninstall_failure_assertions() {
         let (_fixture, base) = MaintenanceFixture::new();
         let named = base.named("child").unwrap();
         super::Paths::from_dirs(named.data_dir.clone(), named.config_dir.clone()).unwrap();
@@ -10371,8 +10380,12 @@ mod tests {
                 })
             },
         );
-        assert!(result.is_err());
-        assert_eq!(*erased.borrow(), ["child"]);
+        let error = result.unwrap_err();
+        assert_eq!(
+            *erased.borrow(),
+            ["child"],
+            "maintenance failed before the child erase attempt: {error:#}"
+        );
         assert_eq!(
             std::fs::read_to_string(base.db_file()).unwrap(),
             "default sentinel"
@@ -10387,8 +10400,18 @@ mod tests {
                 Ok(())
             },
         );
-        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("private manager fixture rejected reject"),
+            "expected the injected preparation failure, got: {error:#}"
+        );
         assert!(erased.borrow().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(base.config_dir.join("operations")).unwrap(),
+            "reject\n"
+        );
         assert_eq!(
             std::fs::read_to_string(named.db_file()).unwrap(),
             "child sentinel"
@@ -10408,7 +10431,10 @@ mod tests {
     }
 
     fn isolated_maintenance_assertions(mode: &str) {
-        assert!(matches!(mode, "release" | "refusal"));
+        assert!(matches!(
+            mode,
+            "failure" | "inventory" | "release" | "refusal"
+        ));
         let mut child = IsolatedMaintenanceProcess(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -10456,6 +10482,8 @@ mod tests {
     #[ignore = "private subprocess fixture for immediate maintenance lock assertions"]
     fn maintenance_isolation_child_fixture() {
         match std::env::var("FORMLESS_TEST_MAINTENANCE_ISOLATION").as_deref() {
+            Ok("failure") => uninstall_failure_assertions(),
+            Ok("inventory") => uninstall_inventory_change_assertions(),
             Ok("release") => maintenance_release_assertions(),
             Ok("refusal") => maintenance_refusal_assertions(),
             _ => panic!("invoke only through the isolated maintenance parent tests"),
