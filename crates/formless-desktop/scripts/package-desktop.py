@@ -72,7 +72,9 @@ def write_archive(bundle, executable, archive, epoch):
             info = zipfile.ZipInfo(source.relative_to(bundle.parent).as_posix(), date_time)
             info.create_system = 3
             info.compress_type = zipfile.ZIP_DEFLATED
-            mode = 0o755 if source == executable or source == executable.parent / "formless" else 0o644
+            mode = 0o755 if source == executable or (
+                source.parent == executable.parent and source.name in ("formless", "formless.exe")
+            ) else 0o644
             info.external_attr = (stat.S_IFREG | mode) << 16
             with source.open("rb") as contents, target.open(info, "w") as entry:
                 shutil.copyfileobj(contents, entry)
@@ -296,7 +298,7 @@ def verify_shipping_artifacts(metadata, built, root_features):
             raise ValueError("build reported a server artifact: " + packages[identity]["name"])
 
 
-def package(args):
+def package(args, cli_binary=None):
     desktop = Path(__file__).resolve().parents[1]
     repository = desktop.parents[1]
     output = Path(args.output).resolve()
@@ -346,9 +348,8 @@ def package(args):
     if binary is None or not binary.is_file():
         raise ValueError("Cargo did not report the desktop executable")
     verify_shipping_artifacts(metadata, built, root_features)
-    cli_binary = None
     cli_command = None
-    if platform == "macos":
+    if platform == "macos" and cli_binary is None:
         cli_command = ["cargo", "build", "--locked", "-p", "formless-bin", "--bin", "formless", "--message-format=json-render-diagnostics"]
         if args.profile == "release":
             cli_command.append("--release")
@@ -397,8 +398,9 @@ def package(args):
             resources.mkdir()
             executable = bundle / ("formless-desktop.exe" if platform == "windows" else "formless-desktop")
         shutil.copy2(binary, executable)
+        bundled_cli = executable.parent / ("formless.exe" if platform == "windows" else "formless")
         if cli_binary is not None:
-            shutil.copy2(cli_binary, executable.parent / "formless")
+            shutil.copy2(cli_binary, bundled_cli)
         shutil.copyfile(repository / "LICENSE", resources / "LICENSE")
         shutil.copyfile(desktop / "README.md", resources / "README.md")
         upstream = desktop / "notices"
@@ -414,7 +416,7 @@ def package(args):
                       "native_acceptance": False,
                       "shipping_graph": graph,
                       "server_build_artifacts": [],
-                      "cli_binary_sha256": digest(executable.parent / "formless") if cli_binary else None,
+                      "cli_binary_sha256": digest(bundled_cli) if cli_binary else None,
                       "cli_build_command": cli_command,
                       "cli_notice_review_limitations": "CLI dependency notices are not collected; development use only" if cli_binary else None,
                       "upstream_notice_manifest_sha256": digest(upstream / "UPSTREAM.json") if (upstream / "UPSTREAM.json").is_file() else None,
@@ -446,8 +448,10 @@ def main():
     parser.add_argument("--profile", choices=("dev", "release"), default="release")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--allow-dirty", action="store_true", help="record tracked changes in development provenance")
+    parser.add_argument("--cli-binary", type=Path, help="include a prebuilt, matching native CLI beside the desktop executable")
+    args = parser.parse_args()
     try:
-        package(parser.parse_args())
+        package(args, args.cli_binary)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print("Packaging failed: " + str(error), file=sys.stderr)
         return 1

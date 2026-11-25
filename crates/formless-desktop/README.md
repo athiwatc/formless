@@ -364,12 +364,19 @@ OS acceptance remain release gates. BUILD.json explicitly records that limit.
 The optional desktop CI arranges the same packaging check on all three hosts;
 failed or unstarted hosted jobs do not establish platform support.
 
+Pushes to `main` publish unsigned [GitHub prereleases](https://github.com/athiwatc/formless/releases)
+with macOS DMGs (Apple Silicon and Intel), an Ubuntu 24.04 x86-64 DEB,
+and a Windows x86-64 installer. Each includes the CLI from the same
+commit so the app launcher can start the local daemon. Standalone CLI
+archives are also attached. These are previews, not signed or notarized
+distributions.
+
 ## Why it is outside the workspace
 
 This crate has its own `[workspace]` table and its own `Cargo.lock`. It is not
 a member of the repository workspace, so `cargo build --workspace`,
-`cargo test --workspace`, the release workflows and the root `Cargo.lock` do
-not see GPUI. Run every command below from this directory.
+`cargo test --workspace`, and the root `Cargo.lock` do not see GPUI. Run every
+command below from this directory.
 
 ## Layout
 
