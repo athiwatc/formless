@@ -470,13 +470,13 @@ fn source_directory_name(
     staging: &Path,
     root: &Path,
 ) -> Option<String> {
-    if let Some(subdir) = subdir.filter(|subdir| !subdir.is_empty() && *subdir != ".") {
-        return Path::new(subdir)
+    if root != staging {
+        return root
             .file_name()
             .map(|name| name.to_string_lossy().into_owned());
     }
-    if root != staging {
-        return root
+    if let Some(subdir) = subdir.filter(|subdir| !subdir.is_empty() && *subdir != ".") {
+        return Path::new(subdir)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned());
     }

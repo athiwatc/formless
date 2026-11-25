@@ -245,6 +245,18 @@ fn skill_names_follow_agent_skills_rules_and_match_source_directory() {
     assert!(error.contains("metadata-name"), "{error}");
     assert!(error.contains("directory-name"), "{error}");
     assert!(store.list_skills().unwrap().is_empty());
+
+    let text = "---\nname: metadata-name\ndescription: d\n---\nBody";
+    let info = formless_core::skills::install_text(&paths, &store, text, "auto", "auto").unwrap();
+    assert_eq!(info.name, "metadata-name");
+
+    let bundle = formless_core::skills::export(&store, "metadata-name").unwrap();
+    let (_other_fixture, other_paths) = temp_paths("skill-name-bundle");
+    let other_store = Store::open(&other_paths.db_file()).unwrap();
+    let staged = formless_core::skills::prepare_bundle(&other_paths, &bundle).unwrap();
+    let imported =
+        formless_core::skills::commit(&other_paths, &other_store, &staged, "import").unwrap();
+    assert_eq!(imported.name, "metadata-name");
 }
 
 #[test]
@@ -332,10 +344,47 @@ fn skills_install_from_folder_zip_and_git_and_version() {
         std::fs::read_to_string(src.join("SKILL.md")).unwrap(),
         "zip install must contain the updated version's actual files"
     );
+    let mismatched_entries = entries
+        .iter()
+        .map(|(path, bytes)| {
+            (
+                path.replacen("report-writer/", "wrong-wrapper/", 1),
+                bytes.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mismatched_zip = paths.data_dir.join("mismatched.zip");
+    write_zip(&mismatched_zip, &mismatched_entries);
+    let error = install(
+        &paths,
+        &store,
+        mismatched_zip.to_str().unwrap(),
+        None,
+        None,
+        "user",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("report-writer"), "{error}");
+    assert!(error.contains("wrong-wrapper"), "{error}");
+    assert_eq!(
+        store.get_skill("report-writer").unwrap().unwrap().version,
+        2
+    );
 
     // git (a local bare repo stands in for a URL), with a subdir.
     let repo = paths.data_dir.join("work");
     write_skill(&repo.join("skills/git-skill"), "git-skill", "From git.");
+    write_skill(
+        &repo.join("skills/wrong-directory"),
+        "git-skill",
+        "Wrong directory.",
+    );
+    write_skill(
+        &repo.join("container/nested-skill"),
+        "nested-skill",
+        "From a nested directory.",
+    );
     let git = |args: &[&str], dir: &std::path::Path| {
         let output = std::process::Command::new("git")
             .args(args)
@@ -406,7 +455,21 @@ fn skills_install_from_folder_zip_and_git_and_version() {
         read_file(&store, "git-skill", "scripts/fix.py").unwrap(),
         "print('hi')"
     );
-    assert_eq!(store.list_skills().unwrap().len(), 2);
+    let nested = install(&paths, &store, &source, Some("container"), None, "user").unwrap();
+    assert_eq!(nested.name, "nested-skill");
+    let error = install(
+        &paths,
+        &store,
+        &source,
+        Some("skills/wrong-directory"),
+        None,
+        "user",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("git-skill"), "{error}");
+    assert!(error.contains("wrong-directory"), "{error}");
+    assert_eq!(store.list_skills().unwrap().len(), 3);
     // Removing deletes rows; files are the caller's to delete.
     assert!(!store.remove_skill("git-skill").unwrap().is_empty());
     assert!(store.get_skill("git-skill").unwrap().is_none());
