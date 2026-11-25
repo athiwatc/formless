@@ -46,7 +46,7 @@ function setup(names, extras = {}) {
     if (!elements.has(id)) elements.set(id, { value: '', style: {}, textContent: '', classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } }, attrs: {}, setAttribute(k,v) { this.attrs[k]=v; }, getAttribute(k) { return this.attrs[k] ?? null; }, removeAttribute(k) { delete this.attrs[k]; }, replaceChildren() {}, select() {}, focus() {} });
     return elements.get(id);
   };
-  const context = vm.createContext({ $, tr: text => text, prefs, navigator: { locks: testLocks() }, queueMicrotask: callback => Promise.resolve().then(callback), mentionAttached: {}, S: { approvalHelpSeen: true, current: 'A', storageScope: 'test-room', chips: {}, attachmentInventories: {}, drafts: {}, outbox: [], outboxFlushing: false, outboxFlushRequested: false, submitting: new Set(), shareApplyPending: false, running: new Set(), liveRun: null, daemonOnline: true, channel: {}, local: true, messages: [], sessions: [], view: 'chat', tools: [] },
+  const context = vm.createContext({ $, TextEncoder, tr: text => text, prefs, navigator: { locks: testLocks() }, queueMicrotask: callback => Promise.resolve().then(callback), mentionAttached: {}, S: { approvalHelpSeen: true, current: 'A', storageScope: 'test-room', chips: {}, attachmentInventories: {}, drafts: {}, outbox: [], outboxFlushing: false, outboxFlushRequested: false, submitting: new Set(), shareApplyPending: false, running: new Set(), liveRun: null, daemonOnline: true, channel: {}, local: true, messages: [], sessions: [], view: 'chat', tools: [] },
     forecastRevision: 0, scheduleForecast() {}, invalidateBranchSummary() {}, branchSummaryEvent() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {},
     // These tests isolate intent/data behavior; real focus/inert behavior runs
     // against the complete shipped UI in web-focus.browser-test.py.
@@ -1461,13 +1461,27 @@ test('same-session GetSession refresh restores a pending step from its prompt pr
   const load = c.openSession('A');
   assert.equal(c.S.step, existing, 'keep the current controls while the snapshot is in flight');
   wait.resolve({ messages: [], running: true, pending_events: [], pending_steps: { prompts: [
-    { session_id: 'A', run_id: 'run-1', step_id: 'step-1', tool_name: 'reader', arguments_preview: '{"path":"src"}', arguments_bytes: 15, index: 1, count: 2 },
+    { session_id: 'A', run_id: 'run-1', step_id: 'step-1', tool_name: 'reader', arguments_preview: '{"path":"src"}', arguments_bytes: 14, index: 1, count: 2 },
   ], more: false } });
   await load;
   assert.equal(c.S.step.step_id, 'step-1');
   assert.equal(c.S.step.arguments, '{"path":"src"}');
+  assert.equal(c.S.step.argumentsComplete, true);
   assert.equal(c.S.step.index, 1);
   assert.equal(c.S.step.count, 2);
+});
+
+test('same-session GetSession refresh marks an oversized pending-step preview incomplete', async () => {
+  const { c, wait } = liveSetup();
+  c.S.current = 'A';
+  const preview = 'x'.repeat(4096);
+  const load = c.openSession('A');
+  wait.resolve({ messages: [], running: true, pending_events: [], pending_steps: { prompts: [
+    { session_id: 'A', run_id: 'run-1', step_id: 'step-1', tool_name: 'reader', arguments_preview: preview, arguments_bytes: 5000, index: 0, count: 1 },
+  ], more: false } });
+  await load;
+  assert.equal(c.S.step.arguments, preview);
+  assert.equal(c.S.step.argumentsComplete, false);
 });
 
 test('same-session GetSession refresh preserves full arguments for the same pending step', async () => {
@@ -1488,6 +1502,25 @@ test('same-session GetSession refresh preserves full arguments for the same pend
   ], more: false } });
   await load;
   assert.equal(c.S.step.arguments, fullArguments);
+  assert.equal(c.S.step.argumentsComplete, true);
+});
+
+test('step Edit is disabled with an explanation only when full arguments are unavailable', () => {
+  const c = setup(['renderStep'], { h: (tag, attrs, ...children) => ({ tag, attrs, children }) });
+  const box = c.$('step');
+  box.replaceChildren = (...children) => { box.children = children; };
+  for (const [complete, disabled] of [[false, true], [true, false], [undefined, false]]) {
+    c.S.step = { step_id: 'step-1', tool_name: 'reader', arguments: '{}', argumentsComplete: complete, index: 0, count: 1 };
+    c.renderStep();
+    const edit = box.children.find(node => node?.tag === 'button' && node.children[0] === 'Edit');
+    const labels = box.children.filter(node => node?.tag === 'button').map(node => node.children[0]);
+    assert.equal(!!edit.attrs.disabled, disabled);
+    assert.ok(labels.includes('Run'));
+    assert.ok(labels.includes('Skip'));
+    const reason = box.children.find(node => node?.attrs?.class === 'muted step-edit-reason');
+    assert.equal(!!reason, disabled);
+    if (disabled) assert.match(reason.children[0], /full arguments are unavailable/i);
+  }
 });
 
 test('live step events received during a same-session refresh supersede its older prompt snapshot', async () => {
@@ -1550,6 +1583,7 @@ test('relay daemon_offline clears live state and rejects pending requests withou
   c.S.running.add('A'); c.S.approvals = [{ id: 'old' }]; c.S.streaming = 'old partial';
   let rejected = 0; c.S.pending = new Map([[1, { reject: e => { assert.match(e.message, /offline/); rejected++; } }]]);
   const start = source.indexOf('    async function onFrame(ws, frame) {');
+  vm.runInContext(fn('resetRelayConnection'), c);
   vm.runInContext(source.slice(start, source.indexOf('\n    ws.onclose =', start)), c);
   await c.onFrame(socket, '{"relay":"daemon_offline"}');
   assert.equal(c.S.channel, null); assert.equal(c.S.approvals.length, 0);

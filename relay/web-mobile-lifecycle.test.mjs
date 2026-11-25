@@ -81,51 +81,76 @@ test('a stale failed probe cannot replace or close the newer relay socket', asyn
   assert.equal(h.closes.length, 0);
 });
 
-test('probe request deadline extends on relay activity and still expires when traffic stops', async () => {
+test('probe timeout uses only the remaining idle budget after Relay progress', async () => {
   const timers = new Map();
-  let timerID = 0;
+  let timerID = 0, now = 10000;
   const ws = { readyState: 1, send() {} };
-  const S = { ws, channel: {}, local: true, relayReady: true, pending: new Map(), nextId: 1, sendChain: Promise.resolve(), relayActivity: 0 };
+  const S = { ws, channel: {}, local: true, relayReady: true, pending: new Map(), nextId: 1, sendChain: Promise.resolve(), relayActivityAt: 0 };
   const context = vm.createContext({
     S, PROTOCOL: 1,
-    setTimeout: (callback, ms) => { const id = ++timerID; timers.set(id, { callback, ms }); return id; },
+    performance: { now: () => now },
+    setTimeout: (callback, ms) => { const id = ++timerID; timers.set(id, { callback, ms, at: now + ms }); return id; },
     clearTimeout: id => timers.delete(id),
   });
   vm.runInContext(fn('request'), context);
+  const advance = async ms => {
+    const target = now + ms;
+    for (;;) {
+      const next = [...timers].sort((a, b) => a[1].at - b[1].at)[0];
+      if (!next || next[1].at > target) break;
+      now = next[1].at;
+      timers.delete(next[0]);
+      next[1].callback();
+      await settle();
+    }
+    now = target;
+    await settle();
+  };
 
   const response = context.request({ type: 'ping' }, 15000, true);
   const settled = response.then(value => ({ value }), error => ({ error }));
   await settle();
   assert.equal(timers.size, 1);
-  const [firstID, first] = timers.entries().next().value;
+  const first = timers.values().next().value;
   assert.equal(first.ms, 15000);
-  timers.delete(firstID);
-  S.relayActivity++;
-  first.callback();
+  await advance(100);
+  S.relayActivityAt = now;
+  await advance(14900);
   assert.equal(S.pending.size, 1);
   assert.equal(timers.size, 1);
-  assert.equal(timers.values().next().value.ms, 15000);
-  const pending = S.pending.get(1);
-  S.pending.delete(1);
-  pending.resolve({ pong: true });
-  assert.deepEqual(await settled, { value: { pong: true } });
+  assert.equal(timers.values().next().value.at, 25100, 'do not grant a fresh 15-second timeout at the old deadline');
+  await advance(99);
+  assert.equal(S.pending.size, 1);
+  await advance(1);
+  assert.match((await settled).error.message, /daemon did not answer/);
+  assert.equal(S.pending.size, 0);
   assert.equal(timers.size, 0);
 
+  S.relayActivityAt = now;
   const idleResponse = context.request({ type: 'ping' }, 15000, true).then(
     value => ({ value }), error => ({ error }),
   );
   await settle();
-  const [idleID, idle] = timers.entries().next().value;
-  timers.delete(idleID);
-  idle.callback();
+  await advance(15000);
   assert.match((await idleResponse).error.message, /daemon did not answer/);
   assert.equal(S.pending.size, 0);
 });
 
 test('a replacement relay reauthenticates after daemon_online', async () => {
-  const sockets = [], controls = [];
+  const sockets = [], controls = [], badgeUpdates = [];
+  let now = 0, endpointDisposed = false;
+  const S = {
+    ws: { readyState: 1 }, local: false, daemonOnline: true, relayReady: true, channel: {}, room: 'room',
+    approvals: [{ id: 'stale-approval' }], questions: [{ id: 'stale-question' }], pendingQuestion: { id: 'stale-question' },
+    relayLink: { ws: null, endpoint: { dispose() { endpointDisposed = true; } } }, pending: new Map(),
+  };
+  S.relayLink.ws = S.ws;
   class FakeWebSocket {
-    constructor(url) { this.url = url; this.readyState = 1; this.sent = []; sockets.push(this); }
+    constructor(url) {
+      assert.equal(S.approvals.length, 0, 'replacement clears stale approvals before opening');
+      assert.equal(S.questions.length, 0, 'replacement clears stale questions before opening');
+      this.url = url; this.readyState = 1; this.sent = []; sockets.push(this);
+    }
     send(frame) { this.sent.push(JSON.parse(frame)); }
     close() {}
   }
@@ -137,37 +162,44 @@ test('a replacement relay reauthenticates after daemon_online', async () => {
     }
     dispose() { this.closed = true; }
   }
-  const S = {
-    local: false, daemonOnline: true, relayReady: true, channel: {}, room: 'room',
-    relayLink: { endpoint: { dispose() {} } }, pending: new Map(),
-    relayModule: { wireBytes: value => value.length, LIMITS: { plaintext: 1024 }, WireEndpoint: FakeWireEndpoint },
-  };
+  Object.assign(S, { relayModule: { wireBytes: value => value.length, LIMITS: { plaintext: 1024 }, WireEndpoint: FakeWireEndpoint } });
   const context = vm.createContext({
     S, location: { protocol: 'https:', host: 'relay.test' }, WebSocket: FakeWebSocket,
     FRAME_VERSION: 2, HANDSHAKE_MS: 8000, HANDSHAKE_TRIES: 3,
     crypto: { getRandomValues: value => { value.fill(7); return value; } },
-    bytesToB64: () => 'nonce', setTimeout: () => 1, clearTimeout() {},
+    bytesToB64: () => 'nonce', performance: { now: () => now }, setTimeout: () => 1, clearTimeout() {},
     $: () => ({ classList: { add() {}, remove() {} } }),
+    clearLiveState: () => { S.approvals = []; S.questions = []; S.pendingQuestion = null; badgeUpdates.push(S.approvals.length); },
     renderAll() {}, renderChrome() {}, renderHistory() {}, note() {},
   });
   vm.runInContext(fn('sendHello'), context);
   vm.runInContext(fn('startHandshake'), context);
+  vm.runInContext(fn('resetRelayConnection'), context);
   vm.runInContext(fn('openRelay'), context);
   context.openRelay();
+  assert.equal(endpointDisposed, true);
+  assert.deepEqual(badgeUpdates, [0]);
   assert.equal(S.daemonOnline, false, 'new socket starts offline until its daemon_online transition');
   const ws = sockets[0], generation = 'a'.repeat(32);
   const sendControl = value => ws.onmessage({ data: JSON.stringify({
     relay: 'control', g: generation, f: JSON.stringify(value),
   }) });
+  now = 1;
   sendControl({ relay: 'transport', v: 1, g: generation });
   await settle();
-  assert.equal(S.relayActivity, 1);
+  assert.equal(S.relayActivityAt, 1);
+  now = 2;
+  sendControl({ relay: 'daemon_offline' });
+  await settle();
+  assert.equal(S.approvals.length, 0);
+  assert.equal(S.questions.length, 0);
+  now = 3;
   sendControl({ relay: 'daemon_online' });
   await settle();
   assert.equal(S.daemonOnline, true);
   assert.equal(ws.sent.length, 1);
   assert.deepEqual(ws.sent[0], { v: 2, hello: 'nonce' }, 'new generation sends its authentication hello');
-  assert.equal(S.relayActivity, 2);
+  assert.equal(S.relayActivityAt, 3);
 });
 
 test('foreground resync failures are reported without an unhandled rejection', async () => {
@@ -180,11 +212,11 @@ test('foreground resync failures are reported without an unhandled rejection', a
   }
 });
 
-test('periodic relay heartbeat runs every 15 seconds with a 15-second no-progress timeout', async () => {
+test('periodic relay heartbeat runs every 10 seconds with a 15-second no-progress timeout', async () => {
   const h = relayHarness();
   let reject;
   h.setProbe(() => new Promise((_, fail) => { reject = fail; }));
-  assert.equal(h.context.interval.ms, 15000);
+  assert.equal(h.context.interval.ms, 10000);
   h.context.interval.callback();
   assert.equal(h.requests[0].type, 'ping');
   assert.equal(h.requests[0].timeout, 15000);

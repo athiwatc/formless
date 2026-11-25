@@ -1797,6 +1797,8 @@ pasting paths.
   runs it, `e` puts the arguments in the input to edit (Enter runs, Esc
   cancels), `s` skips, `a` runs the rest; the keys work while the input is
   empty. The web shows a banner with Run, Edit, Skip and Run the rest.
+  If a restored prompt only has a bounded arguments preview, the web disables
+  Edit with an explanation while keeping Run and Skip available.
 
 ### 5.10 Comparing models
 
@@ -5925,8 +5927,9 @@ during its snapshot fetch, deduplicated by message id.
 When a Relay browser returns to a visible page or comes back online, it probes
 the authenticated encrypted connection immediately and refreshes the selected
 Session (or all Sessions) from daemon state after success. While visible, it
-sends an encrypted health probe every 15 seconds and replaces an unresponsive
-socket after 15 seconds without a response or valid Relay transport progress,
+sends an encrypted health probe every 10 seconds and replaces an unresponsive
+socket after 15 seconds without a response or valid Relay transport progress
+(a quiet failure is detected within one probe interval plus that deadline),
 without waiting for a close event. The daemon retires a browser channel after
 five minutes without browser transport input; the Relay closes that channel
 with code 4002. Mobile platforms may suspend a hidden page and its probes long

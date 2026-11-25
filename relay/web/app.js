@@ -203,6 +203,7 @@
     relayModule: null,
     relayMemory: null, // shared across reconnects; old async consumers stay charged
     relayLink: null,
+    relayActivityAt: null,
     relayLocalProof: false,
     relayRoomReady: false,
     relayReady: false,
@@ -730,13 +731,14 @@
         }
       } catch (error) { return reject(error); }
       const timeout = timeoutMs || 30000;
-      let activity = S.relayActivity || 0;
+      const now = () => typeof performance !== "undefined" ? performance.now() : Date.now();
+      const startedAt = now();
       let timer;
       const onTimeout = () => {
-        const currentActivity = S.relayActivity || 0;
-        if (extendOnRelayActivity && currentActivity !== activity) {
-          activity = currentActivity;
-          timer = setTimeout(onTimeout, timeout);
+        const lastActivityAt = S.relayActivityAt ?? startedAt;
+        const remaining = timeout - (now() - lastActivityAt);
+        if (extendOnRelayActivity && remaining > 0) {
+          timer = setTimeout(onTimeout, Math.max(1, Math.ceil(remaining)));
           return;
         }
         S.pending.delete(id);
@@ -5806,18 +5808,26 @@
     box.classList.toggle("hidden", !st);
     if (!st) return box.replaceChildren();
     const decide = (action, args) => act({ type: "step_decision", step_id: st.step_id, action, arguments: args || null });
+    const canEdit = st.argumentsComplete !== false;
+    const editReason = tr("Full arguments are unavailable; this preview cannot be edited.");
     let pretty = st.arguments;
     try { pretty = JSON.stringify(JSON.parse(st.arguments), null, 2); } catch (_) {}
-    box.replaceChildren(
+    const content = [
       h("span", { class: "banner-text" }, "⏸ Step mode · about to call ", h("strong", null, st.tool_name), " (" + (st.index + 1) + " of " + st.count + ")",
         h("details", null, h("summary", null, "arguments"), h("pre", { class: "diff" }, pretty))),
       h("button", { class: "btn small primary", type: "button", onclick: () => decide("continue") }, tr("Run")),
-      h("button", { class: "btn small", type: "button", onclick: async () => {
+    ];
+    const edit = { class: "btn small", type: "button", onclick: async () => {
         const v = await ask({ title: "Edit the arguments for " + st.tool_name, inputKind: "machine", text: "JSON object", input: true, value: pretty });
         if (v != null) decide("edit", v);
-      } }, tr("Edit")),
+      } };
+    if (!canEdit) Object.assign(edit, { disabled: true, title: editReason });
+    content.push(h("button", edit, tr("Edit")));
+    if (!canEdit) content.push(h("span", { class: "muted step-edit-reason", role: "note" }, editReason));
+    content.push(
       h("button", { class: "btn small", type: "button", onclick: () => decide("skip") }, tr("Skip")),
       h("button", { class: "btn small", type: "button", onclick: () => { S.stepMode = false; decide("all"); } }, tr("Run the rest")));
+    box.replaceChildren(...content);
   }
 
   /** The agent's checklist (`update_plan`, SPEC §5.8), above the composer. */
@@ -8839,12 +8849,15 @@
       S.stepMode = !!r.step_mode;
       if (r.pending_steps && Array.isArray(r.pending_steps.prompts)) {
         const prompt = r.pending_steps.prompts[0];
+        const preview = prompt && typeof prompt.arguments_preview === "string" ? prompt.arguments_preview : "";
+        const sameStep = prompt && S.step && S.step.session_id === prompt.session_id && S.step.run_id === prompt.run_id &&
+          S.step.step_id === prompt.step_id && typeof S.step.arguments === "string" && S.step.argumentsComplete !== false;
+        const previewComplete = prompt && Number.isSafeInteger(prompt.arguments_bytes) &&
+          new TextEncoder().encode(preview).length === prompt.arguments_bytes;
         let step = prompt ? {
           ...prompt,
-          arguments: S.step && S.step.session_id === prompt.session_id && S.step.run_id === prompt.run_id &&
-            S.step.step_id === prompt.step_id && typeof S.step.arguments === "string"
-            ? S.step.arguments
-            : prompt.arguments_preview,
+          arguments: sameStep ? S.step.arguments : preview,
+          argumentsComplete: !!sameStep || !!previewComplete,
         } : null;
         for (const ev of snapshot.events) {
           if (ev.session_id !== id) continue;
@@ -10670,13 +10683,33 @@
     void flushOutbox();
     loadAll();
   }
+  function resetRelayConnection(ws, reason, disposeTransport = false) {
+    if (ws && S.ws !== ws) return false;
+    S.daemonOnline = false;
+    S.channel = null;
+    S.relayActivityAt = null;
+    clearTimeout(S.handshakeTimer);
+    if (disposeTransport) {
+      S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
+      if (S.relayLink && (!ws || S.relayLink.ws === ws)) {
+        S.relayLink.endpoint.dispose();
+        S.relayLink = null;
+      }
+    }
+    clearLiveState();
+    for (const p of S.pending.values()) p.reject(new Error(reason));
+    S.pending.clear();
+    return true;
+  }
   function openRelay() {
     S.local = false;
-    S.daemonOnline = false;
-    if (S.relayLink) S.relayLink.endpoint.dispose();
-    S.relayLink = null;
-    S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
-    S.channel = null;
+    if (S.ws || S.channel || S.relayLink || S.pending.size || S.daemonOnline) {
+      resetRelayConnection(S.ws, "relay connection replaced", true);
+    } else {
+      S.daemonOnline = false;
+      S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
+      S.channel = null;
+    }
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(proto + "//" + location.host + "/relay/" + S.room + "?role=client&transport=1");
     S.ws = ws;
@@ -10726,7 +10759,7 @@
         }
         const endpoint = S.relayLink.endpoint;
         endpoint.receive(frame);
-        if (!endpoint.closed) S.relayActivity = (S.relayActivity || 0) + 1;
+        if (!endpoint.closed) S.relayActivityAt = typeof performance !== "undefined" ? performance.now() : Date.now();
       } catch (_) { try { ws.close(1008, "relay transport failed"); } catch (_) {} }
     };
     async function onFrame(ws, frame) {
@@ -10737,11 +10770,7 @@
         S.daemonOnline = online;
         if (online && !was) startHandshake();
         if (!online && was) {
-          S.channel = null;
-          clearTimeout(S.handshakeTimer);
-          clearLiveState();
-          for (const p of S.pending.values()) p.reject(new Error("daemon went offline"));
-          S.pending.clear();
+          resetRelayConnection(ws, "daemon went offline");
           note("daemon went offline", true);
         }
         renderChrome();
@@ -10802,13 +10831,7 @@
         $("pair-error").textContent = "This browser was disconnected by the daemon. Connect again to rejoin.";
         showPair();
       }
-      S.daemonOnline = false;
-      S.channel = null;
-      S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
-      if (S.relayLink && S.relayLink.ws === ws) S.relayLink.endpoint.dispose();
-      clearLiveState();
-      for (const p of S.pending.values()) p.reject(new Error("relay connection closed"));
-      S.pending.clear();
+      resetRelayConnection(ws, "relay connection closed", true);
       if (!$("app").classList.contains("hidden")) renderAll();
       if (S.userClosed) return;
       // Reconnect with backoff; the relay and daemon are both stateless here.
@@ -10917,7 +10940,7 @@
     renderChrome();
   }
   setInterval(() => { if (S.reconnect) renderChrome(); }, 1000);
-  const RELAY_PROBE_INTERVAL_MS = 15000;
+  const RELAY_PROBE_INTERVAL_MS = 10000;
   const RELAY_PROBE_TIMEOUT_MS = 15000;
   let relayProbe = null;
   let relayResume = null;

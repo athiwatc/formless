@@ -49,7 +49,7 @@ async function browser(keyGate=null,decryptGate=null){
     $:id=>{if(!elements.has(id))elements.set(id,{textContent:'',classList:{add(){},remove(){},contains(){return true;}}});return elements.get(id);},
     setTimeout(){return 1;},clearTimeout(){},renderAll(){},renderChrome(){},renderHistory(){},clearLiveState(){},scheduleReconnect(){reconnects++;},note(){},markStable(){},restorePushSubscription(){},loadAll(){loaded++;},refreshOutbox(){},flushOutbox(){flushed++;},onMessage(message){messages.push(message);},
   });
-  vm.runInContext(['openRelay','finishRelayReady','startHandshake','sendHello','confirmTag','finishHandshake','bytesToB64','b64ToBytes','decrypt','pushRefused'].map(fn).join('\n'),c);
+  vm.runInContext(['openRelay','resetRelayConnection','finishRelayReady','startHandshake','sendHello','confirmTag','finishHandshake','bytesToB64','b64ToBytes','decrypt','pushRefused'].map(fn).join('\n'),c);
   S.key=await webcrypto.subtle.importKey('raw',new Uint8Array(32).fill(7),'HKDF',false,['deriveBits','deriveKey']);
   c.openRelay();const ws=S.ws;ws.onopen();
   const control=(body,receipt)=>ws.onmessage({data:JSON.stringify({relay:'control',g:generation,receipt,f:JSON.stringify(body)})});
