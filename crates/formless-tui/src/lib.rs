@@ -6063,6 +6063,7 @@ impl App {
         if matches!(
             &ev,
             Event::SettingsChanged
+                | Event::MainChatBackendChanged { .. }
                 | Event::RegistryChanged { .. }
                 | Event::SessionUpdated { .. }
                 | Event::MessageAppended { .. }
@@ -33094,6 +33095,20 @@ mod tests {
         f.confirmation_id = required.then(|| "preview-consent".into());
         f
     }
+    #[test]
+    fn backend_change_invalidates_the_draft_forecast() {
+        let mut app = test_app();
+        let generation = app.forecast_generation();
+        app.forecast.hint = Some(forecast_reply("previous backend", false));
+        app.forecast.approved = Some(generation.clone());
+        app.on_event(Event::MainChatBackendChanged {
+            backend: formless_protocol::MainChatBackend::Inherit,
+        });
+        assert_ne!(generation, app.forecast_generation());
+        assert!(app.forecast.hint.is_none());
+        assert!(app.forecast.approved.is_none());
+    }
+
     #[test]
     fn forecast_hint_debounces_and_rejects_stale_draft_model_session_and_files() {
         for change in 0..4 {
