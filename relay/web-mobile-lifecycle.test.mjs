@@ -9,7 +9,7 @@ const fn = name => {
   assert.ok(start >= 0, name);
   return source.slice(start, source.indexOf('\n  }', start) + 4);
 };
-const relayLifecycle = source.slice(source.indexOf('  const RELAY_PROBE_INTERVAL_MS'), source.indexOf('\n  function showPair()'));
+const relayLifecycle = source.slice(source.indexOf('  let localJsonSerializationSeq = 0;'), source.indexOf('\n  function showPair()'));
 const wakeLockStart = source.indexOf('  let wakeLockEnabled = false;');
 const wakeLockEnd = source.indexOf('\n\n  /** Step mode', wakeLockStart);
 const wakeLockLifecycle = source.slice(wakeLockStart, wakeLockEnd);
@@ -24,15 +24,22 @@ function relayHarness() {
   const navigator = { onLine: true };
   const context = vm.createContext({
     S, document, navigator,
+    Blob: class { constructor(parts, options) { this.parts = parts; this.options = options; } },
+    downloadBlob() {},
     setInterval: (callback, ms) => { context.interval = { callback, ms }; return 1; },
     request: (req, timeout) => { requests.push({ type: req.type, timeout }); return probe(); },
     openSession: async (...args) => opened.push(args), loadAll: async () => opened.push(['all']),
-    openRelay: () => { context.reconnects = (context.reconnects || 0) + 1; },
+    openRelay: () => {
+      context.reconnects = (context.reconnects || 0) + 1;
+      S.ws = { readyState: 0 };
+      S.channel = null;
+    },
     retryNow() { context.retries = (context.retries || 0) + 1; },
     note: (...args) => notes.push(args),
   });
   probe = () => Promise.resolve({});
   vm.runInContext(relayLifecycle, context);
+  vm.runInContext(fn('download'), context);
   return { context, S, document, navigator, ws, requests, opened, closes, notes, setProbe: value => { probe = value; } };
 }
 
@@ -49,14 +56,58 @@ test('foreground return probes the encrypted relay and reloads the current sessi
   assert.deepEqual(h.opened, [['session-1', true]]);
 });
 
-test('failed relay probe closes the zombie socket for reconnect before a user request times out', async () => {
+test('failed relay probe replaces the zombie socket without waiting for a close event', async () => {
   const h = relayHarness();
   h.setProbe(() => Promise.reject(new Error('probe timed out')));
   await h.context.resumeRelayAfterReturn();
+  assert.equal(h.context.reconnects, 1);
+  assert.notEqual(h.S.ws, h.ws);
+  assert.equal(h.S.channel, null);
   assert.equal(h.closes.length, 1);
   assert.equal(h.closes[0][0], 4003);
   assert.equal(h.opened.length, 0);
   assert.match(h.notes[0][0], /reconnecting/);
+});
+
+test('a stale failed probe cannot replace or close the newer relay socket', async () => {
+  const h = relayHarness();
+  let reject;
+  h.setProbe(() => new Promise((_, fail) => { reject = fail; }));
+  const recovery = h.context.resumeRelayAfterReturn();
+  const newerSocket = { readyState: 1 };
+  h.S.ws = newerSocket;
+  h.S.channel = {};
+  reject(new Error('probe timed out'));
+  await recovery;
+  assert.equal(h.context.reconnects || 0, 0);
+  assert.equal(h.closes.length, 0);
+});
+
+test('a ping timeout during local JSON export does not replace the healthy socket', async () => {
+  const h = relayHarness();
+  let reject;
+  h.setProbe(() => new Promise((_, fail) => { reject = fail; }));
+  const probe = h.context.probeRelay();
+  h.context.act = async () => ({
+    name: 'large export', format: 'json',
+    messages: { toJSON() { reject(new Error('probe reply was delayed during serialization')); return ['large export']; } },
+  });
+  h.context.slug = value => value.replaceAll(' ', '-');
+  vm.runInContext(fn('exportSession'), h.context);
+  await h.context.exportSession('session-1', 'json');
+  assert.equal(await probe, false);
+  assert.equal(h.context.reconnects || 0, 0);
+  assert.equal(h.closes.length, 0);
+});
+
+test('foreground resync failures are reported without an unhandled rejection', async () => {
+  for (const [session, method] of [['session-1', 'openSession'], [null, 'loadAll']]) {
+    const h = relayHarness();
+    h.S.current = session;
+    h.context[method] = async () => { throw new Error('snapshot failed'); };
+    await h.context.resumeRelayAfterReturn();
+    assert.match(h.notes.at(-1)[0], /Could not refresh the Session/);
+  }
 });
 
 test('periodic relay heartbeat runs every 15 seconds with a five-second dead-connection timeout', async () => {
@@ -69,6 +120,7 @@ test('periodic relay heartbeat runs every 15 seconds with a five-second dead-con
   assert.equal(h.requests[0].timeout, 5000);
   reject(new Error('timeout'));
   await settle();
+  assert.equal(h.context.reconnects, 1);
   assert.equal(h.closes[0][0], 4003);
 });
 

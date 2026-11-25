@@ -1088,7 +1088,9 @@
     return caps.map((c) => h("span", { class: "tag" + (isBroad(c) ? " broad" : ""), title: isBroad(c) ? "broad access: " + broadWhy(c) : null }, c));
   }
   function download(name, value) {
-    downloadBlob(name, new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
+    const serialized = JSON.stringify(value, null, 2);
+    if (relayProbe) localJsonSerializationSeq++;
+    downloadBlob(name, new Blob([serialized], { type: "application/json" }));
   }
   function downloadBlob(name, blob) {
     const a = h("a", { href: URL.createObjectURL(blob), download: name });
@@ -10881,6 +10883,7 @@
     renderChrome();
   }
   setInterval(() => { if (S.reconnect) renderChrome(); }, 1000);
+  let localJsonSerializationSeq = 0;
   const RELAY_PROBE_INTERVAL_MS = 15000;
   const RELAY_PROBE_TIMEOUT_MS = 5000;
   let relayProbe = null;
@@ -10889,13 +10892,21 @@
     if (!S.channel || S.local || !S.relayReady || S.userClosed || S.ws?.readyState !== 1 || navigator.onLine === false) return Promise.resolve(false);
     if (relayProbe) return relayProbe;
     const ws = S.ws, channel = S.channel;
+    const serializationSeq = localJsonSerializationSeq;
     relayProbe = request({ type: "ping" }, RELAY_PROBE_TIMEOUT_MS)
       .then(() => S.ws === ws && S.channel === channel)
       .catch(() => {
-        if (S.ws === ws && S.channel === channel && ws.readyState === 1) {
-          note("relay probe failed; reconnecting", true);
-          try { ws.close(4003, "heartbeat timeout"); } catch (_) {}
+        if (S.ws !== ws || S.channel !== channel) return false;
+        if (localJsonSerializationSeq !== serializationSeq) return false;
+        note("relay probe failed; reconnecting", true);
+        try { openRelay(); }
+        catch (error) {
+          note("Could not replace the relay connection: " + error.message, true);
+          if (S.ws === ws && !S.reconnect) scheduleReconnect(() => {
+            if (!S.userClosed && S.ws === ws) openRelay();
+          });
         }
+        try { if (ws.readyState === 1) ws.close(4003, "heartbeat timeout"); } catch (_) {}
         return false;
       })
       .finally(() => { relayProbe = null; });
@@ -10911,7 +10922,9 @@
       if (!await probeRelay() || S.ws !== ws || S.channel !== channel || document.hidden || S.current !== session) return;
       if (session) await openSession(session, true);
       else await loadAll();
-    })().finally(() => { relayResume = null; });
+    })()
+      .catch(error => { note("Could not refresh the Session after returning: " + error.message, true); })
+      .finally(() => { relayResume = null; });
     return relayResume;
   }
   setInterval(() => {
