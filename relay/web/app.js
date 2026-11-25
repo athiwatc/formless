@@ -4392,12 +4392,13 @@
   function modelDetail(m, t) {
     const parts = [];
     m = m || {};
+    const inferred = (field) => Array.isArray(m.inferred) && m.inferred.includes(field);
     const context = modelContextLabel(m.context);
     if (context !== null) parts.push(context);
     if (m.input_price != null && m.output_price != null) parts.push(uiMoney(m.input_price, null) + "/" + uiMoney(m.output_price, null) + " per M");
-    if (m.vision) parts.push("vision");
-    if (m.tools === true) parts.push("tools");
-    if (m.tools === false) parts.push("no tools");
+    if (typeof m.vision === "boolean") parts.push((inferred("vision") ? "~" : "") + (m.vision ? "vision" : "no vision"));
+    if (typeof m.tools === "boolean") parts.push((inferred("tools") ? "~" : "") + (m.tools ? "tools" : "no tools"));
+    if (inferred("efforts")) parts.push(Array.isArray(m.efforts) && m.efforts.length === 0 ? "~no effort effect" : "~effort choices");
     if (t) parts.push(t.ok ? "✓ tested" : t.transient === true ? "✗ temporary test failure (use Test to retry)" : "✗ test failed");
     return parts.join(" · ");
   }
@@ -4425,13 +4426,16 @@
       role: "combobox", "aria-autocomplete": "list", "aria-controls": list.id, "aria-expanded": "false" });
     const effort = h("select", { "aria-label": "Reasoning effort" },
       efforts.map((e) => h("option", { value: e }, e || "default (provider)")));
-    effort.value = (session && session.reasoning_effort) || "";
+    let preferredEffort = (session && session.reasoning_effort) || "";
+    effort.value = preferredEffort;
+    effort.onchange = () => { preferredEffort = effort.value; };
     const status = h("span", { class: "muted" }, "loading models…");
     const cancel = h("button", { class: "btn small", type: "button" }, "Cancel");
     const asDefault = h("button", { class: "btn small", type: "button", title: "Ctrl/⌘+Enter" }, "Set as default");
     const apply = h("button", { class: "btn small primary", type: "button", title: "Enter" }, selectionOnly ? "Retry" : "Use in this Session");
     const test = h("button", { class: "btn small", type: "button", title: "Latency, streaming, reasoning and tool calls" }, "Test");
     let meta = {}, tests = {};
+    let preferredEffortModel = model;
     const title = selectionOnly ? "Retry with a model" : "Model";
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": title },
       h("div", { class: "modal picker" },
@@ -4478,11 +4482,22 @@
         input.removeAttribute("aria-activedescendant");
       }
       // Only the efforts the highlighted model accepts (SPEC §4.2).
-      const accepted = (meta[choice()] || {}).efforts;
-      const offer = Array.isArray(accepted) ? [""].concat(["minimal", "low", "medium", "high"].filter((e) => accepted.includes(e))) : efforts;
-      const was = effort.value;
+      const selectedModel = choice();
+      if (selectedModel && selectedModel !== preferredEffortModel) {
+        preferredEffort = "";
+        preferredEffortModel = selectedModel;
+        effort.value = "";
+      }
+      const accepted = (meta[selectedModel] || {}).efforts;
+      const offer = Array.isArray(accepted)
+        ? [""].concat([...new Set(accepted.filter((e) => typeof e === "string" && e !== ""))])
+        : efforts.slice();
+      const was = effort.value || preferredEffort;
+      if (!Array.isArray(accepted) && selectedModel === model && was && !offer.includes(was)) offer.push(was);
       effort.replaceChildren(...offer.map((e) => h("option", { value: e }, e || "default (provider)")));
       effort.value = offer.includes(was) ? was : "";
+      if (Array.isArray(accepted) && !offer.includes(was)) preferredEffort = "";
+      else if (effort.value) preferredEffort = effort.value;
       effort.disabled = offer.length <= 1;
       effort.title = offer.length <= 1 ? "Effort has no effect for this model" : "";
       if (!items.length) return;
@@ -11033,9 +11048,10 @@
   });
   document.addEventListener("click", (e) => {
     if (popover && !popover.contains(e.target)) closePopover();
-    // A modal click belongs to that layer, including a button that removed
-    // its dialog before this event bubbled. Do not dismiss background drawers.
-    if (e.composedPath().some((node) => node instanceof Element && node.classList.contains("backdrop"))) return;
+    // Modal and notification clicks belong to their own layers, including a
+    // button that removes its layer before bubbling. Leave the drawer alone.
+    if (e.composedPath().some((node) => node instanceof Element &&
+        (node.classList.contains("backdrop") || node.id === "toasts"))) return;
     const sb = $("sidebar");
     if (sb.classList.contains("open") && !sb.contains(e.target) && e.target !== $("menu-btn")) closeSidebar();
   });

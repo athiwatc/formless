@@ -12,7 +12,10 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 const BEGIN: &str = "PRIVATE_DOCTOR_STDOUT_BEGIN\n";
@@ -39,6 +42,21 @@ impl Drop for OwnedChild {
         let _ = self.0.wait();
     }
 }
+
+#[derive(Clone)]
+struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     paths: Paths,
@@ -261,6 +279,152 @@ fn doctor_child_fixture() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn config_edit_warns_about_unknown_config_keys() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new();
+    let editor = f.root.join("editor.sh");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\nprintf '%s\\n' '[provider]' 'model = \"fixture\"' 'modle = \"fixture\"' > \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let argv = ["formless", "--profile", "p", "config", "edit"];
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args([
+        "--exact",
+        "cli_doctor_tests::config_edit_child_fixture",
+        "--ignored",
+        "--nocapture",
+    ]);
+    for (key, _) in std::env::vars_os() {
+        let key_text = key.to_string_lossy().to_ascii_uppercase();
+        if [
+            "FORMLESS_",
+            "OPENAI_",
+            "ANTHROPIC_",
+            "GROK_",
+            "GOOGLE_",
+            "GEMINI_",
+        ]
+        .iter()
+        .any(|prefix| key_text.starts_with(prefix))
+            || key_text.contains("API_KEY")
+            || key_text.contains("OAUTH")
+        {
+            command.env_remove(key);
+        }
+    }
+    let output = command
+        .current_dir(&f.root)
+        .env("FORMLESS_DATA_DIR", f.root.join("d"))
+        .env("FORMLESS_CONFIG_DIR", f.root.join("c"))
+        .env(
+            "FORMLESS_TEST_CONFIG_EDIT_ARGS",
+            serde_json::to_string(&argv).unwrap(),
+        )
+        .env("EDITOR", &editor)
+        .env_remove("VISUAL")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .contains("unknown configuration key 'provider.modle'; did you mean 'provider.model'?"),
+        "{stderr}"
+    );
+    assert!(std::fs::read_to_string(f.paths.config_file())
+        .unwrap()
+        .contains("modle = \"fixture\""));
+}
+
+#[test]
+fn daemon_startup_logs_unknown_config_keys() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "cli_doctor_tests::daemon_startup_log_child_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "owned config-edit subprocess fixture"]
+fn config_edit_child_fixture() {
+    let _env = super::oauth_credential_env::EnvGuard::isolated();
+    let argv: Vec<String> = serde_json::from_str(
+        &std::env::var("FORMLESS_TEST_CONFIG_EDIT_ARGS")
+            .expect("owned config-edit parent arguments"),
+    )
+    .unwrap();
+    let cli = Cli::try_parse_from(argv).unwrap();
+    super::run_cli(cli).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "owned daemon-startup subprocess fixture"]
+async fn daemon_startup_log_child_fixture() {
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let env = super::oauth_credential_env::EnvGuard::isolated();
+    for key in [
+        "FORMLESS_BASE_URL",
+        "FORMLESS_MODEL",
+        "FORMLESS_IDLE_GRACE_SECS",
+        "FORMLESS_SECURE",
+    ] {
+        env.remove(key);
+    }
+    let f = Fixture::new();
+    let mut config = Config::load_file_only(&f.paths).unwrap();
+    config.provider.model.clear();
+    config.save(&f.paths).unwrap();
+    let file = f.paths.config_file();
+    let original = std::fs::read_to_string(&file).unwrap();
+    let edited = original.replacen("[provider]\n", "[provider]\nmodle = \"gpt-5\"\n", 1);
+    assert_ne!(original, edited);
+    std::fs::write(&file, edited).unwrap();
+
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let writer = logs.clone();
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+        .with_writer(move || SharedLogWriter(writer.clone()))
+        .finish()
+        .try_init()
+        .unwrap();
+    let daemon = formless_core::daemon::Daemon::new(f.paths.clone()).unwrap();
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("unknown configuration key 'provider.modle'; did you mean 'provider.model'?"),
+        "{logs}"
+    );
+    drop(daemon);
+    f.assert_no_provider_calls();
+}
+
 #[test]
 fn doctor_reports_unknown_role_providers_without_changing_configuration() {
     use formless_core::config::{ProviderCfg, RoleCfg};
@@ -332,6 +496,50 @@ fn doctor_reports_unknown_role_providers_without_changing_configuration() {
         !f.paths.lock_file().exists(),
         "doctor must not publish a PID"
     );
+    f.assert_no_provider_calls();
+}
+
+#[test]
+fn doctor_reports_unknown_config_keys_and_suggestions() {
+    let f = Fixture::new();
+    let mut config = Config::load_file_only(&f.paths).unwrap();
+    config.provider.model.clear();
+    config.save(&f.paths).unwrap();
+    let file = f.paths.config_file();
+    let original = std::fs::read_to_string(&file).unwrap();
+    let edited = original.replacen("[provider]\n", "[provider]\nmodle = \"gpt-5\"\n", 1);
+    assert_ne!(original, edited);
+    std::fs::write(&file, &edited).unwrap();
+
+    let json = f.run("p", &["doctor", "--json"]);
+    assert_eq!(
+        json.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let value: Value = serde_json::from_slice(&json.stdout).unwrap();
+    let problems: Vec<_> = value["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|problem| {
+            problem["what"]
+                .as_str()
+                .is_some_and(|what| what.contains("unknown configuration key"))
+        })
+        .collect();
+    assert_eq!(problems.len(), 1, "{value}");
+    assert!(problems[0]["what"]
+        .as_str()
+        .unwrap()
+        .contains("did you mean 'provider.model'?"));
+    let next = problems[0]["next"].as_str().unwrap();
+    assert!(
+        next.starts_with("review ") && next.ends_with(".toml"),
+        "{next}"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), edited);
     f.assert_no_provider_calls();
 }
 

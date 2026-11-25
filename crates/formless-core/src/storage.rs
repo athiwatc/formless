@@ -66,6 +66,7 @@ pub use runfile_storage::{
 
 #[path = "run_state_storage.rs"]
 mod run_state_storage;
+pub(crate) use run_state_storage::portable_plan;
 
 #[path = "topic_storage.rs"]
 mod topic_storage;
@@ -964,7 +965,7 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 80;
+pub const SCHEMA_VERSION: i64 = 82;
 
 #[path = "topic_context.rs"]
 mod topic_context;
@@ -1254,8 +1255,25 @@ fn migrate_v80(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v81(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS imported_session_bundles (
+           fingerprint TEXT PRIMARY KEY,
+           session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_imported_session_bundles_session
+           ON imported_session_bundles(session_id);",
+    )?;
+    Ok(())
+}
+
+fn migrate_v82(conn: &Connection) -> Result<()> {
+    add_column(conn, "jobs", "source_session_id TEXT")?;
+    Ok(())
+}
+
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 78] = [
+const MIGRATIONS: [(i64, MigrationStep); 80] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1622,6 +1640,8 @@ const MIGRATIONS: [(i64, MigrationStep); 78] = [
     }),
     (79, |c| Ok(c.execute_batch(SCHEMA_V79)?)),
     (80, migrate_v80),
+    (81, migrate_v81),
+    (82, migrate_v82),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -2964,6 +2984,32 @@ impl Store {
         self.get_session(&s.id).map(|o| o.unwrap_or(s))
     }
 
+    pub(crate) fn imported_session_for_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT session_id FROM imported_session_bundles WHERE fingerprint=?1",
+                params![fingerprint],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn remember_imported_session_fingerprint(
+        &self,
+        fingerprint: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        self.ex(
+            "INSERT OR IGNORE INTO imported_session_bundles(fingerprint,session_id) VALUES(?1,?2)",
+            params![fingerprint, session_id],
+        )?;
+        Ok(())
+    }
+
     /// Fork a session: copy its messages (optionally only up to `up_to_seq`)
     /// and checkpoints into a new independent session.
     pub fn fork_session(
@@ -3547,6 +3593,7 @@ impl Store {
             id: r.get("id")?,
             prompt: r.get("prompt")?,
             session_id: r.get("session_id")?,
+            source_session_id: r.get("source_session_id")?,
             cron: r.get("cron")?,
             next_run: r.get("next_run")?,
             last_run: r.get("last_run")?,
@@ -3578,6 +3625,14 @@ impl Store {
             let d = (!empty).then(|| d.to_string());
             self.ex("UPDATE jobs SET deliver=?2 WHERE id=?1", params![id, d])?;
         }
+        Ok(())
+    }
+
+    pub fn set_job_source_session_id(&self, id: &str, source_session_id: &str) -> Result<()> {
+        self.ex(
+            "UPDATE jobs SET source_session_id=?2 WHERE id=?1",
+            params![id, source_session_id],
+        )?;
         Ok(())
     }
 
@@ -8975,7 +9030,7 @@ impl ContextCache {
 
 /// An imported transcript carries data, never local attachment authority.
 /// Fork copies use a separate trusted path and retain their recorded lineage.
-fn sanitize_imported_message_meta(meta: Option<&str>) -> Option<String> {
+pub(crate) fn sanitize_imported_message_meta(meta: Option<&str>) -> Option<String> {
     let raw = meta?;
     let Ok(mut value) = serde_json::from_str::<Value>(raw) else {
         return Some(raw.into());
