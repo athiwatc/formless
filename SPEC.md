@@ -5607,6 +5607,9 @@ previous headless Run's Session.
   with no daemon or profile needed. `scripts/install.sh` writes bash, zsh
   and fish completions under `$PREFIX/share`, and the Homebrew formula
   installs them with `generate_completions_from_executable`.
+  Fish completions also suggest `docs` topics while the optional topic
+  argument is unfilled; a supplied topic stops those suggestions. `--print`
+  and `--text` may accompany a topic, but `--keys` may not.
 - The man page, `formless.1`, is generated from the same definitions
   (clap_mangen) by a hidden `formless man`. Releases put it in each Unix
   tarball. `scripts/install.sh` installs it to `$PREFIX/share/man/man1`, and
