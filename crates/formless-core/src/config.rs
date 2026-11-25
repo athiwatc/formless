@@ -1149,7 +1149,7 @@ pub struct ProviderCfg {
     pub model_context_tokens: HashMap<String, u32>,
     /// Per-model corrections to endpoint- and family-derived metadata.
     #[serde(default)]
-    pub model_meta: HashMap<String, ModelMetaCfg>,
+    pub model_meta: Box<HashMap<String, ModelMetaCfg>>,
     pub max_retries: usize,
     /// "chat" (Chat Completions, default) or "responses" (Responses API).
     #[serde(default = "default_api_style")]
@@ -1304,7 +1304,7 @@ impl Default for ProviderCfg {
             reasoning_effort: None,
             context_tokens: 128_000,
             model_context_tokens: HashMap::new(),
-            model_meta: HashMap::new(),
+            model_meta: Box::new(HashMap::new()),
             max_retries: 5,
             api_style: default_api_style(),
             tool_mode: default_tool_mode(),

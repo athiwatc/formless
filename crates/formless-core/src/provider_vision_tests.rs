@@ -77,7 +77,7 @@ fn explicit_vision_overrides_and_prompt_tool_policy_are_retained() {
 fn per_model_vision_corrections_precede_global_and_family_defaults() {
     let cfg = ProviderCfg {
         vision: Some(true),
-        model_meta: HashMap::from([
+        model_meta: Box::new(HashMap::from([
             (
                 "gpt-5".into(),
                 crate::config::ModelMetaCfg {
@@ -92,7 +92,7 @@ fn per_model_vision_corrections_precede_global_and_family_defaults() {
                     ..Default::default()
                 },
             ),
-        ]),
+        ])),
         ..Default::default()
     };
     let provider = Provider::new(cfg, "fixture-key".into()).unwrap();
