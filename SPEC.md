@@ -1386,7 +1386,9 @@ pasting paths.
   control in the active view if the original element disappeared. Nested
   dialogs restore the dialog underneath before returning to the page.
   Live feedback stays non-inert and above every dialog; its actions support
-  pointer and keyboard activation. Recovery after removed or state-hidden
+  pointer and keyboard activation. Interacting with a live notification,
+  including dismissing it, leaves an open mobile Session drawer open.
+  Recovery after removed or state-hidden
   controls is coalesced to a frame, without layout probes on normal streamed
   paints. Hover-only hiding and deliberate pointer click-away do not move focus.
   Escape and backdrop clicks use the dialog's existing cancellation or
@@ -5619,6 +5621,9 @@ previous headless Run's Session.
   with no daemon or profile needed. `scripts/install.sh` writes bash, zsh
   and fish completions under `$PREFIX/share`, and the Homebrew formula
   installs them with `generate_completions_from_executable`.
+  Fish completions also suggest `docs` topics while the optional topic
+  argument is unfilled; a supplied topic stops those suggestions. `--print`
+  and `--text` may accompany a topic, but `--keys` may not.
 - The man page, `formless.1`, is generated from the same definitions
   (clap_mangen) by a hidden `formless man`. Releases put it in each Unix
   tarball. `scripts/install.sh` installs it to `$PREFIX/share/man/man1`, and
@@ -6120,6 +6125,9 @@ during its snapshot fetch, deduplicated by message id.
   governed by the existing "Stay paired after reloading this tab" choice;
   sharing does not persist a new key.
   **Notifications (Web Push, opt-in per device):**
+  - Browser permission is requested only by an explicit Settings → This
+    browser action, never by sending a chat message; existing granted and
+    denied browser decisions are respected.
   - Settings → This browser subscribes with the relay's VAPID key
     (`GET /push/key`) and sends `{"relay":"push_subscribe","sub"}` to the
     room in the clear; a subscription is not Session data. "Turn off"

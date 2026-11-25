@@ -4470,10 +4470,7 @@ impl Daemon {
                 Ok(serde_json::to_value(imported)?)
             }
             Request::StorageUsage => {
-                let mut u = self.with_reader(|st| crate::housekeeping::usage(&self.paths, st))?;
-                u["last_backup"] = json!(crate::housekeeping::last_backup(&self.paths)
-                    .map(|(f, _)| f.display().to_string()));
-                Ok(u)
+                self.with_reader(|st| crate::housekeeping::storage_usage(&self.paths, st))
             }
             Request::Gc { dry_run } => {
                 let cfg = self.config()?;
