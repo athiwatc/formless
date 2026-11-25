@@ -284,6 +284,18 @@ async fn main_chat_backend_selected_provider_survives_restart_and_does_not_redir
         daemon.handle(Request::GetMainChatBackend).await.unwrap(),
         json!(backend)
     );
+    let inventory: MainChatBackends =
+        serde_json::from_value(daemon.handle(Request::ListMainChatBackends).await.unwrap())
+            .unwrap();
+    assert_eq!(inventory.selected, backend);
+    assert!(inventory
+        .providers
+        .iter()
+        .any(|provider| provider.name == "alternate" && provider.model == "served"));
+    assert!(inventory
+        .harnesses
+        .iter()
+        .any(|harness| harness.kind == HarnessKind::Claude));
     let quote = daemon
         .handle(Request::ForecastRun {
             input: ForecastInput {

@@ -84,6 +84,25 @@ pub struct MainChatBackends {
     pub harnesses: Vec<HarnessAvailability>,
 }
 
+#[cfg(test)]
+mod main_chat_backend_wire_tests {
+    use super::*;
+
+    #[test]
+    fn main_chat_backend_requests_round_trip() {
+        for wire in [
+            serde_json::json!({"type":"get_main_chat_backend"}),
+            serde_json::json!({"type":"list_main_chat_backends"}),
+            serde_json::json!({"type":"set_main_chat_backend","backend":{"kind":"inherit"}}),
+            serde_json::json!({"type":"set_main_chat_backend","backend":{"kind":"provider","name":"local","model":"model","effort":"high"}}),
+            serde_json::json!({"type":"set_main_chat_backend","backend":{"kind":"harness","harness":"acp","acp_agent":"gemini"}}),
+        ] {
+            let request: Request = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), wire);
+        }
+    }
+}
+
 impl MainChatBackend {
     pub fn label(&self) -> String {
         match self {
