@@ -1386,7 +1386,9 @@ pasting paths.
   control in the active view if the original element disappeared. Nested
   dialogs restore the dialog underneath before returning to the page.
   Live feedback stays non-inert and above every dialog; its actions support
-  pointer and keyboard activation. Recovery after removed or state-hidden
+  pointer and keyboard activation. Interacting with a live notification,
+  including dismissing it, leaves an open mobile Session drawer open.
+  Recovery after removed or state-hidden
   controls is coalesced to a frame, without layout probes on normal streamed
   paints. Hover-only hiding and deliberate pointer click-away do not move focus.
   Escape and backdrop clicks use the dialog's existing cancellation or
