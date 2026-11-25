@@ -107,7 +107,7 @@ where
     } else {
         writeln!(output, "Available models:")?;
         for (index, model) in models.iter().enumerate() {
-            writeln!(output, "  {}. {model}", index + 1)?;
+            writeln!(output, "  {}. {}", index + 1, crate::table::cell_text(model))?;
         }
     }
     let selection = prompt_line(
@@ -118,7 +118,7 @@ where
     let model = select_model(&selection, &models, &preset.default_model)?;
     cfg.provider.model = model.clone();
 
-    writeln!(output, "Probing {model}...")?;
+    writeln!(output, "Probing {}...", crate::table::cell_text(&model))?;
     let verdict = match probe(&cfg.provider, &api_key, &model) {
         Ok(verdict) if verdict.tool_calling => verdict,
         Ok(_) => {
@@ -129,7 +129,11 @@ where
             bail!("setup was not saved because the model cannot run agent Tools");
         }
         Err(error) => {
-            writeln!(output, "Probe verdict: failed ({error:#}).")?;
+            writeln!(
+                output,
+                "Probe verdict: failed ({}).",
+                crate::table::cell_text(&format!("{error:#}"))
+            )?;
             bail!("setup was not saved");
         }
     };
@@ -331,5 +335,33 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Probe verdict: failed (fixture probe failure)"));
         assert!(!output.contains("private-setup-test-key"));
+    }
+
+    #[test]
+    fn model_listing_escapes_terminal_control_sequences() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths::from_dirs(root.path().join("data"), root.path().join("config"))
+            .unwrap()
+            .named("setup-control-test")
+            .unwrap();
+        let mut input = io::Cursor::new(b"1\nprivate-setup-test-key\n1\n".to_vec());
+        let mut output = Vec::new();
+        let malicious = "spoof\u{1b}[2J\n2. fake\u{202e}";
+
+        let result = run_with(
+            &paths,
+            &mut input,
+            &mut output,
+            prompt_line,
+            |_, _| Ok(vec![malicious.into()]),
+            |_, _, _| Err(anyhow::anyhow!("bad\u{1b}[31merr")),
+        );
+
+        assert!(result.is_err());
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains('\u{1b}'), "{output:?}");
+        assert!(!output.contains('\u{202e}'), "{output:?}");
+        assert!(output.contains("\\u{1b}[2J"), "{output:?}");
+        assert!(output.contains("\\u{202e}"), "{output:?}");
     }
 }
