@@ -49,6 +49,8 @@ jobs:
       - name: GUI-free model and transport tests
         run: cargo test --no-default-features --lib --locked
       - name: Private daemon and fake provider integration
+        env:
+          RUST_MIN_STACK: '8388608'
         run: cargo test --no-default-features --features daemon-tests --test daemon --locked
       - name: Native build
         run: cargo build --locked
