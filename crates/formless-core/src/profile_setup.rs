@@ -12,10 +12,24 @@ pub fn save_verified_provider(
     if prompt_fallback {
         cfg.provider.tool_mode = "prompt".into();
     }
-    if let Some(key) = api_key {
-        config::save_api_key(paths, key)?;
+    let had_configured_provider =
+        Config::load_file_only(paths).is_ok_and(|existing| existing.provider.is_configured());
+    if had_configured_provider {
+        cfg.save(paths)?;
+        if let Some(key) = api_key {
+            config::save_api_key(paths, key)?;
+        }
+    } else {
+        if let Some(key) = api_key {
+            config::save_api_key(paths, key)?;
+        }
+        if let Err(err) = cfg.save(paths) {
+            if api_key.is_some() {
+                config::delete_api_key(paths);
+            }
+            return Err(err);
+        }
     }
-    cfg.save(paths)?;
     Ok(())
 }
 
