@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from urllib.parse import urlencode
 
 
@@ -136,16 +137,24 @@ def merge(repo, run):
 
 
 def merge_pr(repo, pr, sha):
-    details = api(f"repos/{repo}/pulls/{pr}")
+    for attempt in range(5):
+        details = api(f"repos/{repo}/pulls/{pr}")
+        if (
+            details["head"]["sha"] != sha
+            or (details["head"]["repo"] or {}).get("full_name") != repo
+            or details["base"]["ref"] != "main"
+            or details["state"] != "open"
+            or details["draft"]
+            or not 0 < details["changed_files"] <= 300
+        ):
+            return
+        if details["mergeable"] is not None:
+            break
+        if attempt < 4:
+            time.sleep(2)
     if (
-        details["head"]["sha"] != sha
-        or (details["head"]["repo"] or {}).get("full_name") != repo
-        or details["base"]["ref"] != "main"
-        or details["state"] != "open"
-        or details["draft"]
-        or details["mergeable"] is not True
+        details["mergeable"] is not True
         or details["mergeable_state"] not in {"clean", "unstable"}
-        or not 0 < details["changed_files"] <= 300
     ):
         return
     pages = api(f"repos/{repo}/pulls/{pr}/files", True, per_page=100)

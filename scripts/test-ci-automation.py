@@ -201,6 +201,19 @@ class AutomationTests(unittest.TestCase):
         automation.merge(REPO, self.run)
         self.gh.assert_not_called()
 
+    def test_ready_for_review_waits_for_mergeability(self):
+        event = {"action": "ready_for_review", "pull_request": copy.deepcopy(self.pr)}
+        self.payloads["pulls/42"] = {**self.pr, "mergeable": None}
+
+        def finish_mergeability(_):
+            self.payloads["pulls/42"] = self.pr
+
+        with patch.object(automation.time, "sleep", side_effect=finish_mergeability) as wait:
+            automation.dispatch("merge", REPO, event)
+
+        wait.assert_called_once_with(2)
+        self.assert_merge()
+
     def test_draft_conflicted_stale_or_fork_prs_never_merge(self):
         for change in (
             {"mergeable": None},
@@ -213,7 +226,9 @@ class AutomationTests(unittest.TestCase):
         ):
             with self.subTest(change=change):
                 self.payloads["pulls/42"] = {**self.pr, **change}
-                automation.merge(REPO, self.run)
+                with patch.object(automation.time, "sleep") as wait:
+                    automation.merge(REPO, self.run)
+                self.assertEqual(wait.call_count, 4 if change == {"mergeable": None} else 0)
                 self.gh.assert_not_called()
 
 
