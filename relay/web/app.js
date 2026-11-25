@@ -9704,6 +9704,7 @@
           if (/^.+:\+?[0-9]+$/.test(path) || !/^no file/.test(error.message)) {
             note("cannot attach @" + path + ": " + error.message, true);
             if (S.daemonOnline && !/^no file/.test(error.message)) {
+              if (fresh.length) break;
               saveCurrentDraft(text);
               return;
             }
