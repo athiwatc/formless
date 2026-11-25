@@ -2657,7 +2657,7 @@
     }
     if (channel !== S.channel || S.current !== S.mainChat?.id) return;
     const choices = [{ kind: "inherit" }];
-    const select = h("select", { "aria-label": "Main Chat backend" }, h("option", { value: "0" }, mainBackendLabel(choices[0])));
+    const select = h("select", { class: "main-backend-select", "aria-label": "Main Chat backend" }, h("option", { value: "0" }, mainBackendLabel(choices[0])));
     const add = (backend, detail) => {
       const index = choices.push(backend) - 1;
       select.append(h("option", { value: String(index) }, mainBackendLabel(backend) + " — " + detail));
