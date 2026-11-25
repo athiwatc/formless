@@ -5,6 +5,10 @@
 //! user enables it.
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+use std::collections::HashSet;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::{Paths, Store};
@@ -21,71 +25,94 @@ pub struct SkillMeta {
     pub body: String,
 }
 
-// Decode one complete quoted scalar. Literal quote fragments in the
-// permissive Skill metadata format remain text instead of losing characters.
-fn quoted_scalar(value: &str) -> Option<String> {
-    if value.starts_with('"') {
-        return serde_json::from_str::<String>(value).ok();
-    }
-    let inner = value.strip_prefix('\'')?.strip_suffix('\'')?;
-    let mut chars = inner.chars();
-    let mut decoded = String::new();
-    while let Some(c) = chars.next() {
-        if c == '\'' && chars.next() != Some('\'') {
-            return None;
+#[derive(Default)]
+struct SkillFrontmatter {
+    name: Option<String>,
+    description: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for SkillFrontmatter {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldsVisitor;
+
+        impl<'de> Visitor<'de> for FieldsVisitor {
+            type Value = SkillFrontmatter;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a YAML mapping of skill frontmatter fields")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut fields = SkillFrontmatter::default();
+                let mut seen = HashSet::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !seen.insert(key.clone()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate frontmatter key '{key}'"
+                        )));
+                    }
+                    match key.as_str() {
+                        "name" => fields.name = Some(map.next_value()?),
+                        "description" => fields.description = Some(map.next_value()?),
+                        _ => {
+                            let _: IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(fields)
+            }
         }
-        decoded.push(c);
+
+        deserializer.deserialize_map(FieldsVisitor)
     }
-    Some(decoded)
 }
 
 /// Parse `SKILL.md`: `---` frontmatter with `name` and `description`
-/// (plain, quoted, or folded `>`/`|` values), then the body.
+/// (YAML strings), then the body.
 pub fn parse_skill_md(text: &str) -> Result<SkillMeta> {
     let text = text.trim_start_matches('\u{feff}');
-    let rest = text
-        .strip_prefix("---")
-        .context("SKILL.md must start with --- frontmatter")?;
-    let end = rest
-        .find("\n---")
-        .context("SKILL.md frontmatter is not closed with ---")?;
-    let (front, body) = (&rest[..end], &rest[end + 4..]);
-    let mut fields = std::collections::HashMap::new();
-    let lines: Vec<&str> = front.lines().collect();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        i += 1;
-        if line.starts_with(char::is_whitespace)
-            || line.trim().is_empty()
-            || line.trim_start().starts_with('#')
-        {
-            continue;
-        }
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let mut value = crate::frontmatter::scalar_without_comment(value.trim()).to_string();
-        if value.is_empty() || value == ">" || value == "|" || value == ">-" || value == "|-" {
-            // Folded/literal block: the indented lines that follow.
-            let mut parts = Vec::new();
-            while i < lines.len()
-                && (lines[i].starts_with(char::is_whitespace) || lines[i].trim().is_empty())
-            {
-                parts.push(lines[i].trim());
-                i += 1;
-            }
-            value = parts.join(" ").trim().to_string();
-        } else if let Some(decoded) = quoted_scalar(&value) {
-            value = decoded;
-        }
-        fields.insert(key.trim().to_string(), value);
+    let (opening, rest) = text
+        .split_once('\n')
+        .context("SKILL.md must start with --- alone on line 1")?;
+    if opening.strip_suffix('\r').unwrap_or(opening) != "---" {
+        bail!("SKILL.md must start with --- alone on line 1");
     }
-    let name = fields.remove("name").unwrap_or_default();
-    let description = fields.remove("description").unwrap_or_default();
+    let mut offset = 0;
+    let mut closing = None;
+    for line in rest.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let content = content.strip_suffix('\r').unwrap_or(content);
+        if content == "---" {
+            closing = Some((offset, line.len()));
+            break;
+        }
+        offset += line.len();
+    }
+    let Some((end, closing_len)) = closing else {
+        let line = 2 + rest.split_inclusive('\n').count();
+        bail!("SKILL.md frontmatter has no closing --- line (expected on line {line})");
+    };
+    let front = &rest[..end];
+    let body = &rest[end + closing_len..];
+    let fields = serde_yaml_ng::from_str::<SkillFrontmatter>(front).map_err(|error| {
+        let line = error.location().map_or(2, |location| location.line() + 1);
+        anyhow!("invalid SKILL.md frontmatter on line {line}: {error}")
+    })?;
+    let name = fields.name.unwrap_or_default();
+    let description = fields.description.unwrap_or_default();
     validate_name(&name)?;
-    if crate::descriptions::screen(&description).text.is_empty() {
+    let description_chars = description.chars().count();
+    if description_chars == 0 || crate::descriptions::screen(&description).text.is_empty() {
         bail!("SKILL.md needs a non-empty description");
+    }
+    if description_chars > 1024 {
+        bail!("SKILL.md description must be at most 1024 characters");
     }
     Ok(SkillMeta {
         name,
@@ -101,7 +128,9 @@ pub fn validate_name(name: &str) -> Result<()> {
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !name.starts_with('-');
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--");
     if ok {
         Ok(())
     } else {
@@ -336,6 +365,37 @@ fn fetch_into(staging: &Path, source: &str, git_ref: Option<&str>) -> Result<()>
     Ok(())
 }
 
+fn source_directory_name(
+    source: &str,
+    subdir: Option<&str>,
+    staging: &Path,
+    root: &Path,
+) -> Option<String> {
+    if let Some(subdir) = subdir.filter(|subdir| !subdir.is_empty() && *subdir != ".") {
+        return Path::new(subdir)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+    }
+    if root != staging {
+        return root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+    }
+    let local = Path::new(source);
+    if local.is_dir() {
+        return local
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+    }
+    if git_source(source).is_some() {
+        let path = source.split(['?', '#']).next()?.trim_end_matches('/');
+        let name = path.rsplit(['/', ':']).next()?;
+        let name = name.strip_suffix(".git").unwrap_or(name);
+        return (!name.is_empty()).then(|| name.to_string());
+    }
+    None
+}
+
 /// A fetched, validated skill not yet installed (no database access, so
 /// slow fetches never hold the store).
 pub struct Staged {
@@ -358,6 +418,16 @@ pub fn prepare(
     source: &str,
     subdir: Option<&str>,
     git_ref: Option<&str>,
+) -> Result<Staged> {
+    prepare_inner(paths, source, subdir, git_ref, true)
+}
+
+fn prepare_inner(
+    paths: &Paths,
+    source: &str,
+    subdir: Option<&str>,
+    git_ref: Option<&str>,
+    validate_directory_name: bool,
 ) -> Result<Staged> {
     let staging = stage(paths, source, git_ref)?;
     let mut staged = Staged {
@@ -390,6 +460,16 @@ pub fn prepare(
     let text = std::fs::read_to_string(staged.root.join("SKILL.md"))
         .context("no SKILL.md in the skill source")?;
     staged.meta = parse_skill_md(&text)?;
+    if validate_directory_name {
+        if let Some(directory) = source_directory_name(source, subdir, &staging, &staged.root) {
+            if staged.meta.name != directory {
+                bail!(
+                    "skill name '{}' does not match source directory '{directory}'",
+                    staged.meta.name
+                );
+            }
+        }
+    }
     staged.files = files(&staged.root)?;
     Ok(staged)
 }
@@ -498,7 +578,7 @@ pub fn prepare_bundle(paths: &Paths, bundle: &serde_json::Value) -> Result<Stage
             }
             std::fs::write(dst, bytes)?;
         }
-        let mut staged = prepare(paths, &unpack.to_string_lossy(), None, None)?;
+        let mut staged = prepare_inner(paths, &unpack.to_string_lossy(), None, None, false)?;
         staged.source = "import".into();
         Ok(staged)
     })();
@@ -522,7 +602,7 @@ pub fn install_text(
     std::fs::create_dir_all(&dir)?;
     let result = (|| {
         std::fs::write(dir.join("SKILL.md"), skill_md)?;
-        let mut staged = prepare(paths, &dir.to_string_lossy(), None, None)?;
+        let mut staged = prepare_inner(paths, &dir.to_string_lossy(), None, None, false)?;
         staged.source = source.into();
         commit(paths, store, &staged, author)
     })();

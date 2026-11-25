@@ -2723,13 +2723,16 @@ Skills package procedural know-how: how to approach a class of task.
 Tools fill capability gaps; skills say how to use them well.
 
 - **Format:** the Agent Skills `SKILL.md` convention: YAML frontmatter with
-  `name` (1-64 lowercase letters, digits, `-`) and `description` (1-1024
-  chars), a Markdown body, and optional extra files. Header comments outside
-  scalar content are ignored; whitespace-separated inline `#` comments leave
-  quoted hashes and URL fragments intact. Only a complete quoted scalar is
-  decoded (JSON-compatible double-quote escapes or doubled single quotes);
-  literal quote fragments and block content retain their characters. Existing
-  skills install as-is; historical installed metadata is not rewritten.
+  `name` (1-64 lowercase letters, digits and hyphens) and `description` (1-1024
+  characters), a Markdown body, and optional extra files. YAML scalar quoting,
+  escapes, multiline plain values, and block folding/chomping follow YAML
+  semantics. The opening and closing `---` delimiters must each be alone on
+  their line. Duplicate keys and malformed YAML are rejected with a
+  source-line error. Names cannot start or end with a hyphen or contain
+  consecutive hyphens. When the source has a named skill directory (a folder,
+  Git root/subdirectory, or wrapped ZIP), its name must match the frontmatter
+  `name`; mismatches are rejected. `SKILL.md` files are copied unchanged, and
+  historical installed metadata is not rewritten.
 - **Install:** from a folder, a git URL (`--ref`, `--subdir`) or a
   `.zip`; validated, then stored versioned under
   `<data>/skills/<name>/v<N>/` (10 MB max). A `.zip` is extracted

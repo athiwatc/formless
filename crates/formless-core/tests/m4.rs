@@ -2335,7 +2335,7 @@ async fn enabled_skills_are_indexed_in_the_system_prompt() {
     use formless_protocol::{Request, SendMode};
     _env.set("FORMLESS_API_KEY", "test-key");
     let paths = temp_paths("m4skills");
-    let src = paths.data_dir.join("src/tidy");
+    let src = paths.data_dir.join("src/tidy-csv");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(
         src.join("SKILL.md"),
