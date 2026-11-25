@@ -6158,7 +6158,9 @@ during its snapshot fetch, deduplicated by message id.
   are added, removed settings are deleted, and keys this build doesn't
   read (a newer build's, your own notes as keys) stay. Writes are atomic:
   a temporary file beside it, flushed to disk, renamed over it, so a crash
-  leaves the old file or the new one.
+  leaves the old file or the new one. The daemon logs unknown configuration
+  keys at startup, `doctor` reports them, and `config edit` warns before
+  saving; close matches include a suggestion from this section's key set.
 - **Changing settings from a client:** clients never write the file.
   `SetSetting {key, value}` replaces one value. `MergeSetting {key, value}`
   accepts a JSON object for one of the five exposed maps listed above,
@@ -6222,6 +6224,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `run_files.max_files_per_run` / `max_bytes_per_run` | 128 / 16777216 | Recovery admission caps per Run, counting original bytes plus descriptor metadata; overflow keeps paths with a reason; 0 keeps no new recovery payload (§5.7) |
 | `run_files.keep_runs_per_session` / `max_age_days` / `max_total_mb` | 10 / 30 / 256 | Recovery retention per Session, age and profile MiB; 0 expires eligible payload, active/latest Runs remain protected, expired paths stay listed (§5.7) |
 | `provider.base_url` | — (wizard) | Verbatim endpoint base (§4.1) |
+| `provider.preset` | — (endpoint inferred) | Preset ID selected by setup; an explicit ID takes precedence over matching the endpoint (§4.2) |
 | `relay.enabled` | `false` | Dial out to the hosted Relay on daemon start (§12) |
 | `relay.url` | `wss://formless.athiwat.xyz` | Relay websocket base URL |
 | `provider.extra_headers` | {} | Free-form headers per request (§4.1) |
