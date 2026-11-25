@@ -716,7 +716,7 @@ skill: a SKILL.md that helps an agent do the same kind of task well next time.
 Reply with the SKILL.md only, in this exact form:
 ---
 name: lowercase-words-with-hyphens
-description: One or two sentences: what the skill does and when to use it.
+description: \"One or two sentences: what the skill does and when to use it.\"
 ---
 # Title
 ## When to use

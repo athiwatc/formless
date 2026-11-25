@@ -688,6 +688,14 @@ fn skills_export_and_import_bundles() {
 #[test]
 fn distilled_skills_parse_and_install_as_auto() {
     use formless_core::skills::{distil_input, install_text, parse_distilled};
+    let example = formless_core::skills::DISTIL_PROMPT
+        .split_once("Reply with the SKILL.md only, in this exact form:\n")
+        .unwrap()
+        .1
+        .split_once("\nRules:\n")
+        .unwrap()
+        .0;
+    assert!(parse_skill_md(example).is_ok());
     assert!(parse_distilled("NONE").is_none());
     assert!(parse_distilled("Sure! here is a skill").is_none());
     let reply = "```markdown\n---\nname: csv-cleanup\ndescription: Clean a CSV before analysis.\n---\n# CSV cleanup\n## Steps\n1. Read it.\n```";
