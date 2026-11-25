@@ -150,9 +150,10 @@ where
     if let Some(key) = save_key {
         config::save_api_key(paths, &key)?;
     }
+    let open = formless_core::profile_setup::open_command(&paths.profile);
     writeln!(
         output,
-        "Setup saved. Start chatting with `formless chat` or run `formless run TASK`."
+        "Setup saved. Start chatting with `{open} chat` or run `{open} run TASK`."
     )?;
     Ok(())
 }

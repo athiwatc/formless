@@ -645,7 +645,8 @@ fn unconfigured_run_names_the_profile_and_offers_saved_setup_elsewhere() {
             "{message}"
         );
         assert!(
-            message.contains("formless --profile p setup")
+            message.contains(&formless_core::profile_setup::setup_command(active))
+                && message.contains("Open it with `formless --profile p`.")
                 && message.contains("formless profiles list"),
             "{message}"
         );
