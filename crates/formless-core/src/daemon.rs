@@ -489,6 +489,7 @@ struct EventFilter {
     sessions: Option<std::collections::HashSet<String>>,
     deltas: bool,
     transcript_attempts: bool,
+    main_chat_backend: bool,
     /// What the client calls itself, shown to the others on its Sessions.
     label: Option<String>,
 }
@@ -499,6 +500,7 @@ impl Default for EventFilter {
             sessions: None,
             deltas: true,
             transcript_attempts: false,
+            main_chat_backend: false,
             label: None,
         }
     }
@@ -601,6 +603,7 @@ fn current_client() -> Option<(u64, String)> {
 impl EventFilter {
     fn wants(&self, ev: &Event) -> bool {
         match ev {
+            Event::MainChatBackendChanged { .. } => self.main_chat_backend,
             // Session lists, running dots and approvals stay global.
             Event::RunStarted { .. }
             | Event::RunFinished { .. }
@@ -3240,7 +3243,9 @@ impl Daemon {
                 Ok(json!({"abandoned": abandoned}))
             }
             // Only meaningful per connection (see `handle_conn`).
-            Request::Subscribe { .. } | Request::SubscribeTranscriptAttempts { .. } => {
+            Request::Subscribe { .. }
+            | Request::SubscribeTranscriptAttempts { .. }
+            | Request::SubscribeMainChatBackend => {
                 Err(anyhow!("subscribe applies to a client connection"))
             }
             Request::DiffToolVersions { id, from, to } => {
@@ -16739,6 +16744,9 @@ impl Daemon {
                                 env.protocol
                             ),
                         )
+                    } else if matches!(env.request, Request::SubscribeMainChatBackend) {
+                        filter.locked().main_chat_backend = true;
+                        ServerMessage::ok(env.id, json!({"subscribed": true}))
                     } else if let Request::SubscribeTranscriptAttempts { ref session_id } =
                         env.request
                     {
@@ -16792,6 +16800,7 @@ impl Daemon {
                                 sessions: sessions.map(|s| s.into_iter().collect()),
                                 deltas,
                                 transcript_attempts: false,
+                                main_chat_backend: f.main_chat_backend,
                                 label: label.or(f.label.take()),
                             };
                             before
@@ -19694,6 +19703,30 @@ mod backpressure_tests {
             gaps: BTreeMap::new(),
         }]));
         (subs, rx, kick)
+    }
+
+    #[test]
+    fn main_chat_backend_events_require_opt_in_without_a_session_filter() {
+        let (subs, mut rx, _) = subscriber(2);
+        let event = Event::MainChatBackendChanged {
+            backend: formless_protocol::MainChatBackend::Inherit,
+        };
+        send_all(&subs, event.clone());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        {
+            let subs = subs.locked();
+            let mut filter = subs[0].filter.locked();
+            filter.sessions = Some(["topic-session".into()].into_iter().collect());
+            filter.main_chat_backend = true;
+        }
+        send_all(&subs, event);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerMessage::Event(Event::MainChatBackendChanged { .. }))
+        ));
     }
 
     #[test]

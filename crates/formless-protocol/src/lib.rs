@@ -93,6 +93,7 @@ mod main_chat_backend_wire_tests {
         for wire in [
             serde_json::json!({"type":"get_main_chat_backend"}),
             serde_json::json!({"type":"list_main_chat_backends"}),
+            serde_json::json!({"type":"subscribe_main_chat_backend"}),
             serde_json::json!({"type":"set_main_chat_backend","backend":{"kind":"inherit"}}),
             serde_json::json!({"type":"set_main_chat_backend","backend":{"kind":"provider","name":"local","model":"model","effort":"high"}}),
             serde_json::json!({"type":"set_main_chat_backend","backend":{"kind":"harness","harness":"acp","acp_agent":"gemini"}}),
@@ -2794,6 +2795,7 @@ pub enum Request {
     GetMainChat,
     GetMainChatBackend,
     ListMainChatBackends,
+    SubscribeMainChatBackend,
     SetMainChatBackend {
         backend: MainChatBackend,
     },

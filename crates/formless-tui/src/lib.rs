@@ -236,6 +236,7 @@ impl View {
 
 #[derive(Clone, PartialEq)]
 enum Pending {
+    MainBackendSubscription,
     QuestionAnswer {
         question: OpenQuestion,
         index: usize,
@@ -3487,6 +3488,7 @@ impl App {
                         continue;
                     };
                     match kind {
+                        Pending::MainBackendSubscription => {}
                         Pending::ProviderRetry { .. } => {
                             unreachable!("retry acknowledgements handled above")
                         }

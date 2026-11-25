@@ -1060,8 +1060,11 @@ and returns the saved backend object, not the inventory. Backend objects are:
 - `{"kind":"harness","harness":"claude","acp_agent":null}` (use a harness
   listed by the daemon; specify a listed agent for `"harness":"acp"`)
 
-A successful setter broadcasts `main_chat_backend_changed` with the saved
-`backend` to subscribed clients.
+Clients that support the event opt in with `{"type":"subscribe_main_chat_backend"}`
+on each connection after seeing `main_chat_backend_v1` in the daemon's feature
+list. The reply is `{"subscribed":true}`. A successful setter broadcasts
+`main_chat_backend_changed` with the saved `backend` to those connections,
+regardless of their Session filters.
 
 For an explicit request to organize work, the provider-backed Main or Topic
 Chat assistant can call

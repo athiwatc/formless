@@ -480,6 +480,21 @@ impl App {
                                 .any(|feature| feature.as_str() == Some(topic::CAPABILITY))
                         });
                 self.topic.set_capability(enabled);
+                if ok
+                    && result
+                        .as_ref()
+                        .and_then(|value| value["features"].as_array())
+                        .is_some_and(|features| {
+                            features.iter().any(|feature| {
+                                feature == formless_protocol::MAIN_CHAT_BACKEND_FEATURE
+                            })
+                        })
+                {
+                    self.send_request(
+                        Pending::MainBackendSubscription,
+                        Request::SubscribeMainChatBackend,
+                    );
+                }
                 if enabled {
                     self.refresh_topics();
                 }

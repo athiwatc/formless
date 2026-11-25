@@ -948,6 +948,7 @@ enum Pending {
         query: String,
     },
     Ping,
+    MainBackendSubscription,
     Subscribe,
     Sessions,
     Snapshot {
@@ -2957,8 +2958,19 @@ impl Engine {
                         .iter()
                         .any(|feature| feature == "future_transcript_attempts_v1")
                 });
+                if result["features"].as_array().is_some_and(|features| {
+                    features
+                        .iter()
+                        .any(|feature| feature == formless_protocol::MAIN_CHAT_BACKEND_FEATURE)
+                }) {
+                    self.request(
+                        Request::SubscribeMainChatBackend,
+                        Pending::MainBackendSubscription,
+                    );
+                }
                 self.subscribe();
             }
+            Pending::MainBackendSubscription => {}
             Pending::Subscribe => {
                 result?;
                 self.ready = true;

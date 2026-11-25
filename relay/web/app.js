@@ -2515,6 +2515,10 @@
           }
           S.mainBackendSupported = ping.features.includes("main_chat_backend_v1");
           S.mainBackend = null;
+          if (S.mainBackendSupported) {
+            await request({ type: "subscribe_main_chat_backend" }).catch(() => {});
+            if (S.channel !== channel || revision !== (S.topicRevision || 0)) return;
+          }
         }
         const [main, topics] = await Promise.all([initial ? request({ type: "get_main_chat" }) : S.mainChat, request({ type: "list_topics" })]);
         if (S.channel !== channel || revision !== (S.topicRevision || 0)) return;
