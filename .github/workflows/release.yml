@@ -238,10 +238,20 @@ jobs:
         run: |
           deb_version=()
           rpm_version=()
-          if [[ "$PRERELEASE" == true ]]; then
-            version="${GITHUB_REF_NAME#v}"
-            suffix="${version#*-}"
-            package_version="${version%%-*}~${suffix//-/+}"
+          asset_version=
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            package_id="$(cargo pkgid --locked -p formless-bin)"
+            version="${package_id##*#}"
+            version="${version##*@}"
+            version="${version%%+*}"
+            package_version="${version%%-*}~main.$GITHUB_RUN_NUMBER"
+            asset_version="$RELEASE_ID"
+          elif [[ "$PRERELEASE" == true ]]; then
+            asset_version="${GITHUB_REF_NAME#v}"
+            suffix="${asset_version#*-}"
+            package_version="${asset_version%%-*}~${suffix//-/+}"
+          fi
+          if [[ -n "$asset_version" ]]; then
             deb_version=(--deb-version "$package_version-1")
             rpm_version=(--set-metadata "version=\"$package_version\"")
           fi
@@ -249,11 +259,11 @@ jobs:
           # --output recognizes directories only when they already exist.
           mkdir -p target/generate-rpm
           cargo generate-rpm -p crates/formless --output target/generate-rpm "${rpm_version[@]}"
-          if [[ "$PRERELEASE" == true ]]; then
-            # Use the tag's characters in asset names so checksum sidecars
+          if [[ -n "$asset_version" ]]; then
+            # Use the release ID's characters so checksum sidecars
             # match the downloaded names after GitHub's filename normalization.
-            cp target/debian/*.deb "dist/formless_${version}_amd64.deb"
-            cp target/generate-rpm/*.rpm "dist/formless-${version}.x86_64.rpm"
+            cp target/debian/*.deb "dist/formless_${asset_version}_amd64.deb"
+            cp target/generate-rpm/*.rpm "dist/formless-${asset_version}.x86_64.rpm"
           else
             cp target/debian/*.deb target/generate-rpm/*.rpm dist/
           fi

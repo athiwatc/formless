@@ -150,11 +150,15 @@ class ReleasePublication(unittest.TestCase):
             (root / "target/generate-rpm/fixture.rpm").touch()
             (root / "bin/dpkg").write_text("#!/bin/sh\nexit 0\n")
             (root / "bin/sha256sum").write_text('#!/bin/sh\nprintf "digest  %s\\n" "$1"\n')
-            (root / "bin/cargo").write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> args\n')
+            (root / "bin/cargo").write_text(
+                '#!/bin/sh\nif [ "$1" = pkgid ]; then echo "path+file:///repo#formless-bin@0.2.0"; '
+                'else printf "%s\\n" "$@" >> args; fi\n'
+            )
             for command in (root / "bin").iterdir():
                 command.chmod(0o755)
-            for kind, tag in (("", "main"), ("false", "v0.2.0"), ("true", "v0.2.0-rc.1-hotfix")):
-                with self.subTest(tag=tag):
+            for kind, tag, run_number in (("", "main", "9"), ("", "main", "10"),
+                                          ("false", "v0.2.0", ""), ("true", "v0.2.0-rc.1-hotfix", "")):
+                with self.subTest(tag=tag, run_number=run_number):
                     dist = root / "dist"
                     for file in dist.iterdir():
                         file.unlink()
@@ -163,10 +167,18 @@ class ReleasePublication(unittest.TestCase):
                     subprocess.run(
                         ["bash", "-e", "-c", run], cwd=root,
                         env={"PATH": f'{root / "bin"}:{os.environ["PATH"]}', "PRERELEASE": kind,
-                             "GITHUB_REF_NAME": tag}, check=True, timeout=5,
+                             "GITHUB_REF_NAME": tag, "GITHUB_RUN_NUMBER": run_number,
+                             "GITHUB_REF": f"refs/{'heads' if tag == 'main' else 'tags'}/{tag}",
+                             "RELEASE_ID": "main-preview"}, check=True, timeout=5,
                     )
                     actual = args.read_text().splitlines()
-                    if kind == "true":
+                    if tag == "main":
+                        self.assertIn("--deb-version", actual)
+                        self.assertIn(f"0.2.0~main.{run_number}-1", actual)
+                        self.assertIn("--set-metadata", actual)
+                        self.assertIn(f'version="0.2.0~main.{run_number}"', actual)
+                        names = ["formless_main-preview_amd64.deb", "formless-main-preview.x86_64.rpm"]
+                    elif kind == "true":
                         self.assertIn("--deb-version", actual)
                         self.assertIn("0.2.0~rc.1+hotfix-1", actual)
                         self.assertIn("--set-metadata", actual)
