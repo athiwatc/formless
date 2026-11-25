@@ -459,6 +459,23 @@ async fn exercise_step_handoff(
         Choice::Edit(_) => vec![json!({"native": "ไทย"})],
     };
     assert_eq!(arguments, expected);
+    let completed: Vec<_> = observer
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ToolCallFinished { tool_name, ok, .. } if tool_name == TOOL => Some(*ok),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        completed,
+        if matches!(choice, Choice::Skip) {
+            &[][..]
+        } else {
+            &[true]
+        },
+        "fixture Tool outcomes for {choice:?}"
+    );
     future_cases::canonical(&restored, "Tool gate finished. Done 😀", &[]).await;
     assert_eq!(
         snapshot(&mut observer, &fixture.session).await["step_mode"],
