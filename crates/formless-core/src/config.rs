@@ -412,21 +412,12 @@ fn collect_unknown_keys(
                     Some(field) => (Some(field), false),
                     None => (fields.get("*"), true),
                 };
-                let path = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
+                let path = config_key_path(prefix, key);
                 let Some(field) = field else {
                     unknown.push(UnknownConfigKey {
                         key: path,
-                        suggestion: nearest_config_key(key, fields).map(|suggestion| {
-                            if prefix.is_empty() {
-                                suggestion
-                            } else {
-                                format!("{prefix}.{suggestion}")
-                            }
-                        }),
+                        suggestion: nearest_config_key(key, fields)
+                            .map(|suggestion| config_key_path(prefix, &suggestion)),
                     });
                     continue;
                 };
@@ -444,6 +435,23 @@ fn collect_unknown_keys(
             }
         }
         _ => {}
+    }
+}
+
+fn config_key_path(prefix: &str, segment: &str) -> String {
+    let segment = if !segment.is_empty()
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        segment.to_string()
+    } else {
+        toml::Value::String(segment.to_string()).to_string()
+    };
+    if prefix.is_empty() {
+        segment
+    } else {
+        format!("{prefix}.{segment}")
     }
 }
 

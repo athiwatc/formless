@@ -95,6 +95,22 @@ commnad = "typo"
 }
 
 #[test]
+fn quotes_dynamic_map_key_segments_in_paths_and_suggestions() {
+    let text = r#"
+[provider.prices."gpt-4.1"]
+inpt = 1.0
+"#;
+
+    assert_eq!(
+        unknown_keys_from_text(text).unwrap(),
+        vec![UnknownConfigKey {
+            key: "provider.prices.\"gpt-4.1\".inpt".into(),
+            suggestion: Some("provider.prices.\"gpt-4.1\".input".into()),
+        }]
+    );
+}
+
+#[test]
 fn default_config_round_trip_has_no_unknown_keys() {
     let mut config = Config::default();
     config.naming.auto_download_migration_done = true;
