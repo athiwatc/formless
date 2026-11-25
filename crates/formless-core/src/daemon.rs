@@ -19729,6 +19729,56 @@ mod backpressure_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn main_chat_backend_subscription_is_acknowledged_on_the_wire() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let dir = std::env::temp_dir().join(format!("fl-main-sub-{}", uuid::Uuid::new_v4()));
+        let paths = crate::Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
+        let daemon = Arc::new(Daemon::new(paths).unwrap());
+        let (client, server) = tokio::io::duplex(4096);
+        let conn = tokio::spawn(daemon.clone().handle_conn(server));
+        let mut client = tokio::io::BufReader::new(client);
+        client
+            .write_all(
+                format!("{{\"id\":1,\"protocol\":{PROTOCOL_VERSION},\"request\":{{\"type\":\"subscribe_main_chat_backend\"}}}}\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let line = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_frame(&mut client, 4096),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(&line).unwrap(),
+            ServerMessage::Response { id: 1, ok: true, result: Some(value), .. }
+                if value == json!({"subscribed": true})
+        ));
+        daemon.broadcast(Event::MainChatBackendChanged {
+            backend: formless_protocol::MainChatBackend::Inherit,
+        });
+        let line = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_frame(&mut client, 4096),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(&line).unwrap(),
+            ServerMessage::Event(Event::MainChatBackendChanged { .. })
+        ));
+        drop(client);
+        conn.await.unwrap();
+        drop(daemon);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn concurrent_runs_coalesce_usage_and_delta_gaps_without_swallowing_either_run() {
         let (subs, mut rx, kick) = subscriber(3);
