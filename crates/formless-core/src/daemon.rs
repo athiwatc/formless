@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Config, ProviderCfg};
 use crate::namer::{self, ModelSpec};
 use crate::provider::{DeltaKind, Provider, ToolCall, SYSTEM_PROMPT};
-use crate::storage::{ContextCache, Store};
+use crate::storage::{ContextCache, MessageSearchIndex, Store};
 use crate::tools as toolreg;
 use crate::Paths;
 use correction_loop::{CorrectionBatch, CorrectionClass, CorrectionStreak};
@@ -823,6 +823,36 @@ struct ForecastConsent {
     approved: bool,
     requires: bool,
     selected: String,
+}
+
+struct MessageSearchMaintenance {
+    indexes: [(MessageSearchIndex, bool); 2],
+}
+
+impl MessageSearchMaintenance {
+    fn new() -> Self {
+        Self {
+            indexes: [
+                (MessageSearchIndex::Words, true),
+                (MessageSearchIndex::Unicode, true),
+            ],
+        }
+    }
+
+    async fn run_pass(&mut self, daemon: &Arc<Daemon>, max_steps: usize) {
+        for (index, start) in &mut self.indexes {
+            let started = std::time::Instant::now();
+            let complete = daemon
+                .optimize_message_search_pass(*index, start, max_steps)
+                .await;
+            tracing::info!(
+                ?index,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                complete,
+                "optimize message search"
+            );
+        }
+    }
 }
 
 pub struct Daemon {
@@ -16739,29 +16769,16 @@ impl Daemon {
     }
 
     async fn database_maintenance_loop(self: Arc<Self>) {
-        use crate::storage::MessageSearchIndex;
-        let mut indexes = [
-            (MessageSearchIndex::Words, true),
-            (MessageSearchIndex::Unicode, true),
-        ];
+        let mut maintenance = MessageSearchMaintenance::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-            for (index, start) in &mut indexes {
-                let started = std::time::Instant::now();
-                let complete = self.optimize_message_search_pass(*index, start, 1024).await;
-                tracing::info!(
-                    ?index,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    complete,
-                    "optimize message search"
-                );
-            }
+            maintenance.run_pass(&self, 1024).await;
         }
     }
 
     async fn optimize_message_search_pass(
         self: &Arc<Self>,
-        index: crate::storage::MessageSearchIndex,
+        index: MessageSearchIndex,
         start: &mut bool,
         max_steps: usize,
     ) -> bool {

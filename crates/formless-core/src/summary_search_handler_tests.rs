@@ -3,13 +3,24 @@ use super::*;
 
 #[tokio::test]
 async fn capped_message_search_maintenance_resumes_before_starting_another_merge() {
-    use crate::storage::MessageSearchIndex;
-
     let _env = crate::credential_env::EnvGuard::isolated();
     let root = std::env::temp_dir().join(format!("fl-merge-search-{}", uuid::Uuid::new_v4()));
     let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
     Config::default().save(&paths).unwrap();
+    let db = paths.db_file();
     let daemon = Arc::new(Daemon::new(paths).unwrap());
+    let reader =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let segments = || {
+        reader
+            .prepare("SELECT segid, MAX(pgno) FROM messages_fts_idx GROUP BY segid")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()
+            .unwrap()
+    };
     let body = (0..80_000)
         .map(|i| format!("term{i:05} "))
         .collect::<String>();
@@ -22,29 +33,30 @@ async fn capped_message_search_maintenance_resumes_before_starting_another_merge
             Ok(session)
         })
         .unwrap();
-    let mut start = true;
-    let index = MessageSearchIndex::Words;
-    assert!(
-        !daemon
-            .optimize_message_search_pass(index, &mut start, 1)
-            .await
-    );
-    assert!(!start);
+    let initial = segments();
+    let mut maintenance = MessageSearchMaintenance::new();
+    maintenance.run_pass(&daemon, 1).await;
+    let first = segments();
+    let (&output, &page) = first
+        .iter()
+        .find(|(id, _)| !initial.contains_key(id))
+        .unwrap();
+    assert_eq!(first.len(), initial.len() + 1);
     daemon
         .with_store(|store| store.append_message(&session.id, "user", "new segment"))
         .unwrap();
-    assert!(
-        !daemon
-            .optimize_message_search_pass(index, &mut start, 1)
-            .await
+    let interleaved = segments();
+    assert_eq!(interleaved.len(), first.len() + 1);
+    maintenance.run_pass(&daemon, 1).await;
+    let resumed = segments();
+    assert!(resumed[&output] > page);
+    assert_eq!(
+        resumed.keys().collect::<Vec<_>>(),
+        interleaved.keys().collect::<Vec<_>>()
     );
-    assert!(!start);
-    assert!(
-        daemon
-            .optimize_message_search_pass(index, &mut start, 128)
-            .await
-    );
-    assert!(start);
+    maintenance.run_pass(&daemon, 128).await;
+    assert_eq!(segments().len(), 1);
+    drop(reader);
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
 }
