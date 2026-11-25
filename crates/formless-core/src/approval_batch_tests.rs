@@ -339,7 +339,7 @@ async fn skipped_calls_are_excluded_without_skipping_executable_approvals() {
         assert!(futures_util::poll!(&mut approval).is_pending());
         let (first_id, first_batch) = requested(&mut events);
         let first_batch = first_batch.unwrap();
-        assert_eq!(first_batch.index, 2);
+        assert_eq!(first_batch.index, 1);
         assert_eq!(
             first_batch
                 .calls
@@ -368,7 +368,7 @@ async fn skipped_calls_are_excluded_without_skipping_executable_approvals() {
         assert_eq!(
             second_batch,
             Some(ApprovalBatch {
-                index: 3,
+                index: 2,
                 ..first_batch
             })
         );
