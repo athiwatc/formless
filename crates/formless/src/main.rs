@@ -2750,6 +2750,21 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 "config:    {} providers, {} Roles, {} MCP servers added",
                 r["providers"], r["roles"], r["mcp_servers"]
             );
+            println!(
+                "skipped:   {} Tools, {} modules, {} Skills, {} memories, {} jobs, {} Sessions",
+                r["skipped_existing"]["tools"],
+                r["skipped_existing"]["modules"],
+                r["skipped_existing"]["skills"],
+                r["skipped_existing"]["memories"],
+                r["skipped_existing"]["jobs"],
+                r["skipped_existing"]["sessions"]
+            );
+            println!(
+                "config skipped: {} providers, {} Roles, {} MCP servers",
+                r["skipped_existing"]["providers"],
+                r["skipped_existing"]["roles"],
+                r["skipped_existing"]["mcp_servers"]
+            );
             println!("review:    MCP servers are disabled and untrusted; inspect commands before enabling.");
             for server in r["mcp_review"].as_array().into_iter().flatten() {
                 println!(
