@@ -2808,7 +2808,9 @@ suite cannot measure preferences.
 - **Built-ins:** `remember({text, scope?})` saves a note of at most 300
   characters. `scope` is `global` (the default) or
   `project:<absolute path>`. A duplicate (same scope, same text ignoring
-  case and spacing) refreshes the existing note. `forget({id})` deletes one.
+  case and spacing) refreshes the existing note without changing its enabled
+  state; if it is disabled, the agent and user are told it remains off.
+  `forget({id})` deletes one.
   The bootstrap prompt says to remember lasting preferences and facts,
   never secrets or one-off details, and to forget on request.
 - **Store:** the `memories` table (schema v17) holds the text, scope,
@@ -2821,9 +2823,14 @@ suite cannot measure preferences.
   from this one after compaction, which adds a note to the chat that the
   prompt changed. Disabled notes are left out.
 - **Visible and editable.** Every agent write shows live in the chat
-  (`remembered: …`, `forgot: …`). Management uses `ListMemories`,
+  (`remembered: …`, `already remembered (disabled): …`, `forgot: …`). Management uses `ListMemories`,
   `UpsertMemory` (add with no `id`, author `user`; or edit the text,
-  scope or enabled flag) and `DeleteMemory`. Clients are:
+  scope or enabled flag) and `DeleteMemory`. Edits validate text against the
+  note author's limit (800 characters for optimiser notes, 300 otherwise);
+  flag-only changes do not revalidate unchanged text. An edit that would
+  duplicate another note in the same scope is refused with a named error.
+  Disabled notes stay disabled unless the user explicitly enables them.
+  Clients are:
   - CLI: `formless memory list [--json]|add|rm|edit`
   - TUI: `/memory`, `/memory rm|on|off ID`, `/memory edit ID TEXT`,
     `/remember TEXT` (saved as the user), `/forget TEXT` (lists the
