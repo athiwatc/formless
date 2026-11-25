@@ -1046,6 +1046,19 @@ rejects attachments, steering, and provider spending limits; it accepts new
 text messages. Topic Chats and their step-harness choices are unaffected.
 Daemons supporting this setting advertise `main_chat_backend_v1` and expose
 `get_main_chat_backend`, `list_main_chat_backends`, and `set_main_chat_backend`.
+The get request has no arguments and returns the selected backend object.
+The list request has no arguments and returns an object with `selected`
+(the backend object), `providers` (entries with `name` and configured `model`),
+and `harnesses` (supported harness availability entries, including readiness
+details). The setter takes `{"type":"set_main_chat_backend","backend":...}`
+and returns the saved backend object, not the inventory. Backend objects are:
+
+- `{"kind":"inherit"}`
+- `{"kind":"provider","name":"default","model":null,"effort":null}` (use
+  `default` or a configured provider name; omit or set either override to null
+  to use its configured value)
+- `{"kind":"harness","harness":"claude","acp_agent":null}` (use a harness
+  listed by the daemon; specify a listed agent for `"harness":"acp"`)
 
 For an explicit request to organize work, the provider-backed Main or Topic
 Chat assistant can call
