@@ -8,6 +8,8 @@ const start = source.indexOf('  function renderSearch(');
 const end = source.indexOf('\n  // ---', start);
 const fold = source.indexOf('  function foldMap(');
 const foldEnd = source.indexOf('\n  }', fold) + 4;
+const searchStart = source.indexOf('  let searchSeq = 0;');
+const searchEnd = source.indexOf('  function autosize()', searchStart);
 assert.ok(start >= 0 && end > start && fold >= 0 && foldEnd > fold);
 
 function renderResults(hits, query, searchedLatest) {
@@ -47,6 +49,32 @@ test('empty bounded results still show the searched message limit', () => {
   const results = renderResults([], '??', 10000);
   assert.equal(results.children[1].children[0], 'Searched latest 10000 messages.');
   assert.equal(renderResults([], 'hello').children.length, 1);
+});
+
+test('search falls back only for an older daemon rejecting the scoped request', async () => {
+  const calls = [];
+  const rendered = [];
+  const errors = [];
+  let code = 'unsupported';
+  const c = vm.createContext({
+    request: async (req) => {
+      calls.push(req.type);
+      throw Object.assign(new Error(code), { code, daemonResponse: true });
+    },
+    act: async (req) => { calls.push(req.type); return []; },
+    renderSearch: (...args) => rendered.push(args),
+    toast: (error) => errors.push(error),
+    note: () => {},
+  });
+  vm.runInContext(source.slice(searchStart, searchEnd), c);
+  await c.search('??');
+  assert.deepEqual(calls, ['search_sessions_with_scope', 'search_sessions']);
+  assert.deepEqual(rendered, [[[], '??']]);
+  assert.deepEqual(errors, []);
+  code = 'bad_request';
+  await c.search('hello');
+  assert.deepEqual(calls.slice(2), ['search_sessions_with_scope']);
+  assert.deepEqual(errors, ['bad_request']);
 });
 
 test('search retains original accent and case in NFC and decomposed snippets', () => {

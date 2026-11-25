@@ -9658,8 +9658,19 @@
     const seq = ++searchSeq;
     q = q.trim();
     if (!q) { renderSearch(null); return; }
-    const result = await act({ type: "search_sessions_with_scope", query: q, limit: 50 });
-    if (seq === searchSeq && result) renderSearch(result.hits, q, result.searched_latest);
+    try {
+      const result = await request({ type: "search_sessions_with_scope", query: q, limit: 50 });
+      if (seq === searchSeq) renderSearch(result.hits, q, result.searched_latest);
+    } catch (error) {
+      if (seq !== searchSeq) return;
+      if (error.daemonResponse && error.code === "unsupported") {
+        const hits = await act({ type: "search_sessions", query: q, limit: 50 });
+        if (seq === searchSeq && hits) renderSearch(hits, q);
+      } else {
+        toast(error.message, true);
+        note(error.message, true);
+      }
+    }
   }
 
   function autosize() {
