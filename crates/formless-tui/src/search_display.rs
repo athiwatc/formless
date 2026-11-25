@@ -36,10 +36,18 @@ pub(super) fn title(count: usize, context: Option<&Context>, width: usize) -> St
         let capped = count == context.limit;
         if let Some(latest) = context.searched_latest {
             let _ = write!(title, " · Searched latest {latest} messages");
-            let full_width = text::width(&title) + if capped { " · more may exist".len() } else { 0 };
+            let full_width = text::width(&title)
+                + if capped {
+                    " · more may exist".len()
+                } else {
+                    0
+                };
             if full_width > width {
                 let marker = format!(" Latest {latest}");
-                let compact = format!("{marker} · {count} hits{}", if capped { " (cap)" } else { "" });
+                let compact = format!(
+                    "{marker} · {count} hits{}",
+                    if capped { " (cap)" } else { "" }
+                );
                 return if text::width(&compact) <= width {
                     compact
                 } else {
@@ -185,7 +193,11 @@ mod tests {
 
     #[test]
     fn compact_titles_keep_the_search_scope_even_at_the_result_cap() {
-        let context = Context { query: "??".into(), limit: 50, searched_latest: Some(10_000) };
+        let context = Context {
+            query: "??".into(),
+            limit: 50,
+            searched_latest: Some(10_000),
+        };
         assert_eq!(title(50, Some(&context), 14), " Latest 10000");
         assert_eq!(title(0, Some(&context), 14), " Latest 10000");
         assert!(title(50, Some(&context), 30).contains("50 hits (cap)"));
