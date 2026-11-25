@@ -106,7 +106,11 @@ impl App {
             return;
         }
         match name {
-            "main" => self.open_main_chat(),
+            "main" if args.trim() == "backend" => {
+                self.request(Pending::MainBackendCatalog, Request::ListMainChatBackends)
+            }
+            "main" if args.trim().is_empty() => self.open_main_chat(),
+            "main" => self.notes.push("Usage: /main [backend]".into()),
             "topics" => {
                 self.refresh_topics_with_main(true);
                 self.topic.open_picker();
@@ -234,6 +238,10 @@ impl App {
             Action::None | Action::Close => {}
             Action::Refresh => self.refresh_topics_with_main(true),
             Action::OpenMain => self.open_main_chat(),
+            Action::SetMainBackend(backend) => self.request(
+                Pending::MainBackendSaved,
+                Request::SetMainChatBackend { backend },
+            ),
             Action::OpenTopic(topic_id) => self.open_node(Node::Topic(topic_id)),
             Action::OpenAttempt {
                 topic_id,
@@ -476,6 +484,22 @@ impl App {
                     self.refresh_topics();
                 }
             }
+            Pending::MainBackendCatalog => {
+                match parse!(formless_protocol::MainChatBackends, ok, result) {
+                    Some(catalog) => self.topic.open_main_backend(catalog),
+                    None => self
+                        .notes
+                        .push(format!("Main Chat backend unavailable: {reason}")),
+                }
+            }
+            Pending::MainBackendSaved => {
+                match parse!(formless_protocol::MainChatBackend, ok, result) {
+                    Some(backend) => self.notes.push(format!("Main Chat: {}", backend.label())),
+                    None => self
+                        .notes
+                        .push(format!("Main Chat backend not saved: {reason}")),
+                }
+            }
             Pending::TopicMain { generation, open } => {
                 if generation != self.topic_main_generation {
                     return;
@@ -700,6 +724,8 @@ impl Pending {
         matches!(
             self,
             Pending::TopicCapability { .. }
+                | Pending::MainBackendCatalog
+                | Pending::MainBackendSaved
                 | Pending::TopicMain { .. }
                 | Pending::TopicList { .. }
                 | Pending::TopicGet { .. }

@@ -79,6 +79,12 @@ pub struct HarnessRequest {
     pub environment: BTreeMap<OsString, OsString>,
 }
 
+impl HarnessRequest {
+    fn has_mcp(&self) -> bool {
+        !self.mcp_command.as_os_str().is_empty()
+    }
+}
+
 impl fmt::Debug for HarnessRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HarnessRequest")
@@ -180,7 +186,7 @@ fn validate_request(request: &HarnessRequest) -> Result<()> {
     if !request.cwd.is_absolute() {
         bail!("harness working directory must be absolute");
     }
-    if !request.mcp_command.is_absolute() {
+    if request.has_mcp() && !request.mcp_command.is_absolute() {
         bail!("MCP server executable must be an absolute path");
     }
     if request
@@ -263,41 +269,47 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
                     StepAccess::Write => "workspace-write".into(),
                     StepAccess::ReadOnly => "read-only".into(),
                 },
-                "-c".into(),
-                format!(
-                    "mcp_servers.formless.command={}",
-                    toml::Value::String(request.mcp_command.to_string_lossy().into_owned())
-                )
-                .into(),
-                "-c".into(),
-                format!(
-                    "mcp_servers.formless.args={}",
-                    toml::Value::Array(
-                        request
-                            .mcp_args
-                            .iter()
-                            .cloned()
-                            .map(toml::Value::String)
-                            .collect()
-                    )
-                )
-                .into(),
-                "-c".into(),
-                "mcp_servers.formless.required=true".into(),
-                "-c".into(),
-                format!(
-                    "mcp_servers.formless.env_vars={}",
-                    toml::Value::Array(
-                        request
-                            .mcp_env_vars
-                            .iter()
-                            .cloned()
-                            .map(toml::Value::String)
-                            .collect()
-                    )
-                )
-                .into(),
             ]);
+            if request.has_mcp() {
+                args.extend([
+                    "-c".into(),
+                    format!(
+                        "mcp_servers.formless.command={}",
+                        toml::Value::String(request.mcp_command.to_string_lossy().into_owned())
+                    )
+                    .into(),
+                    "-c".into(),
+                    format!(
+                        "mcp_servers.formless.args={}",
+                        toml::Value::Array(
+                            request
+                                .mcp_args
+                                .iter()
+                                .cloned()
+                                .map(toml::Value::String)
+                                .collect()
+                        )
+                    )
+                    .into(),
+                    "-c".into(),
+                    "mcp_servers.formless.required=true".into(),
+                    "-c".into(),
+                    format!(
+                        "mcp_servers.formless.env_vars={}",
+                        toml::Value::Array(
+                            request
+                                .mcp_env_vars
+                                .iter()
+                                .cloned()
+                                .map(toml::Value::String)
+                                .collect()
+                        )
+                    )
+                    .into(),
+                ]);
+            } else {
+                args.extend(["-c".into(), "mcp_servers={}".into()]);
+            }
             if let Some(model) = &request.model {
                 args.extend(["--model".into(), model.into()]);
             }
@@ -315,6 +327,9 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
 }
 
 fn claude_mcp_config(request: &HarnessRequest) -> Result<String> {
+    if !request.has_mcp() {
+        return Ok(json!({"mcpServers": {}}).to_string());
+    }
     let command = request
         .mcp_command
         .to_str()

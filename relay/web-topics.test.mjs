@@ -31,6 +31,40 @@ function setup(names, extra = {}) {
 }
 const json = value => JSON.parse(JSON.stringify(value));
 
+test('Main Chat picker shows readiness and saves the listed provider and overrides', async () => {
+  const calls = [];
+  const h = (type, attrs, ...children) => ({
+    type, attrs, children, value: attrs?.value ?? "", append(child) { this.children.push(child); },
+    addEventListener(event, handler) { this[event] = handler; }
+  });
+  const c = setup(['mainBackendLabel', 'editMainBackend'], {
+    h, harnessLabel: kind => kind,
+    request: async req => {
+      calls.push(json(req));
+      return {
+        selected: { kind: "provider", name: "work", model: "old", effort: null },
+        providers: [{ name: "work", model: "configured" }],
+        harnesses: [{ kind: "claude", installed: false }],
+      };
+    },
+    ask: async opts => {
+      const [select, fields] = opts.body.children;
+      assert.equal(select.value, "1");
+      assert.match(select.children[2].children[0], /Not installed/);
+      assert.equal(fields.children[0].value, "old");
+      fields.children[0].value = " new ";
+      fields.children[1].value = " high ";
+      const req = json(opts.saveRequest());
+      calls.push(req);
+      return req.backend;
+    },
+  });
+  await c.editMainBackend();
+  assert.deepEqual(calls, [{ type: "list_main_chat_backends" },
+    { type: "set_main_chat_backend", backend: { kind: "provider", name: "work", model: "new", effort: "high" } }]);
+  assert.equal(c.S.mainBackend.model, "new");
+});
+
 test('main/topic/attempt hierarchy uses Formless transcript IDs, not external harness IDs', () => {
   const c = setup(['topicSessionIds', 'topicForSession', 'currentTopicAttempt']);
   c.S.topics = [topic('running')];

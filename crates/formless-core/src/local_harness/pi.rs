@@ -367,7 +367,6 @@ pub fn command_spec_with_extension(
         bail!("{MCP_CONFIG_ENV} is reserved for Pi adapter configuration");
     }
 
-    let extension_path = canonical_extension_path(extension_path)?;
     let command = request
         .mcp_command
         .to_str()
@@ -391,31 +390,45 @@ pub fn command_spec_with_extension(
         "rpc".into(),
         "--no-session".into(),
         "--no-extensions".into(),
-        "-e".into(),
-        "builtin:mcp".into(),
-        "-e".into(),
-        extension_path.as_os_str().to_owned(),
     ];
+    if request.has_mcp() {
+        args.extend([
+            "-e".into(),
+            "builtin:mcp".into(),
+            "-e".into(),
+            canonical_extension_path(extension_path)?.into_os_string(),
+        ]);
+    }
     if let Some(model) = &request.model {
         args.extend(["--model".into(), model.into()]);
     }
     args.extend([
         "--append-system-prompt".into(),
-        match request.access {
-            StepAccess::Write => WRITE_GUIDANCE,
-            StepAccess::ReadOnly => READ_ONLY_GUIDANCE,
+        if !request.has_mcp() {
+            "Answer in chat. Do not edit files, execute commands, or access another conversation."
+        } else {
+            match request.access {
+                StepAccess::Write => WRITE_GUIDANCE,
+                StepAccess::ReadOnly => READ_ONLY_GUIDANCE,
+            }
         }
         .into(),
     ]);
     if request.access == StepAccess::ReadOnly {
         args.extend([
             "--tools".into(),
-            format!("read,grep,find,ls,mcp__{server_name}__*").into(),
+            if request.has_mcp() {
+                format!("read,grep,find,ls,mcp__{server_name}__*").into()
+            } else {
+                "read,grep,find,ls".into()
+            },
         ]);
     }
 
     let mut environment = request.environment.clone();
-    environment.insert(OsString::from(MCP_CONFIG_ENV), OsString::from(mcp_config));
+    if request.has_mcp() {
+        environment.insert(OsString::from(MCP_CONFIG_ENV), OsString::from(mcp_config));
+    }
     let request_path = request
         .environment
         .get(OsStr::new("PATH"))
@@ -587,6 +600,11 @@ where
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
     let mut command = tokio::process::Command::from(spec.command());
+    if !request.has_mcp() {
+        command
+            .env_remove(MCP_CONFIG_ENV)
+            .env_remove(super::TOPIC_CAPABILITY_ENV);
+    }
     #[cfg(unix)]
     {
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -645,7 +663,7 @@ where
         stdout,
         input,
         errors,
-        &request.prompt,
+        request,
         handler,
         cancel,
         capability.as_deref(),
@@ -810,14 +828,14 @@ async fn rpc_session(
     stdout: tokio::process::ChildStdout,
     input: mpsc::UnboundedSender<Value>,
     mut writer_errors: watch::Receiver<bool>,
-    prompt: &str,
+    request: &HarnessRequest,
     handler: &dyn InteractionHandler,
     cancel: &CancellationToken,
     capability: Option<&str>,
 ) -> Result<HarnessResult> {
     let send = |value| input.send(value).context("Pi RPC stdin closed");
     send(json!({"id": "state-1", "type": "get_state"}))?;
-    send(json!({"id": "prompt-1", "type": "prompt", "message": prompt}))?;
+    send(json!({"id": "prompt-1", "type": "prompt", "message": request.prompt}))?;
     let mut lines = BoundedLineReader::new(BufReader::new(stdout));
     let mut events = Vec::new();
     let mut history_bytes = 0;
@@ -927,7 +945,7 @@ async fn rpc_session(
                     for id in &open {
                         send(json!({"type": "extension_ui_response", "id": id, "cancelled": true}))?;
                     }
-                    let mut result = parse_events(events)?;
+                    let mut result = parse_events_with_bridge_requirement(events, request.has_mcp())?;
                     result.session_id = session_id;
                     return Ok(result);
                 }
@@ -1137,6 +1155,13 @@ pub fn parse_output(stdout: &str) -> Result<HarnessResult> {
 }
 
 fn parse_events(events: Vec<Value>) -> Result<HarnessResult> {
+    parse_events_with_bridge_requirement(events, true)
+}
+
+fn parse_events_with_bridge_requirement(
+    events: Vec<Value>,
+    requires_bridge: bool,
+) -> Result<HarnessResult> {
     let mut session_id = None;
     let mut bridge_registered = false;
     let mut settled = None;
@@ -1202,7 +1227,7 @@ fn parse_events(events: Vec<Value>) -> Result<HarnessResult> {
     if events.is_empty() {
         bail!("Pi CLI returned empty JSONL output");
     }
-    if !bridge_registered {
+    if requires_bridge && !bridge_registered {
         bail!("Pi CLI output did not confirm Formless MCP bridge registration; check Pi compatibility and extension-loading diagnostics");
     }
     let (will_retry, agent_end_position) =
@@ -1607,6 +1632,36 @@ printf '%s\n' '{"type":"message_end","message":{"role":"custom","customType":"fo
 printf '%s\r\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}}' '{"type":"agent_end","willRetry":false}' '{"type":"agent_settled","aborted":false}'
 while IFS= read -r remaining; do :; done
 "#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_rpc_without_mcp_finishes_without_bridge_registration() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
+        let start = START
+            .lines()
+            .filter(|line| !line.contains("formless-pi-bridge"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = format!(
+            "[ \"$4\" = --no-extensions ] || exit 1\n[ \"$8\" = read,grep,find,ls ] || exit 1\n{start}\n{FINISH}"
+        );
+        let (dir, _, mut request) = fake_pi(&body);
+        request.access = StepAccess::ReadOnly;
+        request.model = None;
+        request.mcp_command = PathBuf::new();
+        request.mcp_args.clear();
+        request.mcp_env_vars.clear();
+        let handler = RecordingHandler::new(true, false);
+        let result = timeout(
+            Duration::from_secs(10),
+            run(&request, Path::new(""), &handler, &CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.message, "done");
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[cfg(unix)]
     #[tokio::test]

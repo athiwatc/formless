@@ -158,7 +158,7 @@ async fn actual_finish_publication_gap_queues_send_and_blocks_queue_drain() {
             .expect("queued Send unexpectedly awaited")
             .unwrap();
         assert_eq!(ack, json!({"queued":true}));
-        daemon.start_next_queued_message(sid.clone());
+        daemon.admit_next_queued_message(sid.clone(), MainChatBackend::Inherit, None);
         assert!(!daemon.runs.locked().contains_key(&sid));
         observed.store(true, Ordering::SeqCst);
     }));

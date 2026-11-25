@@ -203,6 +203,176 @@ impl Drop for Fixture {
     }
 }
 
+async fn send_main_backend_fixture(daemon: &Arc<Daemon>, session_id: &str, content: &str) {
+    daemon
+        .handle(Request::SendMessage {
+            session_id: session_id.into(),
+            content: content.into(),
+            mode: SendMode::Send,
+            client_msg_id: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while daemon.runs.locked().contains_key(session_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Main Chat backend fixture did not finish");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn main_chat_backend_selected_provider_survives_restart_and_does_not_redirect_topics() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mut f = Fixture::new(&env, Mode::RouteSuccess).await;
+    f.cfg.provider.model = "requested".into();
+    let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let endpoint = Router::new().route("/chat/completions", post(move |Json(body): Json<Value>| {
+        let sent = sent.clone();
+        async move {
+            sent.send(body).unwrap();
+            ([
+                ("content-type", "text/event-stream")
+            ], "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Named Main reply\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut named = f.cfg.provider.clone();
+    named.base_url = format!("http://{}", listener.local_addr().unwrap());
+    named.routing_models.clear();
+    named.model = "served".into();
+    f.cfg.providers.insert("alternate".into(), named);
+    let named_server = tokio::spawn(async move { axum::serve(listener, endpoint).await.unwrap() });
+    let paths = f.daemon().paths.clone();
+    f.cfg.save(&paths).unwrap();
+    drop(f.daemon.take());
+    f.daemon = Some(Arc::new(Daemon::new(paths.clone()).unwrap()));
+    let daemon = f.daemon();
+    let main = daemon.with_store(Store::main_chat).unwrap();
+    let source = daemon
+        .with_store(|st| st.append_message(&main.id, "user", "Topic-only request"))
+        .unwrap();
+    let topic = daemon
+        .propose_topic_request(&formless_protocol::TopicProposalRequest {
+            parent_topic_id: None,
+            source_session_id: main.id.clone(),
+            message_ids: vec![source.id],
+            features: vec![],
+            name: "Routing isolation".into(),
+            workspace: None,
+            outline: vec![],
+        })
+        .unwrap();
+    let topic = daemon.with_store(|st| st.approve_topic(&topic.id)).unwrap();
+    let topic_session = topic.topic_session_id.unwrap();
+    let backend = MainChatBackend::Provider {
+        name: "alternate".into(),
+        model: Some("agent-model".into()),
+        effort: Some("high".into()),
+    };
+    daemon
+        .handle(Request::SetMainChatBackend {
+            backend: backend.clone(),
+        })
+        .await
+        .unwrap();
+    drop(f.daemon.take());
+    f.daemon = Some(Arc::new(Daemon::new(paths).unwrap()));
+    let daemon = f.daemon();
+    assert_eq!(
+        daemon.handle(Request::GetMainChatBackend).await.unwrap(),
+        json!(backend)
+    );
+    send_main_backend_fixture(daemon, &main.id, "A Main Chat turn").await;
+    send_main_backend_fixture(daemon, &topic_session, "A Topic Chat turn").await;
+    let received_main = received
+        .try_recv()
+        .expect("named endpoint did not receive Main Chat");
+    assert_eq!(received_main["model"], "agent-model");
+    assert_eq!(received_main["reasoning_effort"], "high");
+    assert!(received.try_recv().is_err());
+    assert_eq!(*f.models.locked(), ["requested"]);
+    named_server.abort();
+    f.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn main_chat_backend_fake_harness_receives_only_main_transcript_in_private_scratch() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env, Mode::RouteSuccess).await;
+    let daemon = f.daemon();
+    let main = daemon.with_store(Store::main_chat).unwrap();
+    daemon
+        .with_store(|st| {
+            st.append_message(&main.id, "assistant", "Earlier Main reply")?;
+            st.append_message(&f.sid, "user", "Other session text")?;
+            Ok(())
+        })
+        .unwrap();
+    let exe = f.root.join("main-backend-claude");
+    std::fs::write(
+        &exe,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "fixture 1.0"; exit; fi
+if [ "$1" = "auth" ]; then echo '{"loggedIn":true}'; exit; fi
+test "$(stat -c %a . 2>/dev/null || stat -f %Lp .)" = 700 || exit 10
+test -z "${FORMLESS_TOPIC_CAPABILITY:-}" || exit 11
+test "$5" = "--mcp-config" && test "$6" = '{"mcpServers":{}}' || exit 12
+test "$7" = "--permission-mode" && test "$8" = "plan" || exit 13
+for prompt; do :; done
+case "$prompt" in *"Earlier Main reply"*"Next Main request"*) ;; *) exit 14 ;; esac
+case "$prompt" in *"Other session text"*) exit 15 ;; esac
+echo '{"result":"Harness Main reply","session_id":"fixture-main"}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    env.set("FORMLESS_TOPIC_CLAUDE_EXE", &exe);
+    env.set(
+        "FORMLESS_TOPIC_CAPABILITY",
+        "fake-inherited-topic-capability",
+    );
+    daemon
+        .handle(Request::SetMainChatBackend {
+            backend: MainChatBackend::Harness {
+                harness: formless_protocol::HarnessKind::Claude,
+                acp_agent: None,
+            },
+        })
+        .await
+        .unwrap();
+    send_main_backend_fixture(daemon, &main.id, "Next Main request").await;
+    let messages = daemon.with_reader(|st| st.list_messages(&main.id)).unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content == "Harness Main reply"),
+        "{messages:?}"
+    );
+    env.set("FORMLESS_TOPIC_CLAUDE_EXE", f.root.join("missing"));
+    let error = daemon
+        .handle(Request::SendMessage {
+            session_id: main.id.clone(),
+            content: "Not recorded".into(),
+            mode: SendMode::Send,
+            client_msg_id: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not ready"), "{error}");
+    assert!(!daemon
+        .with_reader(|st| st.list_messages(&main.id))
+        .unwrap()
+        .iter()
+        .any(|m| m.content == "Not recorded"));
+    assert_eq!(f.posts.load(Ordering::SeqCst), 0);
+    f.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_run_fallback_records_served_quality_and_all_billed_physical_spend() {
     let env = crate::credential_env::EnvGuard::isolated();
@@ -514,9 +684,11 @@ async fn selection_keeps_one_pass_aliases_and_admitted_role_identity_without_htt
         "admitted-private-run".into(),
         Arc::new(RunAdmission {
             pipeline: None,
+            harness: None,
             cfg: cfg.clone(),
             requested: "role:worker".into(),
             resolved_model: "served".into(),
+            provider_name: None,
             routing_pick: None,
             effort: None,
             recovery_messages: vec![],

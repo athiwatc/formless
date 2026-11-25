@@ -1030,8 +1030,25 @@ task, with quality as a gate**.
 
 ### 5.2 Run lifecycle
 
-The singleton Main Chat answers everyday questions in place. For an explicit
-request to organize work, the Main or Topic Chat assistant can call
+The singleton Main Chat answers everyday questions in place. A profile's
+Main Chat backend is persisted separately from the Session model. It defaults
+to `inherit`, preserving normal Session model, Role and provider resolution.
+An explicit provider selects the configured default or a configured named
+provider, with optional model and reasoning-effort overrides. A harness
+selection must identify an entry in the daemon's supported Main Chat harness
+inventory; ACP profiles without a supported read-only mode are not offered.
+The picker displays readiness; a send to an unready harness fails without
+falling back. A harness receives only a bounded Main Chat transcript and runs
+in a private scratch working directory with read-only adapter settings, no
+Topic MCP bridge, and no access to Topic Chat context through Formless.
+Questions and permission requests go to the human. Harness-backed Main Chat
+rejects attachments, steering, and provider spending limits; it accepts new
+text messages. Topic Chats and their step-harness choices are unaffected.
+Daemons supporting this setting advertise `main_chat_backend_v1` and expose
+`get_main_chat_backend`, `list_main_chat_backends`, and `set_main_chat_backend`.
+
+For an explicit request to organize work, the provider-backed Main or Topic
+Chat assistant can call
 `read_topic_context` for recent persisted user messages, the working directory,
 and the topic hierarchy. Work can be in any domain. A proposal can name a
 workspace or use scratch space. An outline reflects only stated or standing
@@ -5457,6 +5474,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines`, `--jsonl` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
+| `formless main` | `backend [show\|set]` | Inspect or select the provider or harness for Main Chat. |
 | `formless memory` | `list`, `add`, `rm`, `edit`, `used` | Inspect or change saved user-memory notes. |
 | `formless models` | `list [--json]` | Fetch the default-provider model catalog and existing picker report; a non-null listing error prints a partial report and exits 1. |
 | `formless modules` | `list`, `show`; `show --version N` | Read all modules, inspect metadata/history/dependents, or emit an exact stored source version. |

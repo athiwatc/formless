@@ -1,12 +1,15 @@
 //! Desktop topic presentation. The Formless model owns planning and handoffs.
 use formless_protocol::{
-    HarnessKind, Request, SessionInfo, StepAccess, TopicArtifact, TopicAttemptStatus,
-    TopicFeatureStatus, TopicInfo, TopicProposalRequest, TopicStatus, TopicStepOutline,
+    HarnessKind, MainChatBackend, MainChatBackends, Request, SessionInfo, StepAccess,
+    TopicArtifact, TopicAttemptStatus, TopicFeatureStatus, TopicInfo, TopicProposalRequest,
+    TopicStatus, TopicStepOutline,
 };
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    MainBackends,
+    SetMainBackend(MainChatBackend),
     Harnesses,
     SetContext {
         topic: String,
@@ -46,6 +49,10 @@ pub enum Action {
 impl Action {
     pub fn request(&self) -> Request {
         match self {
+            Self::MainBackends => Request::ListMainChatBackends,
+            Self::SetMainBackend(backend) => Request::SetMainChatBackend {
+                backend: backend.clone(),
+            },
             Self::Harnesses => Request::ListHarnesses,
             Self::SetContext { topic, allow } => Request::SetTopicContextAccess {
                 topic_id: topic.clone(),
@@ -112,6 +119,8 @@ impl Action {
 
     pub fn decode(&self, value: serde_json::Value) -> Result<Reply, String> {
         match self {
+            Self::MainBackends => serde_json::from_value(value).map(Reply::MainBackends),
+            Self::SetMainBackend(_) => serde_json::from_value(value).map(Reply::MainBackendSaved),
             Self::Harnesses => serde_json::from_value(value).map(Reply::Harnesses),
             Self::SetContext { .. }
             | Self::AddRule { .. }
@@ -129,6 +138,8 @@ impl Action {
 
 #[derive(Debug)]
 pub enum Reply {
+    MainBackends(MainChatBackends),
+    MainBackendSaved(MainChatBackend),
     Harnesses(Vec<formless_protocol::HarnessAvailability>),
     Policy(Box<TopicInfo>),
     Main(SessionInfo),
@@ -384,6 +395,7 @@ pub fn feature_status(status: TopicFeatureStatus) -> &'static str {
 
 #[derive(Default)]
 pub struct State {
+    pub main_backends: Option<MainChatBackends>,
     pub harnesses: Vec<formless_protocol::HarnessAvailability>,
     pub supported: bool,
     pub inventory_loaded: bool,
@@ -482,6 +494,12 @@ impl State {
     }
     pub fn apply(&mut self, reply: Reply) {
         match reply {
+            Reply::MainBackends(backends) => self.main_backends = Some(backends),
+            Reply::MainBackendSaved(backend) => {
+                if let Some(backends) = &mut self.main_backends {
+                    backends.selected = backend;
+                }
+            }
             Reply::Harnesses(harnesses) => self.harnesses = harnesses,
             Reply::Main(main) => self.main = Some(main),
             Reply::Inventory(topics) => {

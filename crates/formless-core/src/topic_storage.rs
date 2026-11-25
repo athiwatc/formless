@@ -1,8 +1,8 @@
 use super::*;
 use anyhow::{anyhow, bail, Context};
 use formless_protocol::{
-    HarnessKind, Question, QuestionAnswer, StepAccess, TopicArtifact, TopicAttemptStatus,
-    TopicFeatureProposal, TopicProposalRequest, WorkspaceKind,
+    HarnessKind, MainChatBackend, Question, QuestionAnswer, StepAccess, TopicArtifact,
+    TopicAttemptStatus, TopicFeatureProposal, TopicProposalRequest, WorkspaceKind,
 };
 use rusqlite::params;
 use std::collections::{HashMap, HashSet};
@@ -805,6 +805,72 @@ impl Store {
             )
             .optional()?;
         Ok(main_id.as_deref() == Some(session_id))
+    }
+
+    pub(crate) fn main_chat_backend(&self) -> Result<MainChatBackend> {
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM profile_metadata WHERE key='main_chat_backend'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        stored.map_or_else(
+            || Ok(MainChatBackend::Inherit),
+            |value| Ok(serde_json::from_str(&value)?),
+        )
+    }
+
+    pub(crate) fn set_main_chat_backend(&self, backend: &MainChatBackend) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO profile_metadata(key,value) VALUES('main_chat_backend',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [serde_json::to_string(backend)?],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn session_main_chat_backend(&self, id: Option<&str>) -> Result<MainChatBackend> {
+        match id {
+            Some(id) if self.is_main_chat(id)? => self.main_chat_backend(),
+            _ => Ok(MainChatBackend::Inherit),
+        }
+    }
+
+    pub(crate) fn main_harness_turns(
+        &self,
+        id: &str,
+        mut bytes: usize,
+    ) -> Result<Vec<(String, String)>> {
+        if !self.is_main_chat(id)? {
+            bail!("not the canonical Main Chat");
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT role, substr(content, 1, ?2) FROM messages
+             WHERE session_id=?1 AND role IN ('user','assistant') AND generated_by IS NULL
+             ORDER BY seq DESC LIMIT 128",
+        )?;
+        let mut rows = statement.query(params![id, bytes as i64])?;
+        let mut turns = Vec::new();
+        while bytes > 0 {
+            let Some(row) = rows.next()? else { break };
+            let role: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            if !turns.is_empty() && content.len() > bytes {
+                break;
+            }
+            let content = if content.len() > bytes {
+                let end = content.floor_char_boundary(bytes);
+                format!("{}\n[message truncated]", &content[..end])
+            } else {
+                content
+            };
+            bytes = bytes.saturating_sub(content.len());
+            turns.push((role, content));
+        }
+        turns.reverse();
+        Ok(turns)
     }
 
     pub fn main_chat(&self) -> Result<SessionInfo> {

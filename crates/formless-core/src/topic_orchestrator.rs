@@ -72,7 +72,7 @@ fn git(path: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().into())
 }
 
-fn private_dir(root: &Path, relative: &Path) -> Result<PathBuf> {
+pub(super) fn private_dir(root: &Path, relative: &Path) -> Result<PathBuf> {
     let mut current = root.canonicalize()?;
     for component in relative.components() {
         let std::path::Component::Normal(component) = component else {
@@ -98,7 +98,7 @@ fn private_dir(root: &Path, relative: &Path) -> Result<PathBuf> {
     Ok(current)
 }
 
-fn private_file(path: &Path) -> Result<std::fs::File> {
+pub(super) fn private_file(path: &Path) -> Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -271,7 +271,7 @@ fn git_input(repo: &Path, topic: &TopicInfo, revision: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_log(path: &Path) -> Result<String> {
+pub(super) fn read_log(path: &Path) -> Result<String> {
     let mut data = Vec::new();
     std::fs::File::open(path)?
         .take(16 * 1024 * 1024 + 1)
@@ -1252,7 +1252,6 @@ impl Daemon {
                 ),
                 HarnessKind::Pi => executable("FORMLESS_TOPIC_PI_EXE")?,
                 HarnessKind::Muse => executable("FORMLESS_TOPIC_MUSE_EXE")?,
-                _ => None,
             },
             executable_argv0: if step.harness == HarnessKind::Acp {
                 resolved_acp_executable_argv0.map(|value| value.to_os_string())

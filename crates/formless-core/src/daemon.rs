@@ -25,6 +25,9 @@ mod topic_orchestrator;
 #[path = "topic_interactions.rs"]
 mod topic_interactions;
 
+#[path = "main_chat_backend.rs"]
+pub(crate) mod main_chat_backend;
+
 #[path = "transcript_attempts.rs"]
 mod transcript_attempts;
 
@@ -831,9 +834,11 @@ struct SentEntry {
 
 struct RunAdmission {
     pipeline: Option<Arc<crate::pipeline_policy::RunPolicy>>,
+    harness: Option<main_chat_backend::MainChatHarness>,
     cfg: Config,
     requested: String,
     resolved_model: String,
+    provider_name: Option<String>,
     routing_pick: Option<String>,
     effort: Option<String>,
     recovery_messages: Vec<MessageInfo>,
@@ -1454,7 +1459,8 @@ impl Daemon {
         session_id: &str,
         requested: Option<&str>,
     ) -> Result<Target> {
-        self.target_resolved(cfg, session_id, requested, None).await
+        self.target_resolved(cfg, session_id, requested, None, None)
+            .await
     }
     async fn target_resolved(
         &self,
@@ -1462,6 +1468,7 @@ impl Daemon {
         session_id: &str,
         requested: Option<&str>,
         resolved: Option<&str>,
+        provider_name: Option<&str>,
     ) -> Result<Target> {
         let (session_model, session_effort) = self.session_model_effort(session_id, cfg);
         // Aliases (`provider.aliases`) resolve at use, so changing one moves
@@ -1530,7 +1537,7 @@ impl Daemon {
         }
         Ok(Target {
             provider: self
-                .provider(cfg)
+                .provider_named(cfg, provider_name)
                 .await?
                 .resolved_dispatch(resolved.unwrap_or(&wanted)),
             model: resolved.unwrap_or(&wanted).to_string(),
@@ -2161,6 +2168,13 @@ impl Daemon {
             Request::GetMainChat => {
                 Ok(serde_json::to_value(self.with_store(|st| st.main_chat())?)?)
             }
+            Request::GetMainChatBackend => Ok(serde_json::to_value(
+                self.with_reader(Store::main_chat_backend)?,
+            )?),
+            Request::ListMainChatBackends => {
+                Ok(serde_json::to_value(self.list_main_chat_backends().await?)?)
+            }
+            Request::SetMainChatBackend { backend } => self.set_main_chat_backend(backend),
             Request::ProposeTopic { proposal } => Ok(serde_json::to_value(
                 self.propose_topic_request(&proposal)?,
             )?),
@@ -2770,6 +2784,11 @@ impl Daemon {
             }
             Request::ForecastRun { input, for_send } => {
                 let cfg = self.config()?;
+                if let Some(forecast) =
+                    self.with_reader(|st| main_chat_backend::harness_forecast(st, &cfg, &input))?
+                {
+                    return Ok(serde_json::to_value(forecast)?);
+                }
                 let mut input = input;
                 if input.model.is_none() {
                     input.model = input.options.model.clone().or_else(|| {
@@ -6157,9 +6176,35 @@ impl Daemon {
             });
         self.with_store(|st| st.get_session(&session_id))?
             .context(RequestFailure::not_found("session not found"))?;
+        let backend = self.with_reader(|st| st.session_main_chat_backend(Some(&session_id)))?;
+        let harness = main_chat_backend::ready_harness(&backend).await?;
         let _admission = self.forecast_admission.locked();
+        if self.with_reader(|st| st.session_main_chat_backend(Some(&session_id)))? != backend {
+            return Err(RequestFailure::busy("Main Chat backend changed; send again").into());
+        }
         self.with_reader(|st| Self::ensure_session_description_trust(st, &session_id))?;
         let control = self.runs.locked().get(&session_id).cloned();
+        let active_harness = control.as_ref().is_some_and(|control| {
+            self.run_admissions
+                .locked()
+                .get(&control.run_id)
+                .is_some_and(|run| run.harness.is_some())
+        });
+        if (harness.is_some() || active_harness) && mode == SendMode::Steer {
+            return Err(RequestFailure::invalid(
+                "Main Chat harnesses cannot be steered; queue a new message or stop the Run",
+            )
+            .into());
+        }
+        if harness.is_some() {
+            let cfg = self.config()?;
+            let input = ForecastInput {
+                session_id: Some(session_id.clone()),
+                draft: content.clone(),
+                ..Default::default()
+            };
+            self.with_reader(|st| main_chat_backend::harness_forecast(st, &cfg, &input))?;
+        }
         if let Some(expected_run) = outbox
             .as_ref()
             .and_then(|send| send.expected_run_id.as_deref())
@@ -6197,7 +6242,8 @@ impl Daemon {
                 return Err(RequestFailure::busy(reason).into());
             }
         }
-        let queue = mode == SendMode::Queue && control.is_some()
+        let queue = (mode == SendMode::Queue || harness.is_some() || active_harness)
+            && control.is_some()
             || control.as_ref().is_some_and(|control| {
                 !control.steering.accepts()
                     || control.cancel.is_cancelled()
@@ -6304,7 +6350,12 @@ impl Daemon {
                         if let Some(expected) = expected_attachments {
                             reviewed_send::check(st, &session_id, Some(expected))?;
                         }
-                        let forecast = self.consented_forecast(st, &cfg, &input)?;
+                        let forecast = if harness.is_some() {
+                            main_chat_backend::harness_forecast(st, &cfg, &input)?
+                                .context("Main Chat backend changed during admission")?
+                        } else {
+                            self.consented_forecast(st, &cfg, &input)?
+                        };
                         #[cfg(test)]
                         if let Some(hook) = self.forecast_admission_test.locked().clone() {
                             hook();
@@ -6313,8 +6364,11 @@ impl Daemon {
                             st.mark_last_run_followup(&session_id, "corrected")?;
                         }
                         let msg = Self::append_user_message_store(st, &session_id, &content, None)?;
-                        let admission =
-                            self.prepare_run_admission(st, &cfg, &session_id, &forecast, None)?;
+                        let admission = if let Some(harness) = harness {
+                            Self::main_harness_admission(&cfg, harness)
+                        } else {
+                            self.prepare_run_admission(st, &cfg, &session_id, &forecast, None)?
+                        };
                         let run_id = st.create_run(&session_id)?;
                         st.record_forecast(&run_id, &forecast)?;
                         let outcome = json!({"started":true,"run_id":run_id});
@@ -6401,6 +6455,15 @@ impl Daemon {
         resumed_from: Option<String>,
     ) -> Result<Arc<RunAdmission>> {
         Self::ensure_session_description_trust(st, session_id)?;
+        if matches!(
+            st.session_main_chat_backend(Some(session_id))?,
+            MainChatBackend::Harness { .. }
+        ) {
+            return Err(RequestFailure::invalid(
+                "Send a new text message to start a Main Chat harness Run",
+            )
+            .into());
+        }
         let session = st
             .get_session(session_id)?
             .context("Session disappeared during admission")?;
@@ -6452,7 +6515,13 @@ impl Daemon {
             forecast.basis.model.clone()
         };
         let pcfg = cfg.provider_cfg(Some(name))?;
-        let effort = if let Some(role) = forecast.basis.role.strip_prefix("role:") {
+        let explicit_provider = matches!(
+            st.session_main_chat_backend(Some(session_id))?,
+            MainChatBackend::Provider { .. }
+        );
+        let effort = if explicit_provider {
+            forecast.basis.reasoning_effort.clone()
+        } else if let Some(role) = forecast.basis.role.strip_prefix("role:") {
             cfg.role(role)?
                 .reasoning_effort
                 .clone()
@@ -6494,9 +6563,11 @@ impl Daemon {
         let checkpoint = crate::forecast::hash(&st.latest_checkpoint_record(session_id)?);
         Ok(Arc::new(RunAdmission {
             pipeline: None,
+            harness: None,
             cfg: fixed,
             requested,
             resolved_model: forecast.basis.model.clone(),
+            provider_name: explicit_provider.then(|| name.to_owned()),
             routing_pick,
             effort,
             recovery_messages,
@@ -6561,26 +6632,13 @@ impl Daemon {
             .map(|id| st.get_session(id))
             .transpose()?
             .flatten();
-        let wanted = cfg.provider.resolve_alias(
-            &input
-                .model
-                .clone()
-                .or_else(|| session.and_then(|s| s.model))
-                .unwrap_or_else(|| cfg.provider.model.clone()),
-        );
-        let role_name = wanted.strip_prefix("role:");
+        let selection =
+            crate::forecast::model_selection(st, cfg, session.as_ref(), input.model.as_deref())?;
+        let role_name = selection.role.as_deref();
         let role = role_name.map(|r| cfg.role(r)).transpose()?;
-        let provider = cfg.provider_cfg(role.and_then(|r| r.provider.as_deref()))?;
-        let model = role.map_or_else(
-            || wanted.clone(),
-            |r| {
-                provider.resolve_alias(if r.model.is_empty() {
-                    &provider.model
-                } else {
-                    &r.model
-                })
-            },
-        );
+        let name = selection.provider.as_str();
+        let provider = cfg.provider_cfg_ref(Some(name))?;
+        let model = selection.model;
         if !ProviderCfg::is_auto_model(&model) {
             return Ok(model);
         }
@@ -6594,9 +6652,7 @@ impl Daemon {
                 .routing_role_choice(
                     cfg,
                     role_name.unwrap(),
-                    role.provider
-                        .as_deref()
-                        .unwrap_or(crate::config::DEFAULT_PROVIDER),
+                    name,
                     &candidates,
                     rand::random::<f64>() < cfg.tools.task_explore_rate,
                 )?
@@ -6625,9 +6681,16 @@ impl Daemon {
         Ok(st
             .routing_auto_choice(
                 cfg,
-                role.and_then(|r| r.provider.as_deref())
-                    .unwrap_or(crate::config::DEFAULT_PROVIDER),
-                crate::routing::is_complex_tokens(max, tools, cfg.provider.routing_complex_chars),
+                name,
+                crate::routing::is_complex_tokens(
+                    max,
+                    tools,
+                    if selection.main_provider {
+                        provider.routing_complex_chars
+                    } else {
+                        cfg.provider.routing_complex_chars
+                    },
+                ),
             )?
             .context("no model candidates")?
             .model)
@@ -6983,7 +7046,34 @@ impl Daemon {
                 runs.remove(&session_id);
             }
         }
-        self.start_next_queued_message(session_id);
+        self.start_next_queued_message(session_id).await;
+    }
+
+    async fn start_next_queued_message(self: &Arc<Self>, session_id: String) {
+        let ready = async {
+            let backend = self.with_reader(|st| {
+                if st.peek_queued_message_with_policy(&session_id)?.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(st.session_main_chat_backend(Some(&session_id))?))
+            })?;
+            let Some(backend) = backend else {
+                return Ok::<_, anyhow::Error>(None);
+            };
+            let harness = main_chat_backend::ready_harness(&backend).await?;
+            Ok(Some((backend, harness)))
+        }
+        .await;
+        match ready {
+            Ok(Some((backend, harness))) => {
+                self.admit_next_queued_message(session_id, backend, harness)
+            }
+            Ok(None) => {}
+            Err(error) => self.broadcast(Event::Note {
+                session_id: Some(session_id),
+                text: format!("Queued message kept: {error}"),
+            }),
+        }
     }
 
     fn finish_tail_failed(&self, session_id: &str, step: &str, p: &Box<dyn std::any::Any + Send>) {
@@ -7130,7 +7220,12 @@ impl Daemon {
         }
     }
 
-    fn start_next_queued_message(self: &Arc<Self>, session_id: String) {
+    fn admit_next_queued_message(
+        self: &Arc<Self>,
+        session_id: String,
+        backend: MainChatBackend,
+        harness: Option<main_chat_backend::MainChatHarness>,
+    ) {
         let _admission = self.forecast_admission.locked();
         let _settings = self.config_guard();
         if self.runs.locked().contains_key(&session_id) || self.session_is_publishing(&session_id) {
@@ -7151,6 +7246,9 @@ impl Daemon {
         let mut held_for_confirmation = false;
         let prepared = self.with_store(|st| {
             st.transaction(|st| {
+                if st.session_main_chat_backend(Some(&session_id))? != backend {
+                    return Err(RequestFailure::busy("Main Chat backend changed; move the queued message to the composer and send it again").into());
+                }
                 let Some((next_content, no_pending_attachments)) =
                     st.peek_queued_message_with_policy(&session_id)?
                 else {
@@ -7161,14 +7259,15 @@ impl Daemon {
                     draft: next_content,
                     ..Default::default()
                 };
-                let selected = self.action_model(st, &cfg, &input)?;
-                let forecast = self.forecast_estimate_selected_with_pending_attachments(
-                    st,
-                    &cfg,
-                    &input,
-                    Some(&selected),
-                    !no_pending_attachments,
-                )?;
+                let forecast = if harness.is_some() {
+                    main_chat_backend::harness_forecast(st, &cfg, &input)?
+                        .context("Main Chat backend changed during admission")?
+                } else {
+                    let selected = self.action_model(st, &cfg, &input)?;
+                    self.forecast_estimate_selected_with_pending_attachments(
+                        st, &cfg, &input, Some(&selected), !no_pending_attachments,
+                    )?
+                };
                 if forecast.confirmation_required {
                     held_for_confirmation = true;
                     return Ok(None);
@@ -7185,8 +7284,11 @@ impl Daemon {
                     None,
                     !no_pending_attachments,
                 )?;
-                let admission =
-                    self.prepare_run_admission(st, &cfg, &session_id, &forecast, None)?;
+                let admission = if let Some(harness) = harness {
+                    Self::main_harness_admission(&cfg, harness)
+                } else {
+                    self.prepare_run_admission(st, &cfg, &session_id, &forecast, None)?
+                };
                 let id = st.create_run(&session_id)?;
                 st.record_forecast(&id, &forecast)?;
                 Ok(Some((msg, id, admission)))
@@ -7195,13 +7297,20 @@ impl Daemon {
         if held_for_confirmation {
             self.broadcast(Event::Note { session_id: Some(session_id.clone()), text: "Queued message kept: its forecast requires confirmation. Move it to the composer and send to review the current quote.".into() });
         }
-        if let Ok(Some((msg, id, admission))) = prepared {
-            self.queue_changed(&session_id);
-            self.broadcast(Event::MessageAppended {
-                session_id: session_id.clone(),
-                message: msg,
-            });
-            let _ = self.launch_prepared_run(session_id, id, admission);
+        match prepared {
+            Ok(Some((msg, id, admission))) => {
+                self.queue_changed(&session_id);
+                self.broadcast(Event::MessageAppended {
+                    session_id: session_id.clone(),
+                    message: msg,
+                });
+                let _ = self.launch_prepared_run(session_id, id, admission);
+            }
+            Ok(None) => {}
+            Err(error) => self.broadcast(Event::Note {
+                session_id: Some(session_id),
+                text: format!("Queued message kept: {error}"),
+            }),
         }
     }
 
@@ -7528,6 +7637,11 @@ impl Daemon {
     ) -> Result<()> {
         self.with_reader(|st| Self::ensure_session_description_trust(st, session_id))?;
         let admitted = self.run_admissions.locked().get(run_id).cloned();
+        if let Some(harness) = admitted.as_ref().and_then(|a| a.harness.clone()) {
+            return self
+                .run_main_harness(session_id, run_id, harness, cancel)
+                .await;
+        }
         let cfg = match &admitted {
             Some(a) => a.cfg.clone(),
             None => self.config()?,
@@ -7549,7 +7663,12 @@ impl Daemon {
             )
             .into());
         }
-        if !cfg.provider.is_configured() {
+        if admitted
+            .as_ref()
+            .and_then(|a| a.provider_name.as_deref())
+            .is_none()
+            && !cfg.provider.is_configured()
+        {
             return Err(anyhow!(
                 "provider not configured; run the onboarding wizard"
             ));
@@ -7582,6 +7701,7 @@ impl Daemon {
                     session_id,
                     Some(&a.requested),
                     Some(&a.resolved_model),
+                    a.provider_name.as_deref(),
                 )
                 .await?
             }
@@ -12770,6 +12890,7 @@ impl Daemon {
         bytes: u64,
         mime: Option<String>,
     ) -> Result<Value> {
+        self.reject_main_harness_attachment(session_id)?;
         self.with_store(|st| st.get_session(session_id))?
             .context(RequestFailure::not_found("session not found"))?;
         if bytes as usize > MAX_ATTACHMENT_BYTES {
@@ -12844,6 +12965,10 @@ impl Daemon {
             .context(RequestFailure::not_found(
                 "no such upload (finished, aborted or expired)",
             ))?;
+        if let Err(error) = self.reject_main_harness_attachment(&u.session_id) {
+            self.discard_artifact_path(&u.part);
+            return Err(error);
+        }
         if u.received != u.expected {
             self.discard_artifact_path(&u.part);
             bail!(
@@ -12889,6 +13014,7 @@ impl Daemon {
         data_b64: &str,
         mime: Option<String>,
     ) -> Result<Value> {
+        self.reject_main_harness_attachment(session_id)?;
         use base64::Engine;
         self.with_store(|st| st.get_session(session_id))?
             .context(RequestFailure::not_found("session not found"))?;
@@ -13030,6 +13156,7 @@ impl Daemon {
     /// An `@` mention (SPEC §5.6): small files are attached, large files and
     /// directories go as a reference the agent can read with its Tools.
     fn attach_path(&self, session_id: &str, path: &str, root: Option<&str>) -> Result<Value> {
+        self.reject_main_harness_attachment(session_id)?;
         let session_root = self.session_cwd(session_id);
         let root_hint = root.or(session_root.as_deref());
         let cwd = std::env::current_dir()?;

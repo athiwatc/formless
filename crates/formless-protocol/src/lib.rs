@@ -39,6 +39,7 @@ pub const DURABLE_OUTBOX_FEATURE: &str = "durable_outbox_v1";
 /// A Steer review identifies one active Run and dispatch checks that identity.
 pub const REVIEWED_STEER_RUN_FEATURE: &str = "reviewed_steer_run_v1";
 pub const TOPIC_ORCHESTRATION_FEATURE: &str = "topic_orchestration_v2";
+pub const MAIN_CHAT_BACKEND_FEATURE: &str = "main_chat_backend_v1";
 pub const USAGE_BY_DAY_UTC_OFFSET_FEATURE: &str = "usage_by_day_utc_offset_v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +53,119 @@ pub enum HarnessKind {
     Antigravity,
     Acp,
     Muse,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MainChatBackend {
+    #[default]
+    Inherit,
+    Provider {
+        name: String,
+        model: Option<String>,
+        effort: Option<String>,
+    },
+    Harness {
+        harness: HarnessKind,
+        acp_agent: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MainChatProvider {
+    pub name: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MainChatBackends {
+    pub selected: MainChatBackend,
+    pub providers: Vec<MainChatProvider>,
+    pub harnesses: Vec<HarnessAvailability>,
+}
+
+impl MainChatBackend {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Inherit => "Inherit session model".into(),
+            Self::Provider {
+                name,
+                model,
+                effort,
+            } => {
+                let mut label = format!("Provider: {name}");
+                if let Some(model) = model {
+                    label.push_str(&format!(" · {model}"));
+                }
+                if let Some(effort) = effort {
+                    label.push_str(&format!(" · {effort}"));
+                }
+                label
+            }
+            Self::Harness { harness, acp_agent } => match acp_agent {
+                Some(agent) => format!("Harness: ACP ({agent})"),
+                None => format!("Harness: {harness:?}"),
+            },
+        }
+    }
+
+    pub fn same_choice(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Provider { name: a, .. }, Self::Provider { name: b, .. }) => a == b,
+            _ => self == other,
+        }
+    }
+}
+
+impl MainChatBackends {
+    pub fn choices(&self) -> Vec<(MainChatBackend, String)> {
+        let mut choices = vec![(
+            MainChatBackend::Inherit,
+            "Existing model and Role settings".into(),
+        )];
+        choices.extend(self.providers.iter().map(|p| {
+            (
+                MainChatBackend::Provider {
+                    name: p.name.clone(),
+                    model: None,
+                    effort: None,
+                },
+                format!(
+                    "Configured model: {}",
+                    if p.model.is_empty() {
+                        "(enter a model)"
+                    } else {
+                        &p.model
+                    }
+                ),
+            )
+        }));
+        choices.extend(self.harnesses.iter().map(|h| {
+            let state = if !h.installed {
+                "Not installed"
+            } else if h.signed_in == Some(false) {
+                "Sign in required"
+            } else if (h.kind == HarnessKind::Acp && h.signed_in.is_none())
+                || (h.kind != HarnessKind::Acp && h.version.is_none())
+            {
+                "Readiness not verified"
+            } else if h.signed_in.is_none() {
+                "Installed; sign-in unknown"
+            } else {
+                "Ready"
+            };
+            (
+                MainChatBackend::Harness {
+                    harness: h.kind,
+                    acp_agent: h.acp_agent.clone(),
+                },
+                h.detail
+                    .as_ref()
+                    .map_or_else(|| state.into(), |detail| format!("{state} · {detail}")),
+            )
+        }));
+        choices
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,6 +601,7 @@ pub const FEATURES: &[&str] = &[
     REVIEWED_SEND_MODE_FEATURE,
     REVIEWED_STEER_RUN_FEATURE,
     TOPIC_ORCHESTRATION_FEATURE,
+    MAIN_CHAT_BACKEND_FEATURE,
     IDLE_STEP_OFF_FEATURE,
     USAGE_BY_DAY_UTC_OFFSET_FEATURE,
     "reviewed_reference_detach_v1",
@@ -2658,6 +2773,11 @@ pub enum Request {
     },
     /// Persistent singleton identity for the user's primary chat conversation.
     GetMainChat,
+    GetMainChatBackend,
+    ListMainChatBackends,
+    SetMainChatBackend {
+        backend: MainChatBackend,
+    },
     /// Persist a pending topic proposal; this never relocates messages or starts a harness.
     ProposeTopic {
         proposal: TopicProposalRequest,

@@ -1,10 +1,10 @@
 use crate::input::InputLine;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use formless_protocol::{
-    HarnessKind, HarnessPermissionOption, HarnessPermissionOptionKind, MessageInfo, Request,
-    SessionInfo, StepAccess, TopicArtifact, TopicAttemptInfo, TopicAttemptStatus,
-    TopicFeatureStatus, TopicInfo, TopicLimits, TopicProposalRequest, TopicRuleDecision,
-    TopicStatus, TopicStepOutline, WorkspaceKind,
+    HarnessKind, HarnessPermissionOption, HarnessPermissionOptionKind, MainChatBackend,
+    MainChatBackends, MessageInfo, Request, SessionInfo, StepAccess, TopicArtifact,
+    TopicAttemptInfo, TopicAttemptStatus, TopicFeatureStatus, TopicInfo, TopicLimits,
+    TopicProposalRequest, TopicRuleDecision, TopicStatus, TopicStepOutline, WorkspaceKind,
 };
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::prelude::*;
@@ -53,6 +53,7 @@ pub enum Action {
     None,
     Close,
     OpenMain,
+    SetMainBackend(MainChatBackend),
     OpenTopic(String),
     OpenAttempt {
         topic_id: String,
@@ -609,6 +610,7 @@ fn nonblank(value: &str) -> Option<String> {
 #[derive(Clone, Debug)]
 enum Overlay {
     Picker,
+    MainBackend(Box<MainBackendPicker>),
     Proposal,
     Review {
         topic_id: String,
@@ -626,6 +628,44 @@ enum Overlay {
         topic_id: String,
         reason: Box<InputLine>,
     },
+}
+
+#[derive(Clone, Debug)]
+struct MainBackendPicker {
+    catalog: MainChatBackends,
+    rows: Vec<(MainChatBackend, String)>,
+    index: usize,
+    field: usize,
+    model: InputLine,
+    effort: InputLine,
+}
+
+impl MainBackendPicker {
+    fn input(&mut self) -> Option<&mut InputLine> {
+        match self.field {
+            1 => Some(&mut self.model),
+            2 => Some(&mut self.effort),
+            _ => None,
+        }
+    }
+
+    fn select(&mut self, index: usize) {
+        self.index = index;
+        self.field = 0;
+        let stored = self
+            .catalog
+            .selected
+            .same_choice(&self.rows[index].0)
+            .then_some(&self.catalog.selected);
+        let (model, effort) = match stored {
+            Some(MainChatBackend::Provider { model, effort, .. }) => {
+                (model.as_deref(), effort.as_deref())
+            }
+            _ => (None, None),
+        };
+        self.model.set(model.unwrap_or_default());
+        self.effort.set(effort.unwrap_or_default());
+    }
 }
 
 pub struct State {
@@ -707,6 +747,11 @@ impl State {
                 }
             }
             Some(Overlay::Reject { reason, .. }) => reason.insert_str(&text),
+            Some(Overlay::MainBackend(picker)) => {
+                if let Some(input) = picker.input() {
+                    input.insert_str(&text);
+                }
+            }
             _ => {}
         }
     }
@@ -938,6 +983,24 @@ impl State {
 
     pub fn open_picker(&mut self) {
         self.overlay = Some(Overlay::Picker);
+    }
+
+    pub fn open_main_backend(&mut self, catalog: MainChatBackends) {
+        let rows = catalog.choices();
+        let index = rows
+            .iter()
+            .position(|(row, _)| row.same_choice(&catalog.selected))
+            .unwrap_or(0);
+        let mut picker = MainBackendPicker {
+            catalog,
+            rows,
+            index,
+            field: 0,
+            model: Default::default(),
+            effort: Default::default(),
+        };
+        picker.select(index);
+        self.overlay = Some(Overlay::MainBackend(Box::new(picker)));
     }
 
     pub fn open_details(&mut self, topic_id: &str) -> bool {
@@ -1301,6 +1364,54 @@ impl State {
         }
         let review_overlay = matches!(overlay, Overlay::Review { .. });
         match overlay {
+            Overlay::MainBackend(mut picker) => {
+                let is_provider = matches!(
+                    picker.rows[picker.index].0,
+                    MainChatBackend::Provider { .. }
+                );
+                match key.code {
+                    KeyCode::Esc => {
+                        self.close_overlay();
+                        return Action::Close;
+                    }
+                    KeyCode::Enter => {
+                        let mut backend = picker.rows[picker.index].0.clone();
+                        if let MainChatBackend::Provider { model, effort, .. } = &mut backend {
+                            let value = |line: &InputLine| {
+                                let text = line.expanded().trim().to_owned();
+                                (!text.is_empty()).then_some(text)
+                            };
+                            *model = value(&picker.model);
+                            *effort = value(&picker.effort);
+                        }
+                        self.close_overlay();
+                        return Action::SetMainBackend(backend);
+                    }
+                    KeyCode::Up => picker.select(picker.index.saturating_sub(1)),
+                    KeyCode::Down => picker.select((picker.index + 1).min(picker.rows.len() - 1)),
+                    KeyCode::Tab if is_provider => picker.field = (picker.field + 1) % 3,
+                    KeyCode::BackTab if is_provider => picker.field = (picker.field + 2) % 3,
+                    _ => {
+                        if let Some(input) = picker.input() {
+                            match key.code {
+                                KeyCode::Backspace => input.backspace(),
+                                KeyCode::Left => input.left(),
+                                KeyCode::Right => input.right(),
+                                KeyCode::Char(c)
+                                    if !key
+                                        .modifiers
+                                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                                {
+                                    input.insert_str(&c.to_string())
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                self.overlay = Some(Overlay::MainBackend(picker));
+                Action::None
+            }
             Overlay::Picker => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.close_overlay();
@@ -1802,6 +1913,54 @@ impl State {
         let area = centered(frame.area(), 88, 88);
         frame.render_widget(Clear, area);
         match overlay {
+            Overlay::MainBackend(picker) => {
+                let block = crate::ui::panel(" Main Chat backend ", color, Color::Cyan);
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                let mut lines = vec![
+                    Line::from(format!("Current: {}", picker.catalog.selected.label())),
+                    Line::from("↑/↓ choose · Tab edit model/effort · Enter save · Esc close"),
+                ];
+                let list_height = (inner.height as usize).saturating_sub(5).max(1);
+                let start = picker.index.saturating_add(1).saturating_sub(list_height);
+                for (i, (backend, detail)) in
+                    picker.rows.iter().enumerate().skip(start).take(list_height)
+                {
+                    let active = i == picker.index;
+                    lines.push(Line::styled(
+                        format!(
+                            "{} {} — {detail}",
+                            if active { "›" } else { " " },
+                            backend.label()
+                        ),
+                        if active {
+                            Style::default().add_modifier(Modifier::REVERSED)
+                        } else {
+                            Style::default()
+                        },
+                    ));
+                }
+                if matches!(
+                    picker.rows[picker.index].0,
+                    MainChatBackend::Provider { .. }
+                ) {
+                    for (field, label, input) in
+                        [(1, "Model", &picker.model), (2, "Effort", &picker.effort)]
+                    {
+                        let text = input.expanded();
+                        lines.push(Line::from(format!(
+                            "{} {label}: {}",
+                            if picker.field == field { "›" } else { " " },
+                            if text.is_empty() {
+                                "(provider default)"
+                            } else {
+                                &text
+                            }
+                        )));
+                    }
+                }
+                frame.render_widget(Paragraph::new(lines), inner);
+            }
             Overlay::Picker => self.draw_picker(frame, area, color),
             Overlay::Proposal => self.draw_proposal(frame, area, color),
             Overlay::Review { topic_id, scroll } => {
@@ -1841,7 +2000,9 @@ impl State {
         let header = vec![
             Line::from(format!(
                 "{}{step} · {harness}",
-                if topic.is_empty() {
+                if permission.topic_id.is_empty() {
+                    "Main Chat"
+                } else if topic.is_empty() {
                     &permission.topic_id
                 } else {
                     &topic
@@ -2574,6 +2735,50 @@ fn centered(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_backend_picker_edits_provider_override_and_shows_unready_harness() {
+        let mut state = State::default();
+        state.open_main_backend(MainChatBackends {
+            selected: MainChatBackend::Provider {
+                name: "work".into(),
+                model: Some("saved-model".into()),
+                effort: None,
+            },
+            providers: vec![formless_protocol::MainChatProvider {
+                name: "work".into(),
+                model: "configured-model".into(),
+            }],
+            harnesses: vec![formless_protocol::HarnessAvailability {
+                kind: HarnessKind::Claude,
+                acp_agent: None,
+                installed: false,
+                signed_in: None,
+                version: None,
+                detail: None,
+            }],
+        });
+        let Some(Overlay::MainBackend(picker)) = &state.overlay else {
+            panic!("no backend picker")
+        };
+        assert_eq!(picker.rows[2].1, "Not installed");
+        assert_eq!(picker.index, 1);
+        let press = |state: &mut State, key| state.key(KeyEvent::new(key, KeyModifiers::NONE));
+        press(&mut state, KeyCode::Tab);
+        press(&mut state, KeyCode::Tab);
+        state.paste("high");
+        let Action::SetMainBackend(backend) = press(&mut state, KeyCode::Enter) else {
+            panic!("no backend action")
+        };
+        assert_eq!(
+            backend,
+            MainChatBackend::Provider {
+                name: "work".into(),
+                model: Some("saved-model".into()),
+                effort: Some("high".into()),
+            }
+        );
+    }
 
     fn session(id: &str) -> SessionInfo {
         SessionInfo {

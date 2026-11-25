@@ -358,6 +358,8 @@ enum Pending {
         generation: u64,
         open: bool,
     },
+    MainBackendCatalog,
+    MainBackendSaved,
     TopicList {
         generation: u64,
     },
@@ -3490,6 +3492,8 @@ impl App {
                             unreachable!("approval acknowledgements handled above")
                         }
                         Pending::TopicCapability { .. }
+                        | Pending::MainBackendCatalog
+                        | Pending::MainBackendSaved
                         | Pending::TopicMain { .. }
                         | Pending::TopicList { .. }
                         | Pending::TopicGet { .. }
@@ -8007,6 +8011,7 @@ impl App {
             ),
             "sessions" => self.open_view(View::Sessions),
             "main" | "topics" | "topic" => self.topic_slash(cmd, ""),
+            cmd if cmd.starts_with("main ") => self.topic_slash("main", &cmd[5..]),
             cmd if cmd.starts_with("topic ") => self.topic_slash("topic", &cmd[6..]),
             "fork" => {
                 if let Some(id) = self.current.clone() {

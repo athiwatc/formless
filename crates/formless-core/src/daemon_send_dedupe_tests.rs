@@ -577,7 +577,7 @@ async fn queued_text_outbox_drain_ignores_later_image_for_forecast() {
     assert!(image_gate.confirmation_required);
 
     assert!(daemon.runs.locked().remove(&sid).is_some());
-    daemon.start_next_queued_message(sid.clone());
+    daemon.start_next_queued_message(sid.clone()).await;
     let (queue, messages, inventory) = daemon
         .with_reader(|st| {
             Ok((

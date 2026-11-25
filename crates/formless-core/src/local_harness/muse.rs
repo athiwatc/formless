@@ -203,7 +203,10 @@ struct Launch {
 fn launch_spec(request: &HarnessRequest, read_only: bool, trust_workspace: bool) -> Launch {
     let server = format!("formless_{}", Uuid::new_v4().simple());
     let selector = format!("mcp__{server}__*");
-    let mut tools = vec!["read_file", "request_user_input", &selector];
+    let mut tools = vec!["read_file", "request_user_input"];
+    if request.has_mcp() {
+        tools.push(&selector);
+    }
     let mut args: Vec<OsString> = [
         "serve",
         "--no-session-log",
@@ -255,6 +258,9 @@ fn launch_spec(request: &HarnessRequest, read_only: bool, trust_workspace: bool)
 }
 
 fn session_config(request: &HarnessRequest, server: &str) -> Result<Value> {
+    if !request.has_mcp() {
+        return Ok(json!({"mcpServers": {}}));
+    }
     let command = request
         .mcp_command
         .to_str()
@@ -295,6 +301,9 @@ async fn run_session(
     let mut command = launch.command.command();
     for name in &request.mcp_env_vars {
         command.env_remove(name);
+    }
+    if !request.has_mcp() {
+        command.env_remove(super::TOPIC_CAPABILITY_ENV);
     }
     command
         .stdin(Stdio::piped())

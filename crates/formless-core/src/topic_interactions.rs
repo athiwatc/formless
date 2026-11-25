@@ -1010,7 +1010,7 @@ impl Daemon {
         }))
     }
 
-    async fn topic_prompt_gate(
+    pub(super) async fn topic_prompt_gate(
         &self,
         session_id: &str,
         cancel: &CancellationToken,
@@ -1132,6 +1132,48 @@ impl Daemon {
         removed.is_some()
     }
 
+    pub(super) async fn wait_main_harness_permission(
+        &self,
+        session_id: &str,
+        harness: HarnessKind,
+        acp_agent: Option<String>,
+        request: HarnessPermissionRequest,
+        cancel: &CancellationToken,
+    ) -> Option<String> {
+        permission_option_ids(&request).ok()?;
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let (sender, mut receiver) = oneshot::channel();
+        self.harness_permissions.locked().insert(
+            id.clone(),
+            PendingPermission {
+                topic_id: String::new(),
+                attempt_id: String::new(),
+                options: request.options.clone(),
+                sender,
+            },
+        );
+        self.broadcast(Event::HarnessPermissionRequested {
+            permission_id: id.clone(),
+            session_id: session_id.into(),
+            topic_id: String::new(),
+            attempt_id: String::new(),
+            harness,
+            acp_agent,
+            title: request.title,
+            kind: request.kind,
+            raw_input: request.raw_input,
+            options: request.options,
+        });
+        tokio::select! {
+            _ = cancel.cancelled() => self.cancel_permission_wait(&id, &mut receiver),
+            _ = self.shutdown.cancelled() => self.cancel_permission_wait(&id, &mut receiver),
+            answer = &mut receiver => answer.ok().flatten(),
+        }
+    }
+
     pub(super) fn close_topic_decisions(&self, topic_id: &str, feature_id: Option<&str>) {
         self.topic_substitutes
             .locked()
@@ -1224,7 +1266,7 @@ impl Daemon {
             {
                 bail!("permission option was not offered");
             }
-            if !st.resume_topic_attempt(&pending.attempt_id)? {
+            if !pending.topic_id.is_empty() && !st.resume_topic_attempt(&pending.attempt_id)? {
                 bail!("attempt is no longer waiting for permission");
             }
             let pending = permissions.remove(id).context("permission vanished")?;
@@ -1236,7 +1278,9 @@ impl Daemon {
             option_id,
             by: current_client().map(|(_, label)| label),
         });
-        self.broadcast(Event::TopicChanged { topic_id });
+        if !topic_id.is_empty() {
+            self.broadcast(Event::TopicChanged { topic_id });
+        }
         Ok(json!({"answered":true}))
     }
 
