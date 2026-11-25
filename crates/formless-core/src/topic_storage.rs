@@ -188,16 +188,34 @@ impl Store {
     }
     pub(crate) fn update_topic_message(&self, message: &MessageInfo) -> Result<()> {
         self.note_rewrite();
-        self.conn.execute(
-            "UPDATE messages SET content=?3,meta=?4 WHERE session_id=?1 AND id=?2",
-            params![
-                message.session_id,
-                message.id,
-                message.content,
-                message.meta
-            ],
-        )?;
-        Ok(())
+        self.transaction(|st| {
+            let existing: Option<(i64, String)> = st
+                .conn
+                .query_row(
+                    "SELECT rowid,content FROM messages WHERE session_id=?1 AND id=?2",
+                    params![message.session_id, message.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((rowid, previous_content)) = existing {
+                if previous_content != message.content {
+                    st.remove_unicode_search_index(rowid, &previous_content)?;
+                }
+                st.conn.execute(
+                    "UPDATE messages SET content=?3,meta=?4 WHERE session_id=?1 AND id=?2",
+                    params![
+                        message.session_id,
+                        message.id,
+                        message.content,
+                        message.meta
+                    ],
+                )?;
+                if previous_content != message.content {
+                    st.add_unicode_search_index(rowid, &message.content)?;
+                }
+            }
+            Ok(())
+        })
     }
     #[cfg(test)]
     pub(crate) fn delete_topic_message_for_test(
@@ -1815,5 +1833,27 @@ fn harness_label(harness: HarnessKind) -> &'static str {
         HarnessKind::Antigravity => "Antigravity",
         HarnessKind::Acp => "ACP",
         HarnessKind::Muse => "Muse",
+    }
+}
+
+#[cfg(test)]
+mod unicode_search_index_tests {
+    use super::*;
+
+    #[test]
+    fn topic_message_updates_refresh_unicode_search_index() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap();
+        let mut message = store
+            .append_message(&session.id, "assistant", "旧しい内容")
+            .unwrap();
+        message.content = "新しい内容".into();
+
+        store.update_topic_message(&message).unwrap();
+
+        assert!(store.search_sessions("旧しい", 20).unwrap().is_empty());
+        let hits = store.search_sessions("新しい", 20).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].message_id, message.id);
     }
 }

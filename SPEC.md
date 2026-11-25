@@ -4520,8 +4520,8 @@ run_tool = "network_policy"     # a registry Tool, or…
   [MODEL]` removes weights, the tokenizer and partial downloads for one
   model. `formless naming remove --all` removes those files for every
   supported naming model. Removal respects the same lock as downloads and
-  model loading. Automatic downloads can fetch the configured model again
-  unless `naming.auto_download` is disabled.
+  model loading. If `naming.auto_download` is enabled, a future naming attempt
+  can fetch the configured model again.
 - **Title cleanup.** Model and fallback heuristic titles strip balanced
   quote/backtick/emphasis wrappers and a leading Markdown heading marker only
   when followed by whitespace. Unpaired punctuation is retained: `C#`,
@@ -4808,6 +4808,11 @@ run_tool = "network_policy"     # a registry Tool, or…
     (including configuration environment overrides, but independent of the
     running daemon's approval-mode display override). `?` opens the complete entry
     in the scrollable text viewer for long descriptions or small terminals;
+  - enabling `naming.auto_download` requires a supported catalogue model.
+    Enter/Space arms consent and a separate `y` confirms it; Escape cancels.
+    Repeated Enter/Space presses do not confirm. Without a supported model,
+    the Web and TUI explain that downloads are unavailable and do not save
+    the setting as enabled;
   - every settable key has an editor or a read-only pointer to config.toml,
     including keys in whole settable sections; optional keys remain visible
     when unset. File-only hooks, security and MCP areas show compact counts,
@@ -5602,6 +5607,9 @@ previous headless Run's Session.
   with no daemon or profile needed. `scripts/install.sh` writes bash, zsh
   and fish completions under `$PREFIX/share`, and the Homebrew formula
   installs them with `generate_completions_from_executable`.
+  Fish completions also suggest `docs` topics while the optional topic
+  argument is unfilled; a supplied topic stops those suggestions. `--print`
+  and `--text` may accompany a topic, but `--keys` may not.
 - The man page, `formless.1`, is generated from the same definitions
   (clap_mangen) by a hidden `formless man`. Releases put it in each Unix
   tarball. `scripts/install.sh` installs it to `$PREFIX/share/man/man1`, and
@@ -6073,7 +6081,39 @@ during its snapshot fetch, deduplicated by message id.
   and URL fragments never reach it. Offline, the status pill says "offline
   · daemon unreachable" and the transcript says the daemon is offline. The
   CSP allows `manifest-src 'self'` and `worker-src 'self'` for this.
+  Installed browsers that implement Web Share Target can share a title,
+  text, URL, image, text file or PDF to Formless. The service worker stores
+  the incoming content in the browser's IndexedDB until the client connects.
+  Share POSTs reject explicit foreign origins and `Sec-Fetch-Site` values of
+  `cross-site` or `same-site`. Same-origin requests and directly user-initiated
+  `Sec-Fetch-Site: none` launches can be applied immediately. Ambiguous
+  opaque/missing-origin ingress without trusted Fetch Metadata is stored in
+  the local inbox and requires the user to choose Add to draft or discard
+  before any draft or attachment changes. Native Android share-sheet delivery
+  has not been verified; legacy browsers may also require this confirmation.
+  The share uses the app's existing launch selection: linked Session, current
+  Session, saved per-scope Session, Main Chat, then the first Session. If there
+  is no writable selection, it opens or creates Main Chat through the existing
+  `get_main_chat` path. The saved selection is the existing `sessionStorageKey`
+  preference, not a share-specific choice. A share to a Topic Chat attempt
+  opens its writable parent Topic Chat, or Main Chat if no parent is writable.
+  An unfinished share records its storage scope and destination Session so a retry cannot redirect
+  text or files after the user switches chats. Formless adds text to that
+  Session's draft and stages files through the pending-attachment flow; the
+  pending attachment inventory restores chips when the Session is reopened.
+  Existing draft text is preserved, and nothing is sent until the user submits
+  it. The Main Chat shortcut opens Main Chat through the existing route, not a
+  newly created regular Session. The manifest also offers an Approvals shortcut
+  to the existing tool-grants view, with the platform-supported browser features. These manifest
+  features are supported by installed Chromium-based Android browsers;
+  Safari on iOS does not implement Web Share Target or manifest shortcuts,
+  and unsupported browsers ignore them. The relay's pairing key remains
+  governed by the existing "Stay paired after reloading this tab" choice;
+  sharing does not persist a new key.
   **Notifications (Web Push, opt-in per device):**
+  - Browser permission is requested only by an explicit Settings → This
+    browser action, never by sending a chat message; existing granted and
+    denied browser decisions are respected.
   - Settings → This browser subscribes with the relay's VAPID key
     (`GET /push/key`) and sends `{"relay":"push_subscribe","sub"}` to the
     room in the clear; a subscription is not Session data. "Turn off"
@@ -6094,8 +6134,14 @@ during its snapshot fetch, deduplicated by message id.
     and a push service refusing our signature (400/401/403) shows there
     and in the log.
   - The service worker shows "An approval or a question is waiting for
-    you", and clicking it focuses the app. No Session content reaches the
-    relay or the push service.
+    you". A generic push click focuses an approval from the app-wide approval
+    queue, or the app-wide pending question if there is no approval; this
+    pending work is not filtered by the selected Session. If the app is closed,
+    it opens the saved Session and asks it to focus pending work. Pushes carry
+    no Session identifier, so they cannot select a waiting item in another
+    Session. Notifications raised by the connected page carry the relevant
+    Session locally and open it on click. No Session content reaches the relay
+    or the push service.
 
 ## 13. Configuration (complete settings table)
 
@@ -6296,7 +6342,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `limits.forecast_confirm_usd` | (none) | Ask before sending when a priced local forecast p90 exceeds this finite nonnegative USD amount; previews add no caps and unpriced/no-history forecasts have no invented dollar range (§5.2) |
 | `limits.daily_usd` / `run_usd` / `run_steps` | (none) | Opt-in spending limits: provider spend per UTC day across Sessions, spend of one Run, and model steps of one Run; a note at 80%, a pause at 100% (§5.2). Profile edits apply to an in-flight Run before its next model step (§5.4). |
 | `naming.enabled` | true | Rename "Untitled" Sessions after their first Run |
-| `naming.model` / `auto_download` / `timeout_secs` | qwen2.5-0.5b / true / 30 | Embedded naming model (empty: a heuristic title), fetched on first use, and how long one naming may take before the heuristic is used |
+| `naming.model` / `auto_download` / `timeout_secs` | qwen2.5-0.5b / false / 30 | Embedded naming model (empty: a heuristic title), whether to allow a first-use download of a supported catalogue model (without it, titles use a heuristic), and how long one naming may take before the heuristic is used |
 
 ## 14. Security
 
@@ -6383,9 +6429,14 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   secrets (§8.3). In builds with embedded model support, naming an untitled
   or provisionally named Session with suitable user text can download weights
   or a tokenizer when the selected [catalogue model](docs/architecture.md#local-naming-models)
-  needs them. Automatic naming and downloads are enabled by default. Set
-  `naming.auto_download = false` to disable automatic downloads or
-  `naming.enabled = false` to disable automatic naming.
+  needs them. Automatic naming is enabled by default, but model downloads are
+  opt-in. Older saved configs and hand-authored configs without the migration
+  marker are conservatively migrated to disable downloads, because an
+  unmarked `true` cannot be distinguished from the former default. Opt in
+  with `formless config set naming.auto_download true`, or in TOML set both
+  `auto_download = true` and `auto_download_migration_done = true` in
+  `[naming]`. Set `naming.enabled = false` to disable automatic naming.
+  Without the model, titles use a heuristic.
 - **Recording:** Invocation inputs/outputs are recorded for metrics + replay,
   with secret-pattern redaction (API keys, bearer tokens, configured
   patterns), capped at `metrics.retention_per_tool` (default 200/Tool).

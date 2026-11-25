@@ -72,6 +72,7 @@ jobs:
           set -euo pipefail
           if command -v cc >/dev/null && command -v python3 >/dev/null &&
              command -v pkg-config >/dev/null && pkg-config --exists dbus-1 &&
+             command -v fish >/dev/null &&
              command -v pdftoppm >/dev/null && command -v pdftotext >/dev/null &&
              python3 -c "import ensurepip" 2>/dev/null; then
             exit 0
@@ -82,7 +83,7 @@ jobs:
             ci_privilege=(sudo -n)
           fi
           "${ci_privilege[@]}" apt-get update
-          "${ci_privilege[@]}" apt-get install -y --no-install-recommends build-essential libdbus-1-dev pkg-config poppler-utils python3 python3-venv
+          "${ci_privilege[@]}" apt-get install -y --no-install-recommends build-essential fish libdbus-1-dev pkg-config poppler-utils python3 python3-venv
 
       - uses: actions/checkout@v7
         with:
@@ -239,6 +240,10 @@ jobs:
       - name: Linux Debian and RPM packaging regression tests
         if: runner.os == 'Linux'
         run: python3 scripts/test-package-completions.py 2>&1 | tee "$CI_DIR/logs/package-completions.log"
+
+      - name: Verify Fish for Linux completion tests
+        if: runner.os == 'Linux'
+        run: fish --version
 
       - name: Workspace unit, integration and doc tests
         run: cargo test --workspace --locked --no-fail-fast 2>&1 | tee "$CI_DIR/logs/rust-tests.log"

@@ -6,7 +6,7 @@
 
 use formless_core::storage::SCHEMA_VERSION;
 use formless_core::Store;
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use std::path::PathBuf;
 
 fn temp_db(tag: &str) -> PathBuf {
@@ -63,6 +63,7 @@ fn opening_a_v67_database_adds_query_indexes_once_without_changing_checkpoint_ro
     raw.execute_batch(
         "DROP INDEX idx_checkpoints_session;
          DROP INDEX idx_run_usage_created;
+         DROP TABLE messages_unicode_fts;
          PRAGMA user_version=67;",
     )
     .unwrap();
@@ -357,4 +358,329 @@ fn write_and_read_latency() {
     time("search_sessions", 200, || {
         std::hint::black_box(store.search_sessions("typical", 20).unwrap());
     });
+}
+
+#[test]
+fn tool_summary_groups_invocations_and_windowed_success_by_registry() {
+    let db = temp_db("tool-summary");
+    let store = Store::open(&db).unwrap();
+    let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
+    let session = store
+        .create_session(Some("summary fixture".into()))
+        .unwrap()
+        .id;
+    let (tool, version) = store
+        .create_tool_version(
+            "summary_fixture",
+            "summary fixture",
+            r#"{"type":"object"}"#,
+            "{}",
+            "function run(){}",
+            &caps,
+            64,
+            "test author",
+        )
+        .unwrap();
+    for (status, tag) in [("success", ""), ("failure", "validation"), ("denied", "")] {
+        store
+            .record_invocation(
+                &tool.id,
+                version,
+                Some(&session),
+                None,
+                None,
+                status,
+                tag,
+                "{}",
+                "",
+                "",
+                1,
+                200,
+            )
+            .unwrap();
+    }
+
+    let listed = store.list_tool_summaries(false).unwrap();
+    let summary = listed.iter().find(|row| row.id == tool.id).unwrap();
+    assert_eq!(summary.invocations, 3);
+    assert_eq!(summary.success_rate, Some(0.5));
+    assert_eq!(summary.author, "test author");
+    assert!(summary.last_used_at.is_some());
+    assert_eq!(summary.capabilities, Vec::<String>::new());
+    let windowed = store.windowed_successes(2).unwrap();
+    assert_eq!(windowed[&tool.id], (2, Some(0.5)));
+    drop(store);
+    std::fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn registry_rollup_migration_backfills_existing_invocations() {
+    let db = temp_db("registry-rollup-backfill");
+    let store = Store::open(&db).unwrap();
+    let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
+    let session = store
+        .create_session(Some("rollup migration fixture".into()))
+        .unwrap()
+        .id;
+    let (tool, version) = store
+        .create_tool_version(
+            "rollup_migration_fixture",
+            "rollup migration fixture",
+            r#"{"type":"object"}"#,
+            "{}",
+            "function run(){}",
+            &caps,
+            64,
+            "test author",
+        )
+        .unwrap();
+    for (status, tag) in [("success", ""), ("failure", "validation")] {
+        store
+            .record_invocation(
+                &tool.id,
+                version,
+                Some(&session),
+                None,
+                None,
+                status,
+                tag,
+                "{}",
+                "",
+                "",
+                1,
+                100,
+            )
+            .unwrap();
+    }
+    drop(store);
+
+    let connection = Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "DROP TRIGGER tool_invocation_summary_insert;
+             DROP TRIGGER tool_invocation_summary_update;
+             DROP TRIGGER tool_invocation_summary_delete;
+             DROP TRIGGER tool_invocation_sessions_insert;
+             DROP TRIGGER tool_invocation_sessions_delete;
+             DROP TABLE tool_invocation_sessions;
+             DROP TABLE tool_invocation_summary;
+             DROP INDEX idx_inv_tool_created;
+             DROP TABLE messages_unicode_fts;
+             PRAGMA user_version=78;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&db).unwrap();
+    let migrated = store.list_tool_summaries(false).unwrap();
+    let summary = migrated.iter().find(|row| row.id == tool.id).unwrap();
+    assert_eq!(summary.invocations, 2);
+    assert_eq!(summary.success_rate, Some(0.5));
+    assert_eq!(summary.author, "test author");
+    assert!(summary.last_used_at.is_some());
+    drop(store);
+    std::fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn tool_definitions_exclude_tools_without_a_current_version() {
+    let db = temp_db("missing-current-tool-version");
+    let store = Store::open(&db).unwrap();
+    let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
+    let (valid, _) = store
+        .create_tool_version(
+            "valid_current_version_fixture",
+            "valid current version fixture",
+            r#"{"type":"object"}"#,
+            "{}",
+            "function run(){}",
+            &caps,
+            64,
+            "test",
+        )
+        .unwrap();
+    let (dangling, _) = store
+        .create_tool_version(
+            "missing_current_version_fixture",
+            "missing current version fixture",
+            r#"{"type":"object"}"#,
+            "{}",
+            "function run(){}",
+            &caps,
+            64,
+            "test",
+        )
+        .unwrap();
+    drop(store);
+
+    let connection = Connection::open(&db).unwrap();
+    connection
+        .execute(
+            "UPDATE tools SET current_version=999 WHERE id=?1",
+            params![&dangling.id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&db).unwrap();
+    let listed = store.list_tool_summaries(false).unwrap();
+    assert!(listed.iter().any(|tool| tool.id == dangling.id));
+    let definitions = formless_core::tools::tool_definitions(&store, None, 40).unwrap();
+    assert!(definitions
+        .iter()
+        .any(|definition| definition["function"]["name"].as_str() == Some(valid.name.as_str())));
+    assert!(!definitions.iter().any(|definition| {
+        definition["function"]["name"].as_str() == Some(dangling.name.as_str())
+    }));
+    drop(store);
+    std::fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn windowed_successes_ignores_retired_and_attention_tools() {
+    let db = temp_db("windowed-eligible-tools");
+    let store = Store::open(&db).unwrap();
+    let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
+    let session = store
+        .create_session(Some("windowed fixture".into()))
+        .unwrap()
+        .id;
+    let mut ids = Vec::new();
+    for name in ["windowed_active", "windowed_retired", "windowed_attention"] {
+        let (tool, version) = store
+            .create_tool_version(
+                name,
+                name,
+                r#"{"type":"object"}"#,
+                "{}",
+                "function run(){}",
+                &caps,
+                64,
+                "test",
+            )
+            .unwrap();
+        store
+            .record_invocation(
+                &tool.id,
+                version,
+                Some(&session),
+                None,
+                None,
+                "failure",
+                "",
+                "{}",
+                "",
+                "",
+                1,
+                100,
+            )
+            .unwrap();
+        ids.push(tool.id);
+    }
+    drop(store);
+
+    let connection = Connection::open(&db).unwrap();
+    connection
+        .execute("UPDATE tools SET retired=1 WHERE id=?1", params![&ids[1]])
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE tools SET needs_attention=1 WHERE id=?1",
+            params![&ids[2]],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&db).unwrap();
+    let windowed = store.windowed_successes(1).unwrap();
+    assert!(windowed.contains_key(&ids[0]));
+    assert!(!windowed.contains_key(&ids[1]));
+    assert!(!windowed.contains_key(&ids[2]));
+    drop(store);
+    std::fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "release-mode scale check for the registry summary hot path"]
+fn registry_summary_and_tool_definitions_meet_the_500_by_200_budget() {
+    const TOOLS: usize = 500;
+    const INVOCATIONS_PER_TOOL: usize = 200;
+    let db = temp_db("registry-scale");
+    let store = Store::open(&db).unwrap();
+    let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
+    let session_id = store
+        .create_session(Some("registry scale fixture".into()))
+        .unwrap()
+        .id;
+    let mut tools = Vec::with_capacity(TOOLS);
+    for index in 0..TOOLS {
+        let (tool, version) = store
+            .create_tool_version(
+                &format!("registry_scale_{index:03}"),
+                "synthetic registry fixture",
+                r#"{"type":"object"}"#,
+                "{}",
+                "function run(){}",
+                &caps,
+                64,
+                "benchmark",
+            )
+            .unwrap();
+        tools.push((tool.id, version));
+    }
+    drop(store);
+
+    let mut connection = Connection::open(&db).unwrap();
+    let transaction = connection.unchecked_transaction().unwrap();
+    {
+        let mut insert = transaction
+            .prepare_cached(
+                "INSERT INTO invocations(id,tool_id,version,session_id,status,tag,created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,'2026-01-01T00:00:00+00:00')",
+            )
+            .unwrap();
+        for (tool_index, (tool_id, version)) in tools.iter().enumerate() {
+            for invocation_index in 0..INVOCATIONS_PER_TOOL {
+                let status = if invocation_index % 2 == 0 {
+                    "success"
+                } else {
+                    "failure"
+                };
+                insert
+                    .execute(params![
+                        format!("scale-{tool_index}-{invocation_index}"),
+                        tool_id,
+                        version,
+                        &session_id,
+                        status,
+                        "",
+                    ])
+                    .unwrap();
+            }
+        }
+    }
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let store = Store::open(&db).unwrap();
+    let started = std::time::Instant::now();
+    let listed = store.list_tool_summaries(false).unwrap();
+    let list_elapsed = started.elapsed();
+    let definitions_started = std::time::Instant::now();
+    let definitions = formless_core::tools::tool_definitions(&store, None, 40).unwrap();
+    let definitions_elapsed = definitions_started.elapsed();
+    let elapsed = started.elapsed();
+
+    assert_eq!(listed.len(), TOOLS);
+    assert!(listed
+        .iter()
+        .all(|tool| tool.invocations == INVOCATIONS_PER_TOOL as i64));
+    assert!(definitions.len() >= 40);
+    println!("500 Tools × 200 invocations: list {list_elapsed:?}, tool_definitions {definitions_elapsed:?}, total {elapsed:?}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(25),
+        "registry list + definitions took {elapsed:?}, expected under 25ms in release"
+    );
+    drop(store);
+    std::fs::remove_dir_all(db.parent().unwrap()).unwrap();
 }

@@ -13,7 +13,7 @@ export function installEventRenderFixture(context, fn) {
   // Event/session reducers use the production incremental live-text helpers.
   // Keep their state scoped to this VM, rather than stubbing cache resets.
   vm.runInContext('const liveText = { session: undefined, run: undefined, answer: {}, thinking: {}, answerSource: undefined, thinkingSource: undefined, expanded: false };\n'
-    + ['currentLiveText', 'appendLiveText', 'clearLiveText'].map(fn).join('\n'), context);
+    + ['currentLiveText', 'appendLiveText', 'clearLiveText', 'focusedLiveTools'].map(fn).join('\n'), context);
   // Keep presentation dependencies real when reducers render localized values.
   context.navigator ??= { language: 'en-US' };
   vm.runInContext(['uiLang', 'uiLocale', 'uiFormat', 'uiFixed', 'uiMoney'].map(fn).join('\n'), context);

@@ -20,6 +20,22 @@ fn fts_queries_are_quoted_prefix_terms() {
 }
 
 #[test]
+fn session_and_audit_search_fold_greek_final_sigma() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(None).unwrap();
+    let message = store.append_message(&session.id, "user", "ος").unwrap();
+    let longer_word = store.append_message(&session.id, "user", "λόγος").unwrap();
+    let hits = store.search_sessions("ΟΣ", 10).unwrap();
+    assert!(hits.iter().any(|hit| hit.message_id == message.id));
+    assert!(hits.iter().any(|hit| hit.message_id == longer_word.id));
+
+    store.audit("tester", "greek_search", "ος").unwrap();
+    let entries = store.list_audit(Some("ΟΣ"), None, 10).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].detail, "ος");
+}
+
+#[test]
 fn search_snippets_prefer_nearby_word_prefixes_and_keep_the_original_text() {
     let store = Store::open_in_memory().unwrap();
     let session = store.create_session(None).unwrap();
@@ -41,6 +57,44 @@ fn search_snippets_prefer_nearby_word_prefixes_and_keep_the_original_text() {
         single,
         &format!("Deploy early {}unr…", "unrelated ".repeat(5))
     );
+}
+
+#[test]
+fn multi_term_han_snippets_center_on_the_matching_passage() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(None).unwrap();
+    let message = format!(
+        "{}这里的目标内容说明了实际匹配段落{}",
+        "前置背景".repeat(40),
+        "后续材料".repeat(40)
+    );
+    store.append_message(&session.id, "user", &message).unwrap();
+
+    let hits = store.search_sessions("目标 内容", 1).unwrap();
+    let snippet = &hits[0].snippet;
+    assert!(snippet.contains("目标内容"), "{snippet}");
+    assert!(snippet.starts_with('…') && snippet.ends_with('…'));
+    assert!(snippet.chars().count() <= 102);
+    let before_match = snippet
+        .split("目标内容")
+        .next()
+        .unwrap()
+        .trim_start_matches('…');
+    assert_eq!(before_match.chars().count(), 40, "{snippet}");
+}
+
+#[test]
+fn overlapping_han_terms_keep_the_complete_matching_passage() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(None).unwrap();
+    let long_term = format!("{}乙", "甲".repeat(50));
+    let message = format!("{}，{}丙丁", "背景".repeat(60), long_term);
+    store.append_message(&session.id, "user", &message).unwrap();
+
+    let query = format!("{long_term} 乙");
+    let hits = store.search_sessions(&query, 1).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].snippet.contains(&long_term), "{}", hits[0].snippet);
 }
 
 #[test]

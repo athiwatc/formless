@@ -433,7 +433,7 @@ checkpoint_tests! {
 }
 
 #[tokio::test]
-async fn whole_v23_profile_answers_status_and_preserves_non_database_files() {
+async fn whole_v23_profile_answers_status_migrates_consent_and_preserves_key_and_artifact() {
     let env = credential_env::EnvGuard::isolated();
     env.remove("FORMLESS_BASE_URL");
     env.remove("FORMLESS_MODEL");
@@ -471,7 +471,36 @@ async fn whole_v23_profile_answers_status_and_preserves_non_database_files() {
     let loaded = Config::load_file_only(&paths).unwrap();
     assert_eq!(loaded.provider.model, "historical-fixture-model");
     assert_eq!(loaded.provider.context_tokens, 8192);
-    assert_eq!(std::fs::read(paths.config_file()).unwrap(), config);
+    let persisted_config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(paths.config_file()).unwrap()).unwrap();
+    assert_eq!(
+        persisted_config["provider"]["model"].as_str(),
+        Some("historical-fixture-model")
+    );
+    assert_eq!(
+        persisted_config["provider"]["base_url"].as_str(),
+        Some("http://127.0.0.1:9/v1")
+    );
+    assert_eq!(
+        persisted_config["provider"]["context_tokens"].as_integer(),
+        Some(8192)
+    );
+    assert_eq!(
+        persisted_config["provider"]["max_retries"].as_integer(),
+        Some(0)
+    );
+    assert_eq!(
+        persisted_config["optimiser"]["cooldown_secs"].as_integer(),
+        Some(3600)
+    );
+    assert_eq!(
+        persisted_config["naming"]["auto_download"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        persisted_config["naming"]["auto_download_migration_done"].as_bool(),
+        Some(true)
+    );
     assert_eq!(
         std::fs::read(paths.key_fallback_file()).unwrap(),
         key.as_bytes()

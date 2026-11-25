@@ -52,6 +52,14 @@ const CLIENT_QUEUE: usize = 4096;
 const MAX_FRAME: usize = formless_protocol::MAX_FRAME_BYTES;
 const MODEL_DOWNLOAD_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
+fn model_download_notice(spec: &ModelSpec) -> String {
+    format!(
+        "Downloading optional session-naming model {} ({}). Session titles use a heuristic until it is installed.",
+        spec.id,
+        namer::display_size(spec.gguf_bytes)
+    )
+}
+
 /// Session-update recency, independent of list pin/archive grouping. This is
 /// not measured model-use history; equal stored timestamps use Session IDs.
 fn recent_session_models(sessions: &[SessionInfo]) -> Vec<String> {
@@ -838,6 +846,8 @@ pub struct Daemon {
     run_publication_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     run_final_decision_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    model_download_test_spec: StdMutex<Option<ModelSpec>>,
     /// Fires when an approval or question starts waiting on the user (the
     /// relay turns it into a Web Push, SPEC §12).
     pub(crate) attention: tokio::sync::broadcast::Sender<()>,
@@ -1079,6 +1089,7 @@ impl Daemon {
         // tell every client that connects this lifetime.
         let mut startup_warnings = Vec::new();
         if !offline && paths.config_file().exists() {
+            let _ = Config::persist_naming_download_migration(&paths);
             if let Ok(mut cfg) = Config::load_file_only(&paths) {
                 if let Some(w) = cfg.migrate_global_auto() {
                     if cfg.save(&paths).is_ok() {
@@ -1136,6 +1147,8 @@ impl Daemon {
             run_publication_test: StdMutex::new(None),
             #[cfg(test)]
             run_final_decision_test: StdMutex::new(None),
+            #[cfg(test)]
+            model_download_test_spec: StdMutex::new(None),
             attention: tokio::sync::broadcast::channel(16).0,
             relay_clients: StdMutex::new(Default::default()),
             uploads: StdMutex::new(HashMap::new()),
@@ -4457,10 +4470,7 @@ impl Daemon {
                 Ok(serde_json::to_value(imported)?)
             }
             Request::StorageUsage => {
-                let mut u = self.with_reader(|st| crate::housekeeping::usage(&self.paths, st))?;
-                u["last_backup"] = json!(crate::housekeeping::last_backup(&self.paths)
-                    .map(|(f, _)| f.display().to_string()));
-                Ok(u)
+                self.with_reader(|st| crate::housekeeping::storage_usage(&self.paths, st))
             }
             Request::Gc { dry_run } => {
                 let cfg = self.config()?;
@@ -4910,7 +4920,7 @@ impl Daemon {
                 }
             }
             Request::ListTools => Ok(serde_json::to_value(
-                self.with_reader(|s| s.list_tools(true))?,
+                self.with_reader(|s| s.list_tool_summaries(true))?,
             )?),
             Request::ListModules => Ok(serde_json::to_value(
                 self.with_reader(|s| s.list_modules())?,
@@ -7166,12 +7176,20 @@ impl Daemon {
             return;
         };
         let spec = cfg.naming.spec();
+        #[cfg(test)]
+        let spec = {
+            let test_spec = *self
+                .model_download_test_spec
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            test_spec.or(spec)
+        };
         if let Some(spec) = spec {
             if cfg.naming.auto_download
                 && namer::embedded_available()
                 && !spec.installed(&self.paths)
             {
-                self.spawn_model_download(spec);
+                self.spawn_model_download(spec, session_id);
             }
         }
         let this = self.clone();
@@ -7390,7 +7408,7 @@ impl Daemon {
         Ok(())
     }
 
-    fn spawn_model_download(self: &Arc<Self>, spec: ModelSpec) {
+    fn spawn_model_download(self: &Arc<Self>, spec: ModelSpec, session_id: &str) {
         let Ok(mut retry_at) = self.model_download.clone().try_lock_owned() else {
             return;
         };
@@ -7398,12 +7416,17 @@ impl Daemon {
             return;
         }
         let this = self.clone();
+        let session_id = session_id.to_string();
         tokio::spawn(async move {
             tracing::info!(
-                "downloading session-naming model {} ({} MB)",
+                "downloading session-naming model {} ({})",
                 spec.id,
-                spec.gguf_bytes / 1_000_000
+                namer::display_size(spec.gguf_bytes)
             );
+            this.broadcast(Event::Note {
+                session_id: Some(session_id.clone()),
+                text: model_download_notice(&spec),
+            });
             let result = tokio::select! {
                 _ = this.shutdown.cancelled() => return,
                 result = namer::download(&this.paths, &spec) => result,
@@ -7411,11 +7434,23 @@ impl Daemon {
             if let Err(e) = result {
                 *retry_at = Some(tokio::time::Instant::now() + MODEL_DOWNLOAD_COOLDOWN);
                 tracing::warn!("session-naming model download failed: {e:#}");
+                this.broadcast(Event::Note {
+                    session_id: Some(session_id),
+                    text: "Session-naming model download failed; titles will continue using a heuristic.".into(),
+                });
                 return;
             }
             *retry_at = None;
             drop(retry_at);
             tracing::info!("session-naming model {} installed", spec.id);
+            this.broadcast(Event::Note {
+                session_id: Some(session_id),
+                text: format!(
+                    "Session-naming model {} is installed ({})",
+                    spec.id,
+                    namer::display_size(spec.gguf_bytes)
+                ),
+            });
             // Sessions titled by the heuristic while it downloaded
             // get a real title now (#871).
             let ids = this
@@ -20155,6 +20190,192 @@ mod model_download_tests {
     use tokio::sync::Notify;
     use tokio::time::{timeout, Instant};
 
+    fn subscribe(daemon: &Daemon) -> mpsc::Receiver<ServerMessage> {
+        let (tx, rx) = mpsc::channel(8);
+        daemon.subs.locked().push(Subscriber {
+            conn: 1,
+            tx: tx.into(),
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: CancellationToken::new(),
+            gaps: Default::default(),
+        });
+        rx
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn finish_first_run(daemon: &Arc<Daemon>) -> String {
+        let (session_id, run_id) = daemon
+            .with_store(|st| {
+                let session = st.create_session(None)?;
+                st.append_message(
+                    &session.id,
+                    "user",
+                    "Create a local-only fixture for first-run naming consent checks.",
+                )?;
+                let run_id = st.create_run(&session.id)?;
+                Ok((session.id, run_id))
+            })
+            .unwrap();
+        daemon
+            .finish_run(session_id.clone(), run_id, "completed")
+            .await;
+        session_id
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn wait_for_session_update(events: &mut mpsc::Receiver<ServerMessage>) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    events.recv().await.unwrap(),
+                    ServerMessage::Event(Event::SessionUpdated { .. })
+                ) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("first-run heuristic title was not published");
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn wait_for_note(
+        events: &mut mpsc::Receiver<ServerMessage>,
+        session_id: &str,
+        expected_text: &str,
+    ) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    ServerMessage::Event(Event::Note {
+                        session_id: Some(id),
+                        text,
+                    }) if id == session_id && text == expected_text => return,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("expected first-run model download status note");
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn assert_no_model_fetch(requests: &AtomicU64, requested: &Notify, paths: &Paths) {
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        assert!(timeout(Duration::from_millis(100), requested.notified())
+            .await
+            .is_err());
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        assert!(!namer::models_dir(paths).exists());
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    #[tokio::test]
+    async fn first_run_consent_gates_local_model_fetch_and_reports_status() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base =
+            std::env::temp_dir().join(format!("fl-first-run-download-{}", uuid::Uuid::new_v4()));
+        let requests = Arc::new(AtomicU64::new(0));
+        let requested = Arc::new(Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/tokenizer",
+            axum::routing::get({
+                let requests = requests.clone();
+                let requested = requested.clone();
+                move || {
+                    let (requests, requested) = (requests.clone(), requested.clone());
+                    async move {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        requested.notify_one();
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base_url = format!("http://{addr}");
+        let spec = ModelSpec {
+            id: "consent-fixture",
+            tokenizer_url: Box::leak(format!("{base_url}/tokenizer").into_boxed_str()),
+            tokenizer_sha256: Box::leak(
+                format!("{:x}", Sha256::digest(b"fixture tokenizer")).into_boxed_str(),
+            ),
+            gguf_url: Box::leak(format!("{base_url}/weights").into_boxed_str()),
+            gguf_sha256: Box::leak(
+                format!("{:x}", Sha256::digest(b"not a model")).into_boxed_str(),
+            ),
+            gguf_bytes: 42,
+            ..namer::QWEN2_5_0_5B
+        };
+        let paths = Paths::from_dirs(base.join("data"), base.join("config")).unwrap();
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let default_cfg = daemon.config().unwrap();
+        assert!(default_cfg.naming.enabled);
+        assert!(!default_cfg.naming.auto_download);
+        assert!(default_cfg.naming.spec().is_some());
+        assert!(!paths.config_file().exists());
+        *daemon.model_download_test_spec.lock().unwrap() = Some(spec);
+        let mut events = subscribe(&daemon);
+        finish_first_run(&daemon).await;
+        wait_for_session_update(&mut events).await;
+        assert_no_model_fetch(&requests, &requested, &paths).await;
+
+        let mut declined_cfg = Config::default();
+        declined_cfg.naming.auto_download = false;
+        declined_cfg.naming.auto_download_migration_done = true;
+        declined_cfg.save(&paths).unwrap();
+        assert!(
+            !daemon
+                .config_with_refresh(true)
+                .unwrap()
+                .naming
+                .auto_download
+        );
+        finish_first_run(&daemon).await;
+        wait_for_session_update(&mut events).await;
+        assert_no_model_fetch(&requests, &requested, &paths).await;
+
+        let mut enabled_cfg = Config::load(&paths).unwrap();
+        enabled_cfg.naming.auto_download = true;
+        enabled_cfg.naming.auto_download_migration_done = true;
+        enabled_cfg.save(&paths).unwrap();
+        assert!(
+            daemon
+                .config_with_refresh(true)
+                .unwrap()
+                .naming
+                .auto_download
+        );
+        let session_id = finish_first_run(&daemon).await;
+        wait_for_note(&mut events, &session_id, &model_download_notice(&spec)).await;
+        timeout(Duration::from_secs(5), requested.notified())
+            .await
+            .expect("enabled first run did not contact the local fetch fixture");
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        wait_for_note(
+            &mut events,
+            &session_id,
+            "Session-naming model download failed; titles will continue using a heuristic.",
+        )
+        .await;
+        assert!(!spec.installed(&paths));
+        assert!(!spec.tokenizer_path(&paths).exists());
+        assert!(!spec.gguf_path(&paths).exists());
+        drop(daemon);
+        server.abort();
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn download_notice_names_model_size_and_heuristic_fallback() {
+        let notice = model_download_notice(&namer::QWEN2_5_0_5B);
+        assert!(notice.contains("qwen2.5-0.5b"), "{notice}");
+        assert!(notice.contains("409 MiB"), "{notice}");
+        assert!(notice.contains("heuristic"), "{notice}");
+    }
+
     #[tokio::test]
     async fn a_failed_naming_model_download_retries_after_cooldown() {
         let _env = crate::credential_env::EnvGuard::isolated();
@@ -20162,6 +20383,7 @@ mod model_download_tests {
         let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
         Config::default().save(&paths).unwrap();
         let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let mut events = subscribe(&daemon);
         let calls = Arc::new(AtomicU64::new(0));
         let requested = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -20201,26 +20423,64 @@ mod model_download_tests {
             ..namer::QWEN2_5_0_5B
         };
         let wait = Duration::from_secs(5);
-        daemon.spawn_model_download(spec);
+        daemon.spawn_model_download(spec, "fixture-session");
         timeout(wait, requested.notified()).await.unwrap();
-        daemon.spawn_model_download(spec);
+        let ServerMessage::Event(Event::Note { session_id, text }) =
+            timeout(wait, events.recv()).await.unwrap().unwrap()
+        else {
+            panic!("expected download status note");
+        };
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(text, model_download_notice(&spec));
+        daemon.spawn_model_download(spec, "fixture-session");
         let earliest_retry = Instant::now() + MODEL_DOWNLOAD_COOLDOWN;
         release.notify_one();
         let retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
         assert!(retry_at.unwrap() >= earliest_retry);
         assert!(!spec.installed(&paths));
+        let ServerMessage::Event(Event::Note { session_id, text }) =
+            timeout(wait, events.recv()).await.unwrap().unwrap()
+        else {
+            panic!("expected failed-download status note");
+        };
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(
+            text,
+            "Session-naming model download failed; titles will continue using a heuristic."
+        );
         drop(retry_at);
-        daemon.spawn_model_download(spec);
+        daemon.spawn_model_download(spec, "fixture-session");
         let mut retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         // Move the retry deadline to the present without a real five-minute wait.
         *retry_at = Some(Instant::now());
         drop(retry_at);
-        daemon.spawn_model_download(spec);
+        daemon.spawn_model_download(spec, "fixture-session");
         let retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
         assert!(retry_at.is_none());
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert!(spec.installed(&paths));
+        let ServerMessage::Event(Event::Note { session_id, text }) =
+            timeout(wait, events.recv()).await.unwrap().unwrap()
+        else {
+            panic!("expected retry-start status note");
+        };
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(text, model_download_notice(&spec));
+        let ServerMessage::Event(Event::Note { session_id, text }) =
+            timeout(wait, events.recv()).await.unwrap().unwrap()
+        else {
+            panic!("expected completed-download status note");
+        };
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(
+            text,
+            format!(
+                "Session-naming model {} is installed ({})",
+                spec.id,
+                namer::display_size(spec.gguf_bytes)
+            )
+        );
         drop(retry_at);
         server.abort();
         drop(daemon);

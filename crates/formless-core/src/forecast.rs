@@ -650,6 +650,8 @@ pub(crate) fn estimate_store_with_window_and_pending_attachments(
     };
     // Comparables and the measured values used by this quote are part of f.
     // Updates in other Runs do not invalidate an otherwise identical quote.
+    let mut fingerprint_cfg = cfg.clone();
+    fingerprint_cfg.naming.auto_download_migration_done = false;
     f.fingerprint = hash(&(
         context_hash,
         &input.draft,
@@ -658,7 +660,7 @@ pub(crate) fn estimate_store_with_window_and_pending_attachments(
             .as_ref()
             .map(|s| (&s.model, &s.reasoning_effort, &s.cwd, &s.instructions)),
         &logical,
-        &cfg,
+        &fingerprint_cfg,
         ratio,
         &f,
     ));
@@ -909,6 +911,23 @@ mod tests {
         c.naming.enabled = false;
         c
     }
+
+    #[test]
+    fn naming_download_migration_marker_does_not_change_forecast_fingerprint() {
+        let st = Store::open_in_memory().unwrap();
+        let mut cfg = config();
+        let session = st.create_session(None).unwrap().id;
+        let input = ForecastInput {
+            session_id: Some(session),
+            draft: "task".into(),
+            ..Default::default()
+        };
+        let before = estimate_store(&st, &cfg, &input).unwrap();
+        cfg.naming.auto_download_migration_done = true;
+        let after = estimate_store(&st, &cfg, &input).unwrap();
+        assert_eq!(before.fingerprint, after.fingerprint);
+    }
+
     fn completed(st: &Store, cfg: &Config, f: &RunForecast, steps: i64, status: &str) -> String {
         let id = st
             .create_run(f.basis.session_id.as_deref().unwrap())

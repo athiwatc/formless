@@ -9,10 +9,65 @@ const origin = "https://formless.example";
 const plain = value => JSON.parse(JSON.stringify(value));
 
 function appFunction(name) {
-  const start = app.indexOf("  async function " + name + "(");
+  const start = app.search(new RegExp("  (?:async )?function " + name + "\\("));
   assert.ok(start >= 0, name);
   return app.slice(start, app.indexOf("\n  }", start) + 4);
 }
+
+test("browser notification permission is requested only from its explicit settings action", async () => {
+  let requests = 0, renders = 0;
+  const Notification = {
+    permission: "default",
+    async requestPermission() { requests++; this.permission = "granted"; return this.permission; },
+  };
+  const c = {
+    Notification, window: { Notification },
+    h: (tag, attrs, ...children) => ({ tag, attrs, children }),
+    note: () => assert.fail("a permission result should not require an error notice"),
+    renderView: () => renders++,
+  };
+  runInNewContext(appFunction("browserNotificationControl"), c);
+  const control = c.browserNotificationControl();
+  assert.equal(control.children[0], "Allow browser notifications");
+  assert.equal(control.attrs["data-setting-control"], "browser-notifications");
+  assert.equal(requests, 0);
+  const focusCalls = [];
+  await control.attrs.onclick({ currentTarget: { focus: options => focusCalls.push(options) } });
+  assert.equal(focusCalls.length, 1);
+  assert.equal(focusCalls[0].preventScroll, true);
+  assert.equal(requests, 1);
+  assert.equal(renders, 1);
+  const allowed = c.browserNotificationControl();
+  assert.equal(allowed.children[0], "allowed by this browser");
+  assert.equal(allowed.attrs["data-setting-control"], "browser-notifications");
+  assert.equal(allowed.attrs.tabindex, -1);
+
+  Notification.permission = "denied";
+  const denied = c.browserNotificationControl();
+  assert.equal(denied.children[0], "blocked; change this site's browser permissions");
+  assert.equal(denied.attrs["data-setting-control"], "browser-notifications");
+  assert.equal(denied.attrs.tabindex, -1);
+  assert.equal(requests, 1);
+});
+
+test("explicit Web Push opt-in requests browser permission before fetching the relay key", async () => {
+  const calls = [];
+  const subscription = { toJSON: () => ({ endpoint: "test" }) };
+  const c = {
+    S: { forgetting: false, pushRemoval: false, pushEnabling: false },
+    Notification: { requestPermission: async () => { calls.push("permission"); return "granted"; } },
+    fetch: async path => { calls.push(path); return { ok: true, json: async () => ({ key: "test" }) }; },
+    navigator: { serviceWorker: { ready: Promise.resolve({ pushManager: {
+      subscribe: async () => { calls.push("subscribe"); return subscription; },
+    } }) } },
+    b64uToBytes: () => new Uint8Array(),
+    registerRelayPush: (_ws, _sub, interactive) => calls.push(["register", interactive]),
+    renderView: () => calls.push("render"), toast: message => calls.push(["toast", message]),
+  };
+  runInNewContext(appFunction("pushOn"), c);
+  await c.pushOn();
+  assert.deepEqual(calls, ["permission", "push/key", "subscribe", ["register", true], "render"]);
+});
 
 test("page chooses a worker first and keeps Session and event tags distinct", async () => {
   const messages = [];
@@ -102,5 +157,5 @@ test("worker notification opens the sending tab or a Session link if it was clos
   await click(notice.data);
   assert.deepEqual(calls.slice(-2), ["close", "/#s=test%20session"]);
   await click(undefined);
-  assert.deepEqual(calls.slice(-2), ["close", "focus"]);
+  assert.deepEqual(calls.slice(-3), ["close", "focus", { type: "formless-focus-pending" }]);
 });

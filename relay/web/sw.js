@@ -18,9 +18,74 @@ self.addEventListener("activate", (e) => {
   );
 });
 
+function storeIncomingShare(share) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open("formless-share-inbox", 1);
+    open.onupgradeneeded = () => {
+      if (!open.result.objectStoreNames.contains("shares")) open.result.createObjectStore("shares", { keyPath: "token" });
+    };
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      try {
+        const tx = db.transaction("shares", "readwrite");
+        tx.objectStore("shares").put(share);
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror = () => { db.close(); reject(tx.error); };
+        tx.onabort = () => { db.close(); reject(tx.error || new Error("share storage aborted")); };
+      } catch (error) {
+        db.close();
+        reject(error);
+      }
+    };
+  });
+}
+
+function shareRequestMetadata(request) {
+  const origin = request.headers?.get?.("Origin") ?? null;
+  const fetchSite = request.headers?.get?.("Sec-Fetch-Site") ?? null;
+  if ((origin != null && origin !== location.origin && origin !== "null")
+    || fetchSite === "cross-site" || fetchSite === "same-site") return null;
+  return {
+    requiresConfirmation: !(origin === location.origin || fetchSite === "none" || origin == null && fetchSite === "same-origin"),
+  };
+}
+
+async function receiveShare(request) {
+  const metadata = shareRequestMetadata(request);
+  if (!metadata) return new Response("Untrusted share request", { status: 403 });
+  try {
+    const form = await request.formData();
+    const text = form.get("text");
+    const title = form.get("title");
+    const url = form.get("url");
+    const files = form.getAll("files").filter((value) => value && typeof value.arrayBuffer === "function" && typeof value.name === "string");
+    const share = {
+      token: crypto.randomUUID(),
+      text: typeof text === "string" ? text : "",
+      title: typeof title === "string" ? title : "",
+      url: typeof url === "string" ? url : "",
+      files,
+      requiresConfirmation: metadata.requiresConfirmation,
+      draftApplied: false,
+    };
+    if (!share.text && !share.title && !share.url && !files.length) {
+      return Response.redirect(new URL("/", location.origin), 303);
+    }
+    await storeIncomingShare(share);
+    return Response.redirect(new URL("/?share=" + encodeURIComponent(share.token), location.origin), 303);
+  } catch (_) {
+    return Response.redirect(new URL("/?share-error=1", location.origin), 303);
+  }
+}
+
 self.addEventListener("fetch", (e) => {
   const url = new URL(e.request.url);
   const path = url.pathname === "/index.html" ? "/" : url.pathname;
+  if (e.request.method === "POST" && e.request.mode === "navigate" && url.origin === location.origin && url.pathname === "/share") {
+    e.respondWith(receiveShare(e.request));
+    return;
+  }
   if (e.request.method !== "GET" || url.origin !== location.origin || !SHELL.includes(path)) return;
   e.respondWith(
     fetch(e.request)
@@ -35,8 +100,8 @@ self.addEventListener("fetch", (e) => {
   );
 });
 
-// Web Push (opt-in, SPEC §12): pushes carry no content, so the notice is
-// generic; opening it brings the app to the front.
+// Web Push (opt-in, SPEC §12): pushes carry no Session ID, so clicks can only
+// focus a pending item already available in the app.
 self.addEventListener("push", (e) => {
   e.waitUntil(self.registration.showNotification("Formless", {
     body: "An approval or a question is waiting for you.",
@@ -74,12 +139,19 @@ self.addEventListener("notificationclick", (e) => {
       if (win?.type === "window" && new URL(win.url).origin === location.origin) {
         await win.focus();
         if (session) win.postMessage({ type: "formless-open-notification-session", session });
+        else win.postMessage({ type: "formless-focus-pending" });
         return;
       }
-      return self.clients.openWindow(session ? "/#s=" + encodeURIComponent(session) : "/");
+      return self.clients.openWindow(session ? "/#s=" + encodeURIComponent(session) : "/?action=focus-pending");
     }
     const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     const win = wins.find((w) => new URL(w.url).origin === location.origin);
-    return win ? win.focus() : self.clients.openWindow("/");
+    if (win) {
+      await win.focus();
+      if (session) win.postMessage({ type: "formless-open-notification-session", session });
+      else win.postMessage({ type: "formless-focus-pending" });
+      return;
+    }
+    return self.clients.openWindow(session ? "/#s=" + encodeURIComponent(session) : "/?action=focus-pending");
   })());
 });
