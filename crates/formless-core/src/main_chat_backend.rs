@@ -254,19 +254,19 @@ impl InteractionHandler for MainInteraction {
                 attempt_id: None,
                 question_id: id.clone(),
                 session_id: self.session_id.clone(),
-                question,
+                question: question.clone(),
                 options,
                 questions: questions.clone(),
             });
             let answer = prompt_reply::wait(&self.daemon.questions, &id, rx, cancel, || {}).await;
             drop(pending);
             let (answer, answers) = answer?;
-            if answers.is_empty() && questions.len() == 1 {
+            let answers = if answers.is_empty() && questions.len() == 1 {
                 let selected = questions[0]
                     .options
                     .iter()
                     .find(|option| option.label == answer);
-                return Some(vec![QuestionAnswer {
+                vec![QuestionAnswer {
                     selected: selected
                         .map(|option| vec![option.label.clone()])
                         .unwrap_or_default(),
@@ -274,7 +274,41 @@ impl InteractionHandler for MainInteraction {
                         .is_none()
                         .then_some(answer)
                         .filter(|answer| !answer.trim().is_empty()),
-                }]);
+                }]
+            } else {
+                answers
+            };
+            let summary = QuestionAnswer::summary_of(&answers);
+            if !summary.trim().is_empty() {
+                let stored = self.daemon.with_store(|st| {
+                    st.transaction(|st| {
+                        let question = st.append_message(
+                            &self.session_id,
+                            "assistant",
+                            &crate::secrets::redact(&question).0,
+                        )?;
+                        let answer = st.append_message(
+                            &self.session_id,
+                            "user",
+                            &crate::secrets::redact(&summary).0,
+                        )?;
+                        Ok([question, answer])
+                    })
+                });
+                match stored {
+                    Ok(messages) => {
+                        for message in messages {
+                            self.daemon.broadcast(Event::MessageAppended {
+                                session_id: self.session_id.clone(),
+                                message,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("could not save Main Chat clarification: {error}");
+                        return None;
+                    }
+                }
             }
             Some(answers)
         })
