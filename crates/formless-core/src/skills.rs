@@ -5,7 +5,7 @@
 //! user enables it.
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use std::collections::HashSet;
 use std::fmt;
@@ -27,21 +27,47 @@ pub struct SkillMeta {
 
 #[derive(Default)]
 struct SkillFrontmatter {
-    name: Option<FrontmatterString>,
-    description: Option<FrontmatterString>,
+    name: Option<String>,
+    description: Option<String>,
 }
 
-struct FrontmatterString(String);
+#[derive(Clone, Copy)]
+enum SkillField {
+    Name,
+    Description,
+}
 
-impl<'de> Deserialize<'de> for FrontmatterString {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+impl SkillField {
+    fn validate(self, value: &str) -> Result<()> {
+        match self {
+            Self::Name => validate_name(value),
+            Self::Description => {
+                let chars = value.chars().count();
+                if chars == 0 || crate::descriptions::screen(value).text.is_empty() {
+                    bail!("description must be non-empty");
+                }
+                if chars > 1024 {
+                    bail!("description must be at most 1024 characters");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+struct SkillFieldSeed(SkillField);
+
+impl<'de> DeserializeSeed<'de> for SkillFieldSeed {
+    type Value = String;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct StringVisitor;
+        struct StringVisitor(SkillField);
 
         impl<'de> Visitor<'de> for StringVisitor {
-            type Value = FrontmatterString;
+            type Value = String;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str("a YAML string")
@@ -51,25 +77,73 @@ impl<'de> Deserialize<'de> for FrontmatterString {
             where
                 E: serde::de::Error,
             {
-                Ok(FrontmatterString(value.to_string()))
+                self.visit_string::<E>(value.to_string())
             }
 
             fn visit_borrowed_str<E>(self, value: &'de str) -> std::result::Result<Self::Value, E>
             where
                 E: serde::de::Error,
             {
-                Ok(FrontmatterString(value.to_string()))
+                self.visit_string::<E>(value.to_string())
             }
 
             fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
             where
                 E: serde::de::Error,
             {
-                Ok(FrontmatterString(value))
+                self.0.validate(&value).map_err(E::custom)?;
+                Ok(value)
             }
         }
 
-        deserializer.deserialize_any(StringVisitor)
+        deserializer.deserialize_any(StringVisitor(self.0))
+    }
+}
+
+struct UniqueFrontmatterKeySeed<'a>(&'a mut HashSet<String>);
+
+impl<'de, 'a> DeserializeSeed<'de> for UniqueFrontmatterKeySeed<'a> {
+    type Value = String;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct KeyVisitor<'a>(&'a mut HashSet<String>);
+
+        impl<'de, 'a> Visitor<'de> for KeyVisitor<'a> {
+            type Value = String;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a string frontmatter key")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_string::<E>(value.to_string())
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_string::<E>(value.to_string())
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if !self.0.insert(value.clone()) {
+                    return Err(E::custom(format!("duplicate frontmatter key '{value}'")));
+                }
+                Ok(value)
+            }
+        }
+
+        deserializer.deserialize_any(KeyVisitor(self.0))
     }
 }
 
@@ -93,15 +167,16 @@ impl<'de> Deserialize<'de> for SkillFrontmatter {
             {
                 let mut fields = SkillFrontmatter::default();
                 let mut seen = HashSet::new();
-                while let Some(key) = map.next_key::<String>()? {
-                    if !seen.insert(key.clone()) {
-                        return Err(serde::de::Error::custom(format!(
-                            "duplicate frontmatter key '{key}'"
-                        )));
-                    }
+                while let Some(key) = map.next_key_seed(UniqueFrontmatterKeySeed(&mut seen))? {
                     match key.as_str() {
-                        "name" => fields.name = Some(map.next_value()?),
-                        "description" => fields.description = Some(map.next_value()?),
+                        "name" => {
+                            fields.name =
+                                Some(map.next_value_seed(SkillFieldSeed(SkillField::Name))?)
+                        }
+                        "description" => {
+                            fields.description =
+                                Some(map.next_value_seed(SkillFieldSeed(SkillField::Description))?)
+                        }
                         _ => {
                             let _: IgnoredAny = map.next_value()?;
                         }
@@ -113,36 +188,6 @@ impl<'de> Deserialize<'de> for SkillFrontmatter {
 
         deserializer.deserialize_map(FieldsVisitor)
     }
-}
-
-fn frontmatter_key(line: &str) -> Option<String> {
-    if line.starts_with(char::is_whitespace) || line.trim_start().starts_with('#') {
-        return None;
-    }
-    let (key, _) = line.split_once(':')?;
-    let key = key.trim();
-    if key.starts_with('"') && key.ends_with('"') {
-        serde_yaml_ng::from_str::<String>(key).ok()
-    } else if key.starts_with('\'') && key.ends_with('\'') {
-        Some(key[1..key.len() - 1].replace("''", "'"))
-    } else {
-        (!key.is_empty()).then(|| key.to_string())
-    }
-}
-
-fn frontmatter_key_line(frontmatter: &str, wanted: &str) -> Option<usize> {
-    frontmatter.lines().enumerate().find_map(|(index, line)| {
-        (frontmatter_key(line).as_deref() == Some(wanted)).then_some(index + 1)
-    })
-}
-
-fn duplicate_frontmatter_key_line(frontmatter: &str) -> Option<usize> {
-    let mut seen = HashSet::new();
-    frontmatter.lines().enumerate().find_map(|(index, line)| {
-        frontmatter_key(line)
-            .filter(|key| !seen.insert(key.clone()))
-            .map(|_| index + 1)
-    })
 }
 
 fn split_skill_md(text: &str) -> Result<(&str, &str)> {
@@ -184,35 +229,19 @@ pub fn parse_skill_md(text: &str) -> Result<SkillMeta> {
     let (front, body) = split_skill_md(text)?;
     let closing_line = 2 + front.split_inclusive('\n').count();
     let fields = serde_yaml_ng::from_str::<SkillFrontmatter>(front).map_err(|error| {
-        let duplicate_line = error
-            .to_string()
-            .starts_with("duplicate frontmatter key ")
-            .then(|| duplicate_frontmatter_key_line(front).map(|line| line + 1))
-            .flatten();
-        let line = duplicate_line
-            .or_else(|| error.location().map(|location| location.line() + 1))
-            .unwrap_or(closing_line);
+        let line = error
+            .location()
+            .map_or(closing_line, |location| location.line() + 1);
         anyhow!("invalid SKILL.md frontmatter on line {line}: {error}")
     })?;
-    let Some(name) = fields.name.map(|value| value.0) else {
+    let Some(name) = fields.name else {
         bail!("SKILL.md frontmatter on line {closing_line} is missing required 'name' field");
     };
-    let name_line = frontmatter_key_line(front, "name").map_or(2, |line| line + 1);
-    validate_name(&name)
-        .map_err(|error| anyhow!("invalid SKILL.md name on line {name_line}: {error}"))?;
-    let Some(description) = fields.description.map(|value| value.0) else {
+    let Some(description) = fields.description else {
         bail!(
             "SKILL.md frontmatter on line {closing_line} is missing required 'description' field"
         );
     };
-    let description_line = frontmatter_key_line(front, "description").map_or(2, |line| line + 1);
-    let description_chars = description.chars().count();
-    if description_chars == 0 || crate::descriptions::screen(&description).text.is_empty() {
-        bail!("SKILL.md description on line {description_line} must be non-empty");
-    }
-    if description_chars > 1024 {
-        bail!("SKILL.md description on line {description_line} must be at most 1024 characters");
-    }
     Ok(SkillMeta {
         name,
         description,

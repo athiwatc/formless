@@ -2734,7 +2734,9 @@ Tools fill capability gaps; skills say how to use them well.
   consecutive hyphens. When the source has a named skill directory (a folder,
   Git root/subdirectory, or wrapped ZIP), its name must match the frontmatter
   `name`; mismatches are rejected. `SKILL.md` files are copied unchanged, and
-  historical installed metadata is not rewritten.
+  historical installed metadata is not rewritten. Reads of already-installed
+  skills extract the body without reparsing historical frontmatter; new
+  installs and reimports still validate it strictly.
 - **Install:** from a folder, a git URL (`--ref`, `--subdir`) or a
   `.zip`; validated, then stored versioned under
   `<data>/skills/<name>/v<N>/` (10 MB max). A `.zip` is extracted

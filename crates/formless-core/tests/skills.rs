@@ -149,6 +149,12 @@ fn skill_frontmatter_follows_yaml_scalar_semantics() {
     assert_eq!(crlf.description, "CRLF fences");
     assert_eq!(crlf.body, "# Body\r\n");
 
+    let quoted_colon_key = parse_skill_md(
+        "---\n':anything': ignored\nname: pdf-tools\ndescription: quoted key\n---\nBody",
+    )
+    .unwrap();
+    assert_eq!(quoted_colon_key.name, "pdf-tools");
+
     let example = parse_skill_md(
         "---\nname: expense-report\ndescription: File and validate reports.\nlicense: Apache-2.0\ncompatibility: Requires python3\nmetadata:\n  author: example-org\n  version: \"2.1\"\nallowed-tools: Bash(git status:*)\n---\n# Expense reports",
     )
@@ -184,6 +190,17 @@ fn skill_frontmatter_errors_name_duplicate_keys_and_source_lines() {
         assert!(error.contains(&format!("on line {line}")), "{error}");
     }
 
+    let error = parse_skill_md(
+        "---\nname: skill\ndescription: \"first line\nlicense: scalar text\ncontinues\"\nlicense: MIT\nlicense: Apache-2.0\n---\nBody",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("duplicate frontmatter key 'license'"),
+        "{error}"
+    );
+    assert!(error.contains("on line 7"), "{error}");
+
     let error = parse_skill_md("---\nname: skill\ndescription: [unterminated\n---\nBody")
         .unwrap_err()
         .to_string();
@@ -214,6 +231,15 @@ fn skill_frontmatter_field_errors_include_source_lines() {
     );
     let error = parse_skill_md(&too_long).unwrap_err().to_string();
     assert!(error.contains("line 3"), "{error}");
+
+    let indented =
+        parse_skill_md("---\n# Root comment\n  name: skill\n  description: d\n---\nBody").unwrap();
+    assert_eq!(indented.name, "skill");
+    let error =
+        parse_skill_md("---\n# Root comment\n  name: Bad Name\n  description: d\n---\nBody")
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("on line 3"), "{error}");
 }
 
 #[test]
@@ -649,6 +675,7 @@ async fn the_agent_loads_enabled_skills() {
 
 #[test]
 fn skills_export_and_import_bundles() {
+    use base64::Engine;
     use formless_core::skills::{commit, export, prepare_bundle};
     let (_fixture, paths) = temp_paths("skbundle");
     let store = Store::open(&paths.db_file()).unwrap();
@@ -678,6 +705,22 @@ fn skills_export_and_import_bundles() {
         read_file(&store2, "report-writer", "scripts/fix.py").unwrap(),
         "print('hi')"
     );
+
+    let mut invalid_bundle = bundle.clone();
+    let skill_file = invalid_bundle["files"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|file| file["path"] == "SKILL.md")
+        .unwrap();
+    skill_file["content_b64"] = base64::engine::general_purpose::STANDARD
+        .encode("---\nname: report-writer\ndescription: \"hi\" there\n---\nBody\n")
+        .into();
+    let error = prepare_bundle(&other, &invalid_bundle)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("on line 3"), "{error}");
 
     // Paths that leave the folder are refused.
     let mut evil = bundle.clone();
