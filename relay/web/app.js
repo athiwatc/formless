@@ -4395,12 +4395,13 @@
   function modelDetail(m, t) {
     const parts = [];
     m = m || {};
+    const inferred = (field) => Array.isArray(m.inferred) && m.inferred.includes(field);
     const context = modelContextLabel(m.context);
     if (context !== null) parts.push(context);
     if (m.input_price != null && m.output_price != null) parts.push(uiMoney(m.input_price, null) + "/" + uiMoney(m.output_price, null) + " per M");
-    if (m.vision) parts.push("vision");
-    if (m.tools === true) parts.push("tools");
-    if (m.tools === false) parts.push("no tools");
+    if (typeof m.vision === "boolean") parts.push((inferred("vision") ? "~" : "") + (m.vision ? "vision" : "no vision"));
+    if (typeof m.tools === "boolean") parts.push((inferred("tools") ? "~" : "") + (m.tools ? "tools" : "no tools"));
+    if (inferred("efforts")) parts.push(Array.isArray(m.efforts) && m.efforts.length === 0 ? "~no effort effect" : "~effort choices");
     if (t) parts.push(t.ok ? "✓ tested" : t.transient === true ? "✗ temporary test failure (use Test to retry)" : "✗ test failed");
     return parts.join(" · ");
   }
@@ -4428,13 +4429,16 @@
       role: "combobox", "aria-autocomplete": "list", "aria-controls": list.id, "aria-expanded": "false" });
     const effort = h("select", { "aria-label": "Reasoning effort" },
       efforts.map((e) => h("option", { value: e }, e || "default (provider)")));
-    effort.value = (session && session.reasoning_effort) || "";
+    let preferredEffort = (session && session.reasoning_effort) || "";
+    effort.value = preferredEffort;
+    effort.onchange = () => { preferredEffort = effort.value; };
     const status = h("span", { class: "muted" }, "loading models…");
     const cancel = h("button", { class: "btn small", type: "button" }, "Cancel");
     const asDefault = h("button", { class: "btn small", type: "button", title: "Ctrl/⌘+Enter" }, "Set as default");
     const apply = h("button", { class: "btn small primary", type: "button", title: "Enter" }, selectionOnly ? "Retry" : "Use in this Session");
     const test = h("button", { class: "btn small", type: "button", title: "Latency, streaming, reasoning and tool calls" }, "Test");
     let meta = {}, tests = {};
+    let preferredEffortModel = model;
     const title = selectionOnly ? "Retry with a model" : "Model";
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": title },
       h("div", { class: "modal picker" },
@@ -4481,11 +4485,22 @@
         input.removeAttribute("aria-activedescendant");
       }
       // Only the efforts the highlighted model accepts (SPEC §4.2).
-      const accepted = (meta[choice()] || {}).efforts;
-      const offer = Array.isArray(accepted) ? [""].concat(["minimal", "low", "medium", "high"].filter((e) => accepted.includes(e))) : efforts;
-      const was = effort.value;
+      const selectedModel = choice();
+      if (selectedModel && selectedModel !== preferredEffortModel) {
+        preferredEffort = "";
+        preferredEffortModel = selectedModel;
+        effort.value = "";
+      }
+      const accepted = (meta[selectedModel] || {}).efforts;
+      const offer = Array.isArray(accepted)
+        ? [""].concat([...new Set(accepted.filter((e) => typeof e === "string" && e !== ""))])
+        : efforts.slice();
+      const was = effort.value || preferredEffort;
+      if (!Array.isArray(accepted) && selectedModel === model && was && !offer.includes(was)) offer.push(was);
       effort.replaceChildren(...offer.map((e) => h("option", { value: e }, e || "default (provider)")));
       effort.value = offer.includes(was) ? was : "";
+      if (Array.isArray(accepted) && !offer.includes(was)) preferredEffort = "";
+      else if (effort.value) preferredEffort = effort.value;
       effort.disabled = offer.length <= 1;
       effort.title = offer.length <= 1 ? "Effort has no effect for this model" : "";
       if (!items.length) return;
@@ -7580,7 +7595,8 @@
         h("dt", null, "density"), h("dd", null, h("span", { class: "read-controls" },
           ["comfortable", "compact"].map((d) => h("button", { class: "btn small" + (S.density === d ? " primary" : ""), type: "button", "aria-pressed": String(S.density === d), onclick: () => setReading(null, d) }, d)))),
         h("dt", null, "encryption"), h("dd", null, "AES-256-GCM, key held only in this tab"),
-        S.local ? null : [h("dt", null, "notifications"), h("dd", null, pushControl())]),
+        h("dt", null, "notifications"), h("dd", null, browserNotificationControl(),
+          S.local ? null : pushControl())),
       h("div", { class: "detail-actions" },
         h("button", { class: "btn danger small", type: "button", onclick: forget }, "Disconnect and forget this device"))));
     box.append(grid, h("p", { class: "muted" }, "Edits are validated and applied by the daemon; rows marked for TUI startup need a TUI restart. Credentials, endpoint and relay configuration use config.toml or their CLI. Manage MCP servers above."));
@@ -7693,6 +7709,19 @@
     filterSettings();
   });
 
+  function browserNotificationControl() {
+    const controlKey = "browser-notifications";
+    const status = (message) => h("span", { class: "muted", "data-setting-control": controlKey, tabindex: -1 }, message);
+    if (!("Notification" in window)) return status("not supported in this browser");
+    if (Notification.permission === "granted") return status("allowed by this browser");
+    if (Notification.permission === "denied") return status("blocked; change this site's browser permissions");
+    return h("button", { class: "btn small", type: "button", "data-setting-control": controlKey, onclick: async (event) => {
+      event.currentTarget.focus({ preventScroll: true });
+      try { await Notification.requestPermission(); }
+      catch (_) { note("Couldn't request browser notification permission.", true); }
+      renderView();
+    } }, "Allow browser notifications");
+  }
   /** Web Push (SPEC §12): opt in per device. The relay keeps this
    * browser's subscription and, when an approval or question waits, sends
    * a push with no content; nothing about the Session leaves the daemon. */
@@ -7723,10 +7752,10 @@
         registerRelayPush(S.ws, existing, true);
         return;
       }
+      if ((await Notification.requestPermission()) !== "granted") return toast("Notifications are blocked for this site.", true);
       const r = await fetch("push/key");
       if (!r.ok) return toast("This relay hasn't set up notifications.", true);
       const { key } = await r.json();
-      if ((await Notification.requestPermission()) !== "granted") return toast("Notifications are blocked for this site.", true);
       const reg = await navigator.serviceWorker.ready;
       if (S.forgetting || S.pushRemoval) return;
       S.pushSubscribe = reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
@@ -9536,7 +9565,6 @@
         await act({ type: "edit_message", session_id: sid, message_id: editMessageId, content: text });
         return;
       }
-      askNotifyPermission();
       closeMentions();
       const toolNames = new Set((S.tools || []).map((tool) => tool.name));
       const sessionKey = sessionCacheKey(scope, sid);
@@ -9821,12 +9849,6 @@
     syncRunningExposure();
     if (!document.hidden) { unseen = 0; document.title = baseTitle; }
   });
-  /** Ask once, from a user gesture (sending a message). */
-  function askNotifyPermission() {
-    if (notifyMode() === "desktop" && "Notification" in window && Notification.permission === "default") {
-      Notification.requestPermission().catch(() => {});
-    }
-  }
   function sessionName(id) {
     const s = S.sessions.find((x) => x.id === id);
     return (s && s.name) || "Session";
@@ -11145,9 +11167,10 @@
   });
   document.addEventListener("click", (e) => {
     if (popover && !popover.contains(e.target)) closePopover();
-    // A modal click belongs to that layer, including a button that removed
-    // its dialog before this event bubbled. Do not dismiss background drawers.
-    if (e.composedPath().some((node) => node instanceof Element && node.classList.contains("backdrop"))) return;
+    // Modal and notification clicks belong to their own layers, including a
+    // button that removes its layer before bubbling. Leave the drawer alone.
+    if (e.composedPath().some((node) => node instanceof Element &&
+        (node.classList.contains("backdrop") || node.id === "toasts"))) return;
     const sb = $("sidebar");
     if (sb.classList.contains("open") && !sb.contains(e.target) && e.target !== $("menu-btn")) closeSidebar();
   });

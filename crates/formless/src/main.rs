@@ -2000,6 +2000,95 @@ impl clap::builder::TypedValueParser for NamingModelParser {
     }
 }
 
+fn generate_completions(shell: clap_complete::Shell, out: &mut impl Write) -> std::io::Result<()> {
+    use clap::CommandFactory;
+
+    clap_complete::generate(shell, &mut Cli::command(), "formless", out);
+    if shell == clap_complete::Shell::Fish {
+        out.write_all(b"\n")?;
+        out.write_all(FISH_DOCS_TOPIC_CONDITION.as_bytes())?;
+        for (name, _, description) in formless_core::docs::TOPICS {
+            writeln!(
+                out,
+                "complete -c formless -f -n '__fish_formless_docs_topic_argument' -a {} -d {}",
+                fish_quote(name),
+                fish_quote(description)
+            )?;
+        }
+    }
+    Ok(())
+}
+
+const FISH_DOCS_TOPIC_CONDITION: &str = r#"function __fish_formless_docs_topic_argument
+    set -l tokens (commandline -opc)
+    set -l command_seen 0
+    set -l docs_seen 0
+    set -l pending_value 0
+    set -l docs_arguments
+
+    for token in $tokens
+        if test $docs_seen -eq 1
+            set -a docs_arguments "$token"
+            continue
+        end
+        if test $pending_value -eq 1
+            set pending_value 0
+            continue
+        end
+        if test $command_seen -eq 0
+            if test (string replace -r '^.*/' '' -- "$token") = formless
+                set command_seen 1
+            end
+            continue
+        end
+        switch "$token"
+            case docs
+                set docs_seen 1
+            case --profile
+                set pending_value 1
+            case '--profile=*' '--secure'
+                continue
+            case '*'
+                return 1
+        end
+    end
+
+    test $docs_seen -eq 1; or return 1
+
+    set pending_value 0
+    set -l options_ended 0
+    for token in $docs_arguments
+        if test $pending_value -eq 1
+            set pending_value 0
+            continue
+        end
+        if test $options_ended -eq 1
+            return 1
+        end
+        switch "$token"
+            case --profile
+                set pending_value 1
+            case '--profile=*' '--secure' '--print' '--text'
+                continue
+            case '--keys' '--help' '-h' '--version'
+                return 1
+            case --
+                set options_ended 1
+            case '-*'
+                return 1
+            case '*'
+                return 1
+        end
+    end
+
+    test $pending_value -eq 0
+end
+"#;
+
+fn fish_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
 fn docs_cmd(topic: Option<&str>, print: bool, keys: bool, text: bool) -> Result<()> {
     let result: Result<()> = (|| {
         let mut out = std::io::stdout().lock();
@@ -2168,13 +2257,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
     // Completions and the man page need nothing else: no profile, config
     // or daemon.
     if let Some(Cmd::Completions { shell }) = cli.cmd {
-        use clap::CommandFactory;
-        clap_complete::generate(
-            shell,
-            &mut Cli::command(),
-            "formless",
-            &mut std::io::stdout(),
-        );
+        generate_completions(shell, &mut std::io::stdout())?;
         return Ok(());
     }
     if let Some(Cmd::Man) = cli.cmd {
@@ -2680,6 +2763,21 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             println!(
                 "config:    {} providers, {} Roles, {} MCP servers added",
                 r["providers"], r["roles"], r["mcp_servers"]
+            );
+            println!(
+                "skipped:   {} Tools, {} modules, {} Skills, {} memories, {} jobs, {} Sessions",
+                r["skipped_existing"]["tools"],
+                r["skipped_existing"]["modules"],
+                r["skipped_existing"]["skills"],
+                r["skipped_existing"]["memories"],
+                r["skipped_existing"]["jobs"],
+                r["skipped_existing"]["sessions"]
+            );
+            println!(
+                "config skipped: {} providers, {} Roles, {} MCP servers",
+                r["skipped_existing"]["providers"],
+                r["skipped_existing"]["roles"],
+                r["skipped_existing"]["mcp_servers"]
             );
             println!("review:    MCP servers are disabled and untrusted; inspect commands before enabling.");
             for server in r["mcp_review"].as_array().into_iter().flatten() {
@@ -3606,6 +3704,13 @@ enum Fix {
 /// The daemon and file checks `--fix` can act on.
 fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
     let mut out = Vec::new();
+    if let Ok(unknown) = formless_core::config::unknown_keys_from_file(&paths.config_file()) {
+        out.extend(unknown.into_iter().map(|key| Problem {
+            what: format!("{}: {key}", paths.config_file().display()),
+            next: Some(format!("review {}", paths.config_file().display())),
+            fix: None,
+        }));
+    }
     // Jobs that will not fire on schedule (SPEC §9.7).
     if let (Ok(cfg), true) = (Config::load(paths), paths.db_file().exists()) {
         let active = formless_core::Store::open(&paths.db_file())
@@ -6874,6 +6979,9 @@ fn config_edit(paths: &Paths) -> Result<()> {
                 .map(|(_, unmarked_auto_download)| (text, unmarked_auto_download))
         }) {
             Ok((text, unmarked_auto_download)) => {
+                for key in formless_core::config::unknown_keys_from_text(&text)? {
+                    eprintln!("warning: {}: {key}", file.display());
+                }
                 formless_core::config::write_atomic(&file, text.as_bytes())?;
                 if unmarked_auto_download {
                     eprintln!("warning: unmarked naming.auto_download = true is treated as false; use `formless config set naming.auto_download true` to opt in");

@@ -1645,6 +1645,8 @@ pub struct JobInfo {
     pub prompt: String,
     /// Run in this Session; None starts a new Session each time.
     pub session_id: Option<String>,
+    #[serde(skip)]
+    pub source_session_id: Option<String>,
     /// Recurring schedule (5-field cron, local time); None is one-shot.
     pub cron: Option<String>,
     pub next_run: Option<String>,

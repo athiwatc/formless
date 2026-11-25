@@ -1995,6 +1995,33 @@ test('only a fresh idle text send retains direct legacy compatibility', async ()
   assert.equal(duplicate.$('input').value, 'already queued');
 });
 
+test('sending the first chat message does not request browser notification permission', async () => {
+  const calls = []; let permissionRequests = 0;
+  const Notification = {
+    permission: 'default',
+    requestPermission() { permissionRequests++; return Promise.resolve('granted'); },
+  };
+  const c = setup(['submit', 'loadOutbox'], {
+    pingFeatures: [],
+    crypto: { randomUUID: () => 'first-message' },
+    Notification, window: { Notification },
+    askNotifyPermission() {
+      if (Notification.permission === 'default') Notification.requestPermission();
+    },
+    closeMentions() {}, mentionsIn: () => [], renderOutbox() {},
+    request: async req => {
+      calls.push(req);
+      return req.type === 'list_pending_attachments' ? { attachments: [] } : {};
+    },
+  });
+  c.S.settings = { limits: {} };
+  c.S.attachmentInventories.A = [];
+  c.$('input').value = 'first chat message';
+  await c.submit(false);
+  assert.equal(calls.some(req => req.type === 'send_message'), true);
+  assert.equal(permissionRequests, 0);
+});
+
 test('legacy fresh sends require an empty pairing outbox under the outbox lock', async () => {
   const prefs = memoryPrefs();
   prefs.set('outbox:test-room', [{ scope: 'test-room', order: 1, session_id: 'B', content: 'saved elsewhere', mode: 'send', expected_attachments: [], client_msg_id: 'saved-in-B', attempted: false, status: 'queued' }]);
