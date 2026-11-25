@@ -3107,6 +3107,454 @@ async fn step_mode_pauses_edits_and_skips_calls() {
     server.abort();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn invalid_step_edit_stays_pending_and_is_not_persisted_or_dispatched() {
+    let _env = credential_env::EnvGuard::isolated();
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    _env.set("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4invalidstep");
+    seed_sleeper(&paths);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post({
+                let calls = calls.clone();
+                move || {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if n == 0 {
+                            sse_tool("s1", "echo_fast", json!({"x": 1}))
+                        } else {
+                            sse_text("done")
+                        }
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let id = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.rpc(Request::SetStepMode {
+        session_id: id.clone(),
+        on: true,
+    })
+    .await;
+    c.send(Request::SendMessage {
+        session_id: id.clone(),
+        content: "go".into(),
+        mode: SendMode::Send,
+        client_msg_id: None,
+    })
+    .await;
+    let step_id = loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        if let Ok(ServerMessage::Event(Event::StepPending { step_id, .. })) =
+            serde_json::from_str::<ServerMessage>(&line)
+        {
+            break step_id;
+        }
+    };
+    let error = c
+        .rpc_result(Request::StepDecision {
+            step_id: step_id.clone(),
+            action: "edit".into(),
+            arguments: Some(r#"{"x":"not-an-integer"}"#.into()),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.contains("input failed schema validation"), "{error}");
+    let pending_messages = c.rpc(Request::GetSession { id: id.clone() }).await["messages"].clone();
+    assert!(
+        !pending_messages.to_string().contains("s1"),
+        "the tool call was persisted before the step was accepted: {pending_messages}"
+    );
+    c.send(Request::StepDecision {
+        step_id,
+        action: "edit".into(),
+        arguments: Some(r#"{"x":5}"#.into()),
+    })
+    .await;
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        if let Ok(ServerMessage::Event(Event::RunFinished { status, .. })) =
+            serde_json::from_str::<ServerMessage>(&line)
+        {
+            assert_eq!(status, "completed");
+            break;
+        }
+    }
+    let msgs = c.rpc(Request::GetSession { id }).await["messages"].clone();
+    assert!(!msgs.to_string().contains("not-an-integer"), "{msgs}");
+    let tools: Vec<_> = msgs
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    assert_eq!(tools.len(), 1, "{tools:?}");
+    assert!(
+        tools[0]["content"].as_str().unwrap().contains('5'),
+        "{tools:?}"
+    );
+    server.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn edited_relative_capability_requires_approval_and_denial_prevents_execution() {
+    let _env = credential_env::EnvGuard::isolated();
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{ApprovalScope, Event, Request, SendMode, ServerMessage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    _env.set("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4stepcap");
+    let work = paths.data_dir.parent().unwrap().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let work = work.canonicalize().unwrap();
+    let existing_path = work.join("existing.txt");
+    let edited_path = work.join("edited.txt");
+    std::fs::write(&existing_path, "existing").unwrap();
+    {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let schema = r#"{"type":"object","properties":{"path":{"type":"string","pattern":"^/"}},"required":["path"]}"#;
+        let caps = Capabilities::parse(&["fs:write:$input.path".into()]).unwrap();
+        let (info, _) = store
+            .create_tool_version(
+                "step_writer",
+                "writes to the input path",
+                schema,
+                "{}",
+                "function run(i){ fs.write(i.path, 'executed'); return {ok:true}; }",
+                &caps,
+                64,
+                "agent",
+            )
+            .unwrap();
+        let existing_cap =
+            Capabilities::parse(&[format!("fs:write:{}", existing_path.display())]).unwrap();
+        store.set_approval(&info.id, &existing_cap, 64).unwrap();
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post({
+                let calls = calls.clone();
+                let path = existing_path.display().to_string();
+                move || {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    let path = path.clone();
+                    async move {
+                        if n == 0 {
+                            sse_tool("s1", "step_writer", json!({"path": path}))
+                        } else {
+                            sse_text("done")
+                        }
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let mut cfg = formless_core::Config::load(&paths).unwrap();
+    cfg.security.trusted_paths.clear();
+    cfg.save(&paths).unwrap();
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let id = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    Store::open(&paths.db_file())
+        .unwrap()
+        .set_session_cwd(&id, Some(work.to_str().unwrap()))
+        .unwrap();
+    c.rpc(Request::SetStepMode {
+        session_id: id.clone(),
+        on: true,
+    })
+    .await;
+    c.send(Request::SendMessage {
+        session_id: id.clone(),
+        content: "edit the output path".into(),
+        mode: SendMode::Send,
+        client_msg_id: None,
+    })
+    .await;
+    let step_id = loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        if let Ok(ServerMessage::Event(Event::StepPending {
+            step_id, tool_name, ..
+        })) = serde_json::from_str::<ServerMessage>(&line)
+        {
+            assert_eq!(tool_name, "step_writer");
+            break step_id;
+        }
+    };
+    c.rpc(Request::StepDecision {
+        step_id,
+        action: "edit".into(),
+        arguments: Some(json!({"path": "edited.txt"}).to_string()),
+    })
+    .await;
+    let (approval_id, capabilities, already_allowed) = loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        if let Ok(ServerMessage::Event(Event::ApprovalRequested {
+            approval_id,
+            tool_name,
+            capabilities,
+            already_allowed,
+            ..
+        })) = serde_json::from_str::<ServerMessage>(&line)
+        {
+            assert_eq!(tool_name, "step_writer");
+            break (approval_id, capabilities, already_allowed);
+        }
+    };
+    assert_eq!(
+        capabilities,
+        vec![format!("fs:write:{}", edited_path.display())]
+    );
+    assert_eq!(
+        already_allowed,
+        vec![format!("fs:write:{}", existing_path.display())]
+    );
+    c.send(Request::ApprovalDecision {
+        remember_denial: Default::default(),
+        paths: Default::default(),
+        approval_id,
+        approved: false,
+        scope: ApprovalScope::Once,
+    })
+    .await;
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        if let Ok(ServerMessage::Event(Event::RunFinished { status, .. })) =
+            serde_json::from_str::<ServerMessage>(&line)
+        {
+            assert_eq!(status, "completed");
+            break;
+        }
+    }
+    assert!(!edited_path.exists(), "denied call must not execute");
+    let session = c.rpc(Request::GetSession { id }).await.to_string();
+    assert!(
+        session.contains(&edited_path.display().to_string()),
+        "the accepted edit stores the normalized path it was validated with"
+    );
+    server.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn step_edits_fail_closed_for_missing_tools_and_malformed_schemas() {
+    let _env = credential_env::EnvGuard::isolated();
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use formless_protocol::{Event, Request, SendMode, ServerMessage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    _env.set("FORMLESS_API_KEY", "test-key");
+    let paths = temp_paths("m4stepclosed");
+    let broken_schema_tool_id = {
+        let store = Store::open(&paths.db_file()).unwrap();
+        store
+            .create_tool_version(
+                "broken_schema",
+                "fixture",
+                r#"{"type":"object"}"#,
+                "{}",
+                "function run(i){ return {}; }",
+                &Capabilities::default(),
+                64,
+                "agent",
+            )
+            .unwrap()
+            .0
+            .id
+    };
+    let connection = rusqlite::Connection::open(paths.db_file()).unwrap();
+    let changed = connection
+        .execute(
+            "UPDATE tool_versions SET input_schema=?1 WHERE tool_id=?2 AND version=1",
+            rusqlite::params!["not-json", broken_schema_tool_id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(connection);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/models",
+            get(|| async { Json(json!({"data": [{"id": "mock-1"}]})) }),
+        )
+        .route(
+            "/chat/completions",
+            post({
+                let calls = calls.clone();
+                move || {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        match n {
+                            0 => sse_tool("missing-call", "missing_step_tool", json!({})),
+                            1 => sse_tool("broken-call", "broken_schema", json!({})),
+                            _ => sse_text("done"),
+                        }
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    write_cfg(&paths, &base, 30, false, 128_000);
+    let server = start_daemon(&paths).await;
+    let mut c = Client::connect(&paths).await;
+    let id = c.rpc(Request::CreateSession { name: None }).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.rpc(Request::SetStepMode {
+        session_id: id.clone(),
+        on: true,
+    })
+    .await;
+    c.send(Request::SendMessage {
+        session_id: id.clone(),
+        content: "run both calls".into(),
+        mode: SendMode::Send,
+        client_msg_id: None,
+    })
+    .await;
+    let (step_id, first_call) = loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        if let Ok(ServerMessage::Event(Event::StepPending {
+            step_id, tool_name, ..
+        })) = serde_json::from_str::<ServerMessage>(&line)
+        {
+            break (step_id, tool_name);
+        }
+    };
+    assert_eq!(first_call, "missing_step_tool");
+    let error = c
+        .rpc_result(Request::StepDecision {
+            step_id: step_id.clone(),
+            action: "edit".into(),
+            arguments: Some("{}".into()),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("tool 'missing_step_tool' no longer exists"),
+        "{error}"
+    );
+    let messages = c.rpc(Request::GetSession { id: id.clone() }).await["messages"].clone();
+    assert!(!messages.to_string().contains("missing-call"), "{messages}");
+    c.rpc(Request::StepDecision {
+        step_id,
+        action: "skip".into(),
+        arguments: None,
+    })
+    .await;
+    let (step_id, second_call) = loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        if let Ok(ServerMessage::Event(Event::StepPending {
+            step_id, tool_name, ..
+        })) = serde_json::from_str::<ServerMessage>(&line)
+        {
+            break (step_id, tool_name);
+        }
+    };
+    assert_eq!(second_call, "broken_schema");
+    let error = c
+        .rpc_result(Request::StepDecision {
+            step_id: step_id.clone(),
+            action: "edit".into(),
+            arguments: Some("{}".into()),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.contains("tool has invalid input schema"), "{error}");
+    let messages = c.rpc(Request::GetSession { id: id.clone() }).await["messages"].clone();
+    assert!(!messages.to_string().contains("broken-call"), "{messages}");
+    c.rpc(Request::StepDecision {
+        step_id,
+        action: "skip".into(),
+        arguments: None,
+    })
+    .await;
+    loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
+        if let Ok(ServerMessage::Event(Event::RunFinished { status, .. })) =
+            serde_json::from_str::<ServerMessage>(&line)
+        {
+            assert_eq!(status, "completed");
+            break;
+        }
+    }
+    server.abort();
+}
+
 /// `/compare A B` (SPEC §5.10): the same prompt on each model in its own
 /// fork; the answers come back together to the original Session.
 #[cfg(unix)]

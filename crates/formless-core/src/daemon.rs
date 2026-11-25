@@ -3,7 +3,8 @@ use formless_protocol::*;
 use formless_runtime::LockExt as _;
 use formless_runtime::{Capabilities, ExecErrorKind, ExecRequest, HostMode, HostOps};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -516,6 +517,39 @@ fn stop_note(result: &crate::provider::ChatResult) -> Option<String> {
     }
 }
 
+fn served_model_info(
+    requested: &str,
+    routing_pick: Option<&str>,
+    served: &str,
+    used_fallback: bool,
+) -> Option<ServedModelInfo> {
+    let via = if used_fallback {
+        "fallback".to_string()
+    } else if let Some(routing_pick) = routing_pick {
+        format!("routing:{routing_pick}")
+    } else {
+        return None;
+    };
+    (!served.is_empty() && (served != requested || (!used_fallback && routing_pick.is_some())))
+        .then(|| ServedModelInfo {
+            name: served.to_string(),
+            via,
+            requested: requested.to_string(),
+        })
+}
+
+fn add_served_model_meta(
+    meta: &mut Value,
+    requested: &str,
+    routing_pick: Option<&str>,
+    served: &str,
+    used_fallback: bool,
+) {
+    if let Some(served) = served_model_info(requested, routing_pick, served, used_fallback) {
+        meta["model"] = json!(served);
+    }
+}
+
 /// What the daemon's own model calls inside [`counted`] are for, and the
 /// Session/Run they serve ("" when none).
 #[derive(Clone)]
@@ -800,6 +834,7 @@ struct RunAdmission {
     cfg: Config,
     requested: String,
     resolved_model: String,
+    routing_pick: Option<String>,
     effort: Option<String>,
     recovery_messages: Vec<MessageInfo>,
     resumed_from: Option<String>,
@@ -888,7 +923,7 @@ pub struct Daemon {
     /// Persistent evidence for configured model listings (SPEC §4.2).
     model_listing_health: StdMutex<model_listing_health::State>,
     /// Comparisons in flight: id → (origin Session, [(fork, model)]).
-    comparisons: StdMutex<HashMap<String, (String, Vec<(String, String)>)>>,
+    comparisons: StdMutex<HashMap<String, (String, Vec<(String, String, i64)>)>>,
     branch_summary_state: Arc<StdMutex<branch_summary::BranchSummaryState>>,
     hunk_reviews: StdMutex<review_daemon::ReviewState>,
     run_file_post_images: StdMutex<HashMap<(String, String), String>>,
@@ -1089,6 +1124,11 @@ impl Daemon {
         // tell every client that connects this lifetime.
         let mut startup_warnings = Vec::new();
         if !offline && paths.config_file().exists() {
+            if let Ok(unknown) = crate::config::unknown_keys_from_file(&paths.config_file()) {
+                for key in unknown {
+                    tracing::warn!("{}: {}", paths.config_file().display(), key);
+                }
+            }
             let _ = Config::persist_naming_download_migration(&paths);
             if let Ok(mut cfg) = Config::load_file_only(&paths) {
                 if let Some(w) = cfg.migrate_global_auto() {
@@ -1450,6 +1490,7 @@ impl Daemon {
                 .map(|c| pcfg.resolve_alias(c))
                 .collect();
             let provider = self.provider_named(cfg, role.provider.as_deref()).await?;
+            let mut routing_pick = None;
             let model = if role.model.is_empty() {
                 cfg.provider_cfg(role.provider.as_deref())?.model
             } else if ProviderCfg::is_auto_model(&role.model) && !role.candidates.is_empty() {
@@ -1468,6 +1509,7 @@ impl Daemon {
                     .context("no role model candidates")?;
                 choice.explanation["kind"] = json!(format!("role:{role_name}"));
                 self.note_routing(session_id, choice.explanation);
+                routing_pick = Some(choice.model.clone());
                 choice.model
             } else {
                 role.model.clone()
@@ -1480,6 +1522,7 @@ impl Daemon {
             return Ok(Target {
                 provider: provider.resolved_dispatch(&model),
                 model,
+                routing_pick,
                 effort,
                 system: role.system.clone(),
                 role: Some(role_name.to_string()),
@@ -1491,6 +1534,7 @@ impl Daemon {
                 .await?
                 .resolved_dispatch(resolved.unwrap_or(&wanted)),
             model: resolved.unwrap_or(&wanted).to_string(),
+            routing_pick: None,
             effort: session_effort,
             system: None,
             role: None,
@@ -3994,10 +4038,6 @@ impl Daemon {
                     .into_iter()
                     .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|m| (m.to_string(), v)))
                     .collect();
-                for m in &models {
-                    meta.entry(m.clone())
-                        .or_insert_with(|| crate::provider::known_model_meta(m));
-                }
                 let roles: Vec<_> = cfg
                     .roles
                     .iter()
@@ -4009,6 +4049,23 @@ impl Daemon {
                     .collect();
                 let sessions = self.with_reader(|st| st.list_sessions())?;
                 let recent = recent_session_models(&sessions);
+                for model in models
+                    .iter()
+                    .chain(&recent)
+                    .chain(cfg.provider.aliases.keys())
+                    .chain(cfg.provider.model_meta.keys())
+                {
+                    let resolved = cfg.provider.resolve_alias(model);
+                    let mut model_meta = meta
+                        .get(&resolved)
+                        .or_else(|| meta.get(model))
+                        .cloned()
+                        .unwrap_or_else(|| crate::provider::known_model_meta(&resolved));
+                    if let Some(override_cfg) = cfg.provider.model_meta.get(&resolved) {
+                        crate::provider::apply_model_meta_override(&mut model_meta, override_cfg);
+                    }
+                    meta.insert(model.clone(), model_meta);
+                }
                 Ok(json!({
                     "models": models,
                     "meta": meta,
@@ -4470,10 +4527,7 @@ impl Daemon {
                 Ok(serde_json::to_value(imported)?)
             }
             Request::StorageUsage => {
-                let mut u = self.with_reader(|st| crate::housekeeping::usage(&self.paths, st))?;
-                u["last_backup"] = json!(crate::housekeeping::last_backup(&self.paths)
-                    .map(|(f, _)| f.display().to_string()));
-                Ok(u)
+                self.with_reader(|st| crate::housekeeping::storage_usage(&self.paths, st))
             }
             Request::Gc { dry_run } => {
                 let cfg = self.config()?;
@@ -5386,16 +5440,28 @@ impl Daemon {
                         "action must be continue, skip, edit or all",
                     )));
                 }
-                if action == "edit" {
+                let arguments = if action == "edit" {
                     let a = arguments.as_deref().unwrap_or_default();
-                    let v: Value = serde_json::from_str(a)
-                        .context("edited arguments must be a JSON object")?;
+                    let mut v: Value = serde_json::from_str(a).map_err(|error| {
+                        RequestFailure::invalid(format!(
+                            "edited arguments must be a JSON object: {error}"
+                        ))
+                    })?;
                     if !v.is_object() {
                         return Err(anyhow::Error::new(RequestFailure::invalid(
                             "edited arguments must be a JSON object",
                         )));
                     }
-                }
+                    let submitted = v.clone();
+                    self.validate_step_edit(&step_id, &mut v)?;
+                    if v == submitted {
+                        arguments
+                    } else {
+                        Some(v.to_string())
+                    }
+                } else {
+                    arguments
+                };
                 let tx = self
                     .step_waiters
                     .lock()
@@ -5405,7 +5471,7 @@ impl Daemon {
                 let _ = tx.decision.send((action.clone(), arguments));
                 Ok(json!({"step_id": step_id, "action": action}))
             }
-            Request::ImportAll { bundle } => self.import_all(&bundle).await,
+            Request::ImportAll { bundle } => Box::pin(self.import_all(&bundle)).await,
             Request::RunOptimiser { tool_id } => {
                 let this = self.clone();
                 tokio::spawn(async move {
@@ -6383,6 +6449,7 @@ impl Daemon {
             .rsplit_once(':')
             .map(|(name, _)| name)
             .unwrap_or(crate::config::DEFAULT_PROVIDER);
+        let routing_pick = forecast.routing_pick.clone();
         let mut fixed = cfg.clone();
         let requested = if forecast.basis.role.starts_with("role:") {
             let role = forecast.basis.role.trim_start_matches("role:");
@@ -6442,6 +6509,7 @@ impl Daemon {
             cfg: fixed,
             requested,
             resolved_model: forecast.basis.model.clone(),
+            routing_pick,
             effort,
             recovery_messages,
             resumed_from,
@@ -6771,8 +6839,13 @@ impl Daemon {
         let producer = crate::routing_task_observation::Producer(task.clone());
         crate::routing_task_observation::scope(
             task,
-            self.clone()
-                .run_loop_inner(session_id, run_id, cancel, cancel_flag, steer_rx),
+            Box::pin(self.clone().run_loop_inner(
+                session_id,
+                run_id,
+                cancel,
+                cancel_flag,
+                steer_rx,
+            )),
         )
         .await;
         drop(producer);
@@ -6792,10 +6865,8 @@ impl Daemon {
         let taint_scope = self.taint_scope(&session_id, &run_id);
         let mut final_status = "completed";
         loop {
-            match self
-                .run_step(&session_id, &run_id, &cancel, &cancel_flag)
-                .await
-            {
+            let step = Box::pin(self.run_step(&session_id, &run_id, &cancel, &cancel_flag));
+            match step.await {
                 Ok(()) => {
                     #[cfg(test)]
                     if let Some(hook) = self.run_final_decision_test.locked().take() {
@@ -7535,6 +7606,7 @@ impl Daemon {
         };
         if let Some(admitted) = &admitted {
             target.effort = admitted.effort.clone();
+            target.routing_pick = admitted.routing_pick.clone();
         }
         let provider = {
             let (sid, rid, subs) = (
@@ -7604,6 +7676,10 @@ impl Daemon {
             &cfg,
         )?;
         let model = self.resolve_model_named(&requested_model, &cfg, provider.name(), complex)?;
+        let routing_pick = target
+            .routing_pick
+            .as_deref()
+            .or_else(|| ProviderCfg::is_auto_model(&requested_model).then_some(model.as_str()));
         self.run_models
             .lock()
             .unwrap()
@@ -8061,6 +8137,13 @@ impl Daemon {
                 if paused_turns < 3 {
                     paused_turns += 1;
                     let mut meta = json!({"stop_reason": "pause_turn"});
+                    add_served_model_meta(
+                        &mut meta,
+                        &requested_model,
+                        routing_pick,
+                        &result.model_used,
+                        result.used_fallback,
+                    );
                     if !result.reasoning.is_empty() {
                         meta["reasoning_content"] = json!(result.reasoning);
                     }
@@ -8157,14 +8240,12 @@ impl Daemon {
                     )
                     .await?;
                 }
-                // Which model answered, when not the one asked for: a
-                // fallback, or auto routing's pick (SPEC §4.5).
-                let served = (!result.model_used.is_empty() && result.model_used != requested_model)
-                    .then(|| {
-                        let via = if result.model_used == model { "routing" } else { "fallback" };
-                        json!({"model": {"name": result.model_used, "via": via, "requested": requested_model}})
-                            .to_string()
-                    });
+                let served = served_model_info(
+                    &requested_model,
+                    routing_pick,
+                    &result.model_used,
+                    result.used_fallback,
+                );
                 // Never an empty answer for a refusal or a filter stop (#615).
                 // The placeholder is marked as such (#1104): clients show it
                 // as a note, and the model never sees it as its own words.
@@ -8184,8 +8265,8 @@ impl Daemon {
                     .or(result.truncated.then_some("max_tokens"));
                 let meta = match (stored_stop, served) {
                     (Some(stop), served) => {
-                        let mut m: Value = served
-                            .and_then(|s| serde_json::from_str(&s).ok())
+                        let mut m = served
+                            .map(|served| json!({"model": served}))
                             .unwrap_or_else(|| json!({}));
                         m["stop_reason"] = json!(stop);
                         if result.truncated || stop == "model_context_window_exceeded" {
@@ -8196,7 +8277,7 @@ impl Daemon {
                         }
                         Some(m.to_string())
                     }
-                    (None, served) => served,
+                    (None, served) => served.map(|served| json!({"model": served}).to_string()),
                 };
                 let msg = self.with_store(|st| {
                     st.append_message_meta(session_id, "assistant", &content, meta)
@@ -8237,6 +8318,13 @@ impl Daemon {
             // (thinking-mode endpoints require it echoed back; §10.6) —
             // it is never stored as the assistant's answer content.
             let mut meta = json!({"tool_calls": calls_json});
+            add_served_model_meta(
+                &mut meta,
+                &requested_model,
+                routing_pick,
+                &result.model_used,
+                result.used_fallback,
+            );
             if !result.reasoning.is_empty() {
                 meta["reasoning_content"] = json!(result.reasoning);
             }
@@ -8291,7 +8379,14 @@ impl Daemon {
                 bail!("interrupted");
             }
             let (denied, approved_calls) = self
-                .approve_calls(&cfg, session_id, run_id, &result.tool_calls, cancel)
+                .approve_calls(
+                    &cfg,
+                    session_id,
+                    run_id,
+                    &result.tool_calls,
+                    Some(&skipped),
+                    cancel,
+                )
                 .await?;
             if cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst) {
                 bail!("interrupted");
@@ -8523,7 +8618,7 @@ impl Daemon {
         })?;
         let forks: Vec<_> = prepared
             .iter()
-            .map(|(fork, _, _, _, model)| (fork.id.clone(), model.clone()))
+            .map(|(fork, message, _, _, model)| (fork.id.clone(), model.clone(), message.seq))
             .collect();
         self.comparisons.locked().insert(
             comparison_id.clone(),
@@ -8542,18 +8637,35 @@ impl Daemon {
             }
         }
         Ok(
-            json!({"comparison_id":comparison_id,"forks":forks.iter().map(|(s,m)|json!({"session_id":s,"model":m})).collect::<Vec<_>>()}),
+            json!({"comparison_id":comparison_id,"forks":forks.iter().map(|(s,m,_)|json!({"session_id":s,"model":m})).collect::<Vec<_>>()}),
         )
     }
 
     /// A compared fork finished: once every fork has, report the answers
     /// to the Session the comparison came from.
+    fn comparison_answer(
+        messages: &[formless_protocol::MessageInfo],
+        prompt_seq: i64,
+    ) -> (String, Option<formless_protocol::ServedModelInfo>) {
+        let answer = messages.iter().rev().find(|message| {
+            message.seq > prompt_seq && message.role == "assistant" && !message.content.is_empty()
+        });
+        let served_model = answer.and_then(|message| {
+            let meta: Value = serde_json::from_str(message.meta.as_deref()?).ok()?;
+            serde_json::from_value(meta["model"].clone()).ok()
+        });
+        (
+            answer.map_or_else(String::new, |message| message.content.clone()),
+            served_model,
+        )
+    }
+
     fn comparison_run_ended(&self, session_id: &str) {
         let done = {
             let mut all = self.comparisons.locked();
             let Some(id) = all
                 .iter()
-                .find(|(_, (_, forks))| forks.iter().any(|(f, _)| f == session_id))
+                .find(|(_, (_, forks))| forks.iter().any(|(f, _, _)| f == session_id))
                 .map(|(id, _)| id.clone())
             else {
                 return;
@@ -8563,7 +8675,7 @@ impl Daemon {
                 all[&id]
                     .1
                     .iter()
-                    .any(|(f, _)| f != session_id && runs.contains_key(f))
+                    .any(|(f, _, _)| f != session_id && runs.contains_key(f))
             };
             if busy {
                 return;
@@ -8576,15 +8688,11 @@ impl Daemon {
         let cfg = self.config().unwrap_or_default();
         let results = forks
             .into_iter()
-            .map(|(fork, model)| {
-                let answer = self
+            .map(|(fork, model, prompt_seq)| {
+                let messages = self
                     .with_reader(|st| st.list_messages(&fork))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .rev()
-                    .find(|m| m.role == "assistant" && !m.content.is_empty())
-                    .map(|m| m.content)
                     .unwrap_or_default();
+                let (answer, served_model) = Self::comparison_answer(&messages, prompt_seq);
                 let run = self
                     .with_reader(|st| st.run_metrics_for(Some(&fork), 1, None))
                     .unwrap_or_default()
@@ -8596,6 +8704,7 @@ impl Daemon {
                     .and_then(|u| u.cost);
                 ComparisonResult {
                     model,
+                    served_model,
                     session_id: fork,
                     status: run
                         .as_ref()
@@ -8620,6 +8729,59 @@ impl Daemon {
     /// Step mode (SPEC §5.9): before a step's calls run, ask about each
     /// one. Edited arguments replace the call's; returns the ids of the
     /// calls to skip. Without a connected client it does not wait.
+    fn validate_step_edit(&self, step_id: &str, input: &mut Value) -> Result<()> {
+        let (session_id, tool_name) = self
+            .step_waiters
+            .lock()
+            .unwrap()
+            .get(step_id)
+            .map(|waiter| {
+                (
+                    waiter.prompt.session_id.clone(),
+                    waiter.prompt.tool_name.clone(),
+                )
+            })
+            .context(RequestFailure::not_found("that step is no longer waiting"))?;
+        let (schema, caps) = match toolreg::builtin_schema(&tool_name) {
+            Some(schema) => (schema, None),
+            None => {
+                let Some((_, version)) =
+                    self.with_store(|store| store.get_tool_by_name(&tool_name))?
+                else {
+                    return Err(anyhow::Error::new(RequestFailure::invalid(format!(
+                        "tool '{tool_name}' no longer exists"
+                    ))));
+                };
+                let schema = serde_json::from_str(&version.input_schema).map_err(|error| {
+                    RequestFailure::invalid(format!("tool has invalid input schema: {error}"))
+                })?;
+                let caps = Capabilities::parse(&version.capabilities).map_err(|error| {
+                    RequestFailure::invalid(format!("tool has invalid capabilities: {error}"))
+                })?;
+                (schema, Some(caps))
+            }
+        };
+        let validator = toolreg::compile_schema(&schema).map_err(|error| {
+            RequestFailure::invalid(format!("tool has invalid input schema: {error}"))
+        })?;
+        toolreg::coerce_json_strings(&schema, input);
+        if let Some(caps) = caps {
+            let cwd = self
+                .session_cwd(&session_id)
+                .map(std::path::PathBuf::from)
+                .map(Ok)
+                .unwrap_or_else(std::env::current_dir)?;
+            let mut normalized = input.clone();
+            if caps.absolutize_inputs(&mut normalized, &cwd).is_ok() {
+                *input = normalized;
+            }
+        }
+        toolreg::validate_against(&validator, input).map_err(|error| {
+            RequestFailure::invalid(format!("input failed schema validation: {error}"))
+        })?;
+        Ok(())
+    }
+
     async fn step_gate(
         &self,
         session_id: &str,
@@ -8700,6 +8862,7 @@ impl Daemon {
         session_id: &str,
         run_id: &str,
         calls: &[ToolCall],
+        skipped_ids: Option<&HashSet<String>>,
         cancel: &CancellationToken,
     ) -> Result<(HashMap<String, bool>, Vec<ToolCall>)> {
         if cancel.is_cancelled() {
@@ -8715,7 +8878,9 @@ impl Daemon {
             .unwrap_or_else(std::env::current_dir)?;
         let mut prepared = calls.to_vec();
         for call in &mut prepared {
-            if toolreg::is_builtin(&call.name) {
+            if skipped_ids.is_some_and(|ids| ids.contains(&call.id))
+                || toolreg::is_builtin(&call.name)
+            {
                 continue;
             }
             let Some((_, ver)) = self.with_store(|st| st.get_tool_by_name(&call.name))? else {
@@ -8740,7 +8905,8 @@ impl Daemon {
         let mut denied: HashMap<String, bool> = HashMap::new();
         // Several held calls in one batch: each prompt lists them all
         // (SPEC §5.2), and each is still answered on its own.
-        let batch = approval_batch::Batch::new(self.held_calls(cfg, session_id, calls)?);
+        let batch =
+            approval_batch::Batch::new(self.held_calls(cfg, session_id, calls, skipped_ids)?);
         self.approve_each(
             cfg,
             session_id,
@@ -8749,6 +8915,7 @@ impl Daemon {
             cancel,
             &mut denied,
             batch.as_ref(),
+            skipped_ids,
         )
         .await?;
         Ok((denied, prepared))
@@ -8865,10 +9032,12 @@ impl Daemon {
         cfg: &Config,
         session_id: &str,
         calls: &[ToolCall],
+        skipped_ids: Option<&HashSet<String>>,
     ) -> Result<Vec<(usize, String, HeldCall)>> {
         let mut held = Vec::new();
         for (ordinal, tc) in calls.iter().enumerate() {
-            if toolreg::is_builtin(&tc.name) {
+            if skipped_ids.is_some_and(|ids| ids.contains(&tc.id)) || toolreg::is_builtin(&tc.name)
+            {
                 continue;
             }
             let Some((info, ver)) = self.with_store(|st| st.get_tool_by_name(&tc.name))? else {
@@ -8966,12 +9135,14 @@ impl Daemon {
         cancel: &CancellationToken,
         denied: &mut HashMap<String, bool>,
         batch: Option<&approval_batch::Batch>,
+        skipped_ids: Option<&HashSet<String>>,
     ) -> Result<()> {
         for (ordinal, tc) in calls.iter().enumerate() {
             if cancel.is_cancelled() {
                 bail!("interrupted");
             }
-            if toolreg::is_builtin(&tc.name) {
+            if skipped_ids.is_some_and(|ids| ids.contains(&tc.id)) || toolreg::is_builtin(&tc.name)
+            {
                 continue;
             }
             if let Some((info, ver)) = self.with_store(|st| st.get_tool_by_name(&tc.name))? {
@@ -9963,6 +10134,7 @@ impl Daemon {
                 session_id,
                 "direct",
                 std::slice::from_ref(&tc),
+                None,
                 &cancel,
             )
             .await
@@ -10401,6 +10573,15 @@ impl Daemon {
 
     /// Load a `formless.session/1` bundle as a new Session.
     fn import_session_bundle(&self, bundle: &Value) -> Result<SessionInfo> {
+        self.import_session_bundle_with_fingerprint(bundle, None)
+            .map(|(session, _)| session)
+    }
+
+    fn import_session_bundle_with_fingerprint(
+        &self,
+        bundle: &Value,
+        fingerprint: Option<&str>,
+    ) -> Result<(SessionInfo, bool)> {
         if bundle["format"].as_str() != Some("formless.session/1") {
             return Err(anyhow!("unsupported session bundle format"));
         }
@@ -10436,20 +10617,141 @@ impl Daemon {
             .enumerate()
             .map(|(index, message)| message["seq"].as_i64().unwrap_or(index as i64 + 1))
             .collect();
-        let s = self.with_store(|st| {
+        self.with_store(|st| {
             st.transaction(|st| {
-                let s = st.import_session(
+                if let Some(fingerprint) = fingerprint {
+                    if let Some(session_id) = st.imported_session_for_fingerprint(fingerprint)? {
+                        let session = st
+                            .get_session(&session_id)?
+                            .context("recorded imported session disappeared")?;
+                        return Ok((session, false));
+                    }
+                }
+                let session = st.import_session(
                     bundle["name"].as_str().unwrap_or("Imported"),
                     bundle["model"].as_str().map(str::to_string),
                     bundle["reasoning_effort"].as_str().map(str::to_string),
                     &messages,
                     &checkpoints,
                 )?;
-                st.import_session_plan_bundle(&s.id, bundle, &source_seqs)?;
-                Ok(s)
+                st.import_session_plan_bundle(&session.id, bundle, &source_seqs)?;
+                if let Some(fingerprint) = fingerprint {
+                    st.remember_imported_session_fingerprint(fingerprint, &session.id)?;
+                }
+                Ok((session, true))
             })
-        })?;
-        Ok(s)
+        })
+    }
+
+    fn import_session_identity(bundle: &Value) -> Result<Value> {
+        let raw_messages = bundle["messages"].as_array().cloned().unwrap_or_default();
+        let mut source_positions = BTreeMap::new();
+        let mut previous_seq = 0;
+        for (index, message) in raw_messages.iter().enumerate() {
+            let source_seq = message["seq"].as_i64().unwrap_or(index as i64 + 1);
+            if source_seq <= previous_seq
+                || source_positions
+                    .insert(source_seq, index as i64 + 1)
+                    .is_some()
+            {
+                bail!("Imported message sequence mapping is ambiguous or out of order");
+            }
+            previous_seq = source_seq;
+        }
+        let messages = raw_messages
+            .iter()
+            .map(|message| {
+                json!({
+                    "role": message["role"].as_str().unwrap_or("user"),
+                    "content": message["content"].as_str().unwrap_or_default(),
+                    "meta": crate::storage::sanitize_imported_message_meta(message["meta"].as_str()),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut checkpoints = bundle["checkpoints"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, checkpoint)| {
+                let up_to_seq = checkpoint["up_to_seq"].as_i64().unwrap_or(0);
+                (
+                    up_to_seq,
+                    index,
+                    json!({
+                        "summary": checkpoint["summary"].as_str().unwrap_or_default(),
+                        "up_to_seq": up_to_seq,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        checkpoints.sort_by_key(|(up_to_seq, index, _)| (*up_to_seq, *index));
+        let checkpoints = checkpoints
+            .into_iter()
+            .map(|(_, _, checkpoint)| checkpoint)
+            .collect::<Vec<_>>();
+        let current_plan = bundle
+            .get("plan")
+            .map(crate::storage::portable_plan)
+            .transpose()?
+            .unwrap_or_default();
+        let has_current_plan = bundle.get("plan").is_some() || bundle.get("plan_state").is_some();
+        if bundle.get("plan_history").is_some() && !has_current_plan {
+            bail!("Plan history requires an explicit current plan or plan_state; history-only imports are ambiguous");
+        }
+        let mut plan_history = BTreeMap::<i64, Vec<PlanItem>>::new();
+        if let Some(history) = bundle.get("plan_history") {
+            let history = history
+                .as_array()
+                .context("plan_history must be an array")?;
+            if history.len() > raw_messages.len() + 1 {
+                bail!("Plan history exceeds retained message boundaries");
+            }
+            let mut seen = BTreeSet::new();
+            for revision in history {
+                let source_seq = revision["anchor_seq"]
+                    .as_i64()
+                    .context("Plan revision boundary required")?;
+                if !seen.insert(source_seq) {
+                    bail!("Duplicate plan revision boundary");
+                }
+                let anchor = if source_seq == 0 {
+                    0
+                } else {
+                    *source_positions
+                        .get(&source_seq)
+                        .context("Plan revision points outside imported messages")?
+                };
+                let items = crate::storage::portable_plan(&revision["items"])?;
+                plan_history.insert(anchor, items);
+            }
+        }
+        if has_current_plan {
+            plan_history.insert(raw_messages.len() as i64, current_plan.clone());
+        }
+        if plan_history.values().all(|items| items.is_empty()) {
+            plan_history.clear();
+        }
+        let plan_history = plan_history
+            .into_iter()
+            .map(|(anchor, items)| json!({"anchor": anchor, "items": items}))
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "name": bundle["name"].as_str().unwrap_or("Imported"),
+            "model": bundle.get("model").and_then(Value::as_str),
+            "reasoning_effort": bundle.get("reasoning_effort").and_then(Value::as_str),
+            "messages": messages,
+            "checkpoints": checkpoints,
+            "plan": current_plan,
+            "plan_history": plan_history,
+        }))
+    }
+
+    fn import_session_fingerprint(identity: &Value) -> Result<String> {
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(identity)?)
+        ))
     }
 
     /// `ExportAll` (SPEC §15): one bundle for a new machine.
@@ -10487,7 +10789,7 @@ impl Daemon {
             .with_reader(|st| st.list_jobs())?
             .into_iter()
             .filter(|j| j.cron.is_some())
-            .map(|j| json!({"prompt": j.prompt, "cron": j.cron, "overlap": j.overlap, "deliver": j.deliver, "enabled": j.enabled}))
+            .map(|j| json!({"prompt": j.prompt, "session_id": j.source_session_id.as_ref().or(j.session_id.as_ref()), "cron": j.cron, "overlap": j.overlap, "deliver": j.deliver, "enabled": j.enabled}))
             .collect();
         let (config, blanked) = self.config()?.portable();
         let mut out = json!({
@@ -10525,22 +10827,44 @@ impl Daemon {
         }
         let list = |k: &str| bundle[k].as_array().cloned().unwrap_or_default();
         let mut failed: Vec<String> = Vec::new();
+        let kinds = [
+            "providers",
+            "roles",
+            "mcp_servers",
+            "modules",
+            "tools",
+            "skills",
+            "memories",
+            "jobs",
+            "sessions",
+        ];
+        let mut added = kinds
+            .iter()
+            .map(|kind| ((*kind).to_string(), 0usize))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut skipped_existing = added.clone();
+        let count = |counts: &mut std::collections::BTreeMap<String, usize>, kind: &str| {
+            *counts.entry(kind.to_string()).or_default() += 1;
+        };
         // Config first (providers and Roles the Tools may name), then
         // modules (Tools load them), then the rest.
         let incoming: Config = serde_json::from_value(bundle["config"].clone()).unwrap_or_default();
-        let (mut providers, mut roles, mut servers) = (0, 0, 0);
         let mut server_review = Vec::new();
         self.with_config_edit(|cfg| {
             for (k, v) in incoming.providers {
                 if !cfg.providers.contains_key(&k) {
                     cfg.providers.insert(k, v);
-                    providers += 1;
+                    count(&mut added, "providers");
+                } else {
+                    count(&mut skipped_existing, "providers");
                 }
             }
             for (k, v) in incoming.roles {
                 if !cfg.roles.contains_key(&k) {
                     cfg.roles.insert(k, v);
-                    roles += 1;
+                    count(&mut added, "roles");
+                } else {
+                    count(&mut skipped_existing, "roles");
                 }
             }
             for (k, mut v) in incoming.mcp.servers {
@@ -10549,15 +10873,16 @@ impl Daemon {
                     v.trusted = false;
                     server_review.push(json!({"name":k, "target":crate::mcp_catalog::safe_target(&v), "disabled":true, "trusted":false}));
                     cfg.mcp.servers.insert(k, v);
-                    servers += 1;
+                    count(&mut added, "mcp_servers");
+                } else {
+                    count(&mut skipped_existing, "mcp_servers");
                 }
             }
-            Ok(providers + roles + servers > 0)
+            Ok(added["providers"] + added["roles"] + added["mcp_servers"] > 0)
         })?;
-        if providers + roles + servers > 0 {
+        if added["providers"] + added["roles"] + added["mcp_servers"] > 0 {
             self.broadcast(Event::McpServersChanged);
         }
-        let mut modules = 0;
         for m in list("modules") {
             let (Some(name), Some(code)) = (m["name"].as_str(), m["code"].as_str()) else {
                 continue;
@@ -10566,6 +10891,7 @@ impl Daemon {
                 .with_reader(|st| st.get_module_by_name(name))?
                 .is_some()
             {
+                count(&mut skipped_existing, "modules");
                 continue;
             }
             match self.with_store(|st| {
@@ -10576,17 +10902,22 @@ impl Daemon {
                     "import",
                 )
             }) {
-                Ok(_) => modules += 1,
+                Ok(_) => count(&mut added, "modules"),
                 Err(e) => failed.push(format!("module {name}: {e}")),
             }
         }
         let cfg = self.config()?;
-        let mut tools = 0;
         let mut capability_families = std::collections::BTreeMap::<String, usize>::new();
         for t in list("tools") {
+            if let Some(name) = t["name"].as_str() {
+                if self.with_reader(|st| st.get_tool_by_name(name))?.is_some() {
+                    count(&mut skipped_existing, "tools");
+                    continue;
+                }
+            }
             match self.import_one_tool(&t, &cfg).await {
                 Ok(_) => {
-                    tools += 1;
+                    count(&mut added, "tools");
                     for cap in t["capabilities"]
                         .as_array()
                         .into_iter()
@@ -10601,31 +10932,120 @@ impl Daemon {
                 Err(e) => failed.push(format!("tool {}: {e}", t["name"].as_str().unwrap_or("?"))),
             }
         }
-        let mut skills = 0;
         for b in list("skills") {
-            let res = crate::skills::prepare_bundle(&self.paths, &b).and_then(|staged| {
-                self.with_store(|st| crate::skills::commit(&self.paths, st, &staged, "import"))
-            });
-            match res {
-                Ok(_) => skills += 1,
-                Err(e) => failed.push(format!("skill {}: {e}", b["name"].as_str().unwrap_or("?"))),
+            let bundle_name = b["name"].as_str().unwrap_or("?").to_string();
+            match crate::skills::prepare_bundle(&self.paths, &b) {
+                Ok(staged) => {
+                    let name = staged.meta.name.clone();
+                    match self.with_store(|st| {
+                        if st.get_skill(&name)?.is_some() {
+                            Ok(false)
+                        } else {
+                            crate::skills::commit(&self.paths, st, &staged, "import")?;
+                            Ok(true)
+                        }
+                    }) {
+                        Ok(true) => count(&mut added, "skills"),
+                        Ok(false) => count(&mut skipped_existing, "skills"),
+                        Err(e) => failed.push(format!("skill {name}: {e}")),
+                    }
+                }
+                Err(e) => failed.push(format!("skill {bundle_name}: {e}")),
             }
         }
-        let mut memories = 0;
+        let mut memory_keys = self.with_reader(|st| {
+            Ok(st
+                .list_memories()?
+                .into_iter()
+                .map(|memory| (memory.scope, crate::memory::dedup_key(&memory.text)))
+                .collect::<std::collections::BTreeSet<_>>())
+        })?;
         for m in list("memories") {
             let text = m["text"].as_str().unwrap_or_default();
             let scope = m["scope"].as_str().unwrap_or("global");
+            let key = (scope.to_string(), crate::memory::dedup_key(text));
+            if !memory_keys.insert(key.clone()) {
+                count(&mut skipped_existing, "memories");
+                continue;
+            }
             match self.with_store(|st| st.add_memory(text, scope, "import", None)) {
-                Ok((_, true)) => memories += 1,
-                Ok(_) => {}
-                Err(e) => failed.push(format!("memory: {e}")),
+                Ok((_, true)) => count(&mut added, "memories"),
+                Ok(_) => count(&mut skipped_existing, "memories"),
+                Err(e) => {
+                    memory_keys.remove(&key);
+                    failed.push(format!("memory: {e}"));
+                }
             }
         }
-        let mut jobs = 0;
-        for j in list("jobs") {
+        let delivery_identity = |deliver: Option<&Value>| {
+            deliver
+                .filter(|value| {
+                    !value.is_null() && !value.as_object().is_some_and(|object| object.is_empty())
+                })
+                .map(Value::to_string)
+                .unwrap_or_default()
+        };
+        let incoming_jobs = list("jobs");
+        let has_importable_job = incoming_jobs
+            .iter()
+            .any(|job| job["prompt"].as_str().is_some() && job["cron"].as_str().is_some());
+        let mut job_identities = if has_importable_job {
+            self.with_reader(|st| {
+                let jobs = st.list_jobs()?;
+                let target_session_ids = jobs
+                    .iter()
+                    .filter(|job| job.cron.is_some())
+                    .filter_map(|job| job.session_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let mut existing_session_ids = std::collections::BTreeSet::new();
+                for id in target_session_ids {
+                    if st.get_session(&id)?.is_some() {
+                        existing_session_ids.insert(id);
+                    }
+                }
+                let mut identities = std::collections::BTreeSet::new();
+                for job in jobs {
+                    let Some(cron) = job.cron else {
+                        continue;
+                    };
+                    if job
+                        .session_id
+                        .as_ref()
+                        .is_some_and(|target| !existing_session_ids.contains(target))
+                    {
+                        continue;
+                    }
+                    identities.insert((
+                        job.source_session_id.or(job.session_id),
+                        job.prompt,
+                        cron,
+                        job.overlap,
+                        delivery_identity(job.deliver.as_ref()),
+                    ));
+                }
+                Ok(identities)
+            })?
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        for j in incoming_jobs {
             let (Some(prompt), Some(cron)) = (j["prompt"].as_str(), j["cron"].as_str()) else {
                 continue;
             };
+            let session_id = j["session_id"].as_str().map(str::to_string);
+            let overlap = j["overlap"].as_str().unwrap_or("skip").to_string();
+            let delivery = delivery_identity(j.get("deliver"));
+            let identity = (
+                session_id.clone(),
+                prompt.to_string(),
+                cron.to_string(),
+                overlap.clone(),
+                delivery.clone(),
+            );
+            if job_identities.contains(&identity) {
+                count(&mut skipped_existing, "jobs");
+                continue;
+            }
             let next = crate::jobs::first_run(Some(cron), None, chrono::Local::now())
                 .ok()
                 .map(|t| t.to_rfc3339());
@@ -10634,25 +11054,98 @@ impl Daemon {
                 continue;
             };
             let made = self.with_store(|st| {
-                let job = st.create_job(prompt, None, Some(cron), &next, true, "import")?;
-                st.set_job_options(
-                    &job.id,
-                    j["overlap"].as_str(),
-                    (!j["deliver"].is_null()).then_some(&j["deliver"]),
-                )?;
-                // Paused: review, then enable on this machine.
-                st.set_job_enabled(&job.id, false)?;
-                Ok(())
+                st.transaction(|st| {
+                    let job = st.create_job(prompt, None, Some(cron), &next, true, "import")?;
+                    if let Some(source_session_id) = session_id.as_deref() {
+                        st.set_job_source_session_id(&job.id, source_session_id)?;
+                    }
+                    st.set_job_options(
+                        &job.id,
+                        j["overlap"].as_str(),
+                        (!j["deliver"].is_null()).then_some(&j["deliver"]),
+                    )?;
+                    // Paused: review, then enable on this machine.
+                    st.set_job_enabled(&job.id, false)?;
+                    Ok(())
+                })
             });
             match made {
-                Ok(()) => jobs += 1,
+                Ok(()) => {
+                    count(&mut added, "jobs");
+                    job_identities.insert(identity);
+                }
                 Err(e) => failed.push(format!("job {cron}: {e}")),
             }
         }
-        let mut sessions = 0;
-        for b in list("sessions") {
-            match self.import_session_bundle(&b) {
-                Ok(_) => sessions += 1,
+        let sessions = list("sessions");
+        let mut session_identities = BTreeMap::new();
+        if !sessions.is_empty() {
+            for session in self.with_reader(|st| st.list_sessions())? {
+                let Ok(exported) = self.session_bundle(&session.id) else {
+                    continue;
+                };
+                let Ok(identity) = Self::import_session_identity(&exported) else {
+                    continue;
+                };
+                session_identities
+                    .entry(serde_json::to_string(&identity)?)
+                    .or_insert(session.id);
+            }
+        }
+        let mut seen_session_fingerprints = BTreeSet::new();
+        for b in sessions {
+            if b["format"].as_str() != Some("formless.session/1") {
+                failed.push(format!(
+                    "session {}: unsupported session bundle format",
+                    b["name"].as_str().unwrap_or("?")
+                ));
+                continue;
+            }
+            let identity = match Self::import_session_identity(&b) {
+                Ok(identity) => identity,
+                Err(e) => {
+                    failed.push(format!(
+                        "session {}: {e}",
+                        b["name"].as_str().unwrap_or("?")
+                    ));
+                    continue;
+                }
+            };
+            let fingerprint = Self::import_session_fingerprint(&identity)?;
+            if seen_session_fingerprints.contains(&fingerprint) {
+                count(&mut skipped_existing, "sessions");
+                continue;
+            }
+            if self
+                .with_reader(|st| st.imported_session_for_fingerprint(&fingerprint))?
+                .is_some()
+            {
+                seen_session_fingerprints.insert(fingerprint);
+                count(&mut skipped_existing, "sessions");
+                continue;
+            }
+            let identity_key = serde_json::to_string(&identity)?;
+            if let Some(session_id) = session_identities.get(&identity_key) {
+                let session_id = session_id.clone();
+                self.with_store(|st| {
+                    st.transaction(|st| {
+                        st.remember_imported_session_fingerprint(&fingerprint, &session_id)
+                    })
+                })?;
+                seen_session_fingerprints.insert(fingerprint);
+                count(&mut skipped_existing, "sessions");
+                continue;
+            }
+            match self.import_session_bundle_with_fingerprint(&b, Some(&fingerprint)) {
+                Ok((session, true)) => {
+                    seen_session_fingerprints.insert(fingerprint);
+                    count(&mut added, "sessions");
+                    session_identities.insert(identity_key, session.id);
+                }
+                Ok((_, false)) => {
+                    seen_session_fingerprints.insert(fingerprint);
+                    count(&mut skipped_existing, "sessions");
+                }
                 Err(e) => failed.push(format!(
                     "session {}: {e}",
                     b["name"].as_str().unwrap_or("?")
@@ -10663,16 +11156,17 @@ impl Daemon {
             st.audit(
                 "user",
                 "import_all",
-                &format!("{tools} tools, {skills} skills"),
+                &format!("{} tools, {} skills", added["tools"], added["skills"]),
             )
         });
         self.broadcast(Event::SkillsChanged);
         self.broadcast(Event::MemoryUpdated);
         self.broadcast(Event::JobsChanged);
         Ok(json!({
-            "tools": tools, "modules": modules, "skills": skills, "memories": memories,
-            "jobs": jobs, "sessions": sessions, "providers": providers, "roles": roles,
-            "mcp_servers": servers, "blanked": bundle["blanked"], "failed": failed,
+            "tools": added["tools"], "modules": added["modules"], "skills": added["skills"], "memories": added["memories"],
+            "jobs": added["jobs"], "sessions": added["sessions"], "providers": added["providers"], "roles": added["roles"],
+            "mcp_servers": added["mcp_servers"], "added": added, "skipped_existing": skipped_existing,
+            "blanked": bundle["blanked"], "failed": failed,
             "mcp_review": server_review, "tool_capability_families": capability_families,
             "review_notice": "MCP servers are disabled and untrusted; inspect each command before enabling. Jobs are paused and Skills disabled.",
         }))
@@ -11001,6 +11495,7 @@ impl Daemon {
                 _ = cancel.cancelled() => bail!("interrupted"),
                 result = self.target(cfg, session_id, model) => result?,
             };
+            let target_routing_pick = target.routing_pick.clone();
             let provider = target.provider;
             let session_effort = target.effort;
             let requested = target.model;
@@ -11024,6 +11519,7 @@ impl Daemon {
             let mut task_tokens = 0i64;
             // USD of those tokens; None once a step's model has no price.
             let mut task_cost = Some(0.0);
+            let mut last_served_model = None;
             let sub_defs = || -> Result<Vec<Value>> {
                 self.with_store(|st| {
                     let mut defs =
@@ -11054,6 +11550,9 @@ impl Daemon {
                 provider.name(),
                 self.routing_complex(&provider, &requested, &messages, &sub_defs()?, cfg)?,
             )?;
+            let routing_pick = target_routing_pick
+                .as_deref()
+                .or_else(|| ProviderCfg::is_auto_model(&requested).then_some(model.as_str()));
             let label = match &role {
                 Some(r) => format!("{r} · {model}"),
                 None => model.clone(),
@@ -11113,6 +11612,17 @@ impl Daemon {
                     drop(routing_call);
                     self.flush_routing()?;
                     let result=result?;
+                    let served_model = served_model_info(
+                        &requested,
+                        routing_pick,
+                        &result.model_used,
+                        result.used_fallback,
+                    );
+                    last_served_model = served_model.clone();
+                    if let (Some(inv), Some(served)) = (parent_inv, served_model.as_ref()) {
+                        let _ = self
+                            .with_store(|st| st.add_invocation_served_model(inv, served));
+                    }
                     self.record_data_origin(
                         session_id,
                         run_id,
@@ -11144,7 +11654,12 @@ impl Daemon {
                         tool_calls: result.tool_calls.iter().map(|c| c.name.clone()).collect(),
                     });
                     if result.tool_calls.is_empty() {
-                        record(&json!({"role": "assistant", "content": result.content}));
+                        let mut assistant =
+                            json!({"role": "assistant", "content": result.content.clone()});
+                        if let Some(served) = &served_model {
+                            assistant["meta"] = json!({"model": served});
+                        }
+                        record(&assistant);
                         return Ok(result.content);
                     }
                     let calls_json: Vec<Value> = result
@@ -11167,7 +11682,11 @@ impl Daemon {
                     if !result.thinking_blocks.is_empty() {
                         assistant["thinking_blocks"] = json!(result.thinking_blocks);
                     }
-                    record(&assistant);
+                    let mut stored_assistant = assistant.clone();
+                    if let Some(served) = &served_model {
+                        stored_assistant["meta"] = json!({"model": served});
+                    }
+                    record(&stored_assistant);
                     messages.push(assistant);
                     if result.truncated {
                         let mut stuck = None;
@@ -11184,7 +11703,7 @@ impl Daemon {
                         continue;
                     }
                     let (denied, approved_calls) = self
-                        .approve_calls(cfg, session_id, run_id, &result.tool_calls, cancel)
+                        .approve_calls(cfg, session_id, run_id, &result.tool_calls, None, cancel)
                         .await?;
                     let mut stuck = None;
                         let mut correction_batch = CorrectionBatch::default();
@@ -11265,7 +11784,9 @@ impl Daemon {
                     )
                 });
             }
-            if let Ok(sub) = self.with_store(|st| st.finish_subagent(&sub_id, status, &result)) {
+            if let Ok(sub) = self.with_store(|st| {
+                st.finish_subagent(&sub_id, status, &result, &label, last_served_model.as_ref())
+            }) {
                 self.broadcast(Event::SubagentFinished {
                     session_id: session_id.to_string(),
                     subagent: sub,
@@ -18003,6 +18524,7 @@ impl HostOps for NestedOps {
             .handle
             .block_on(self.daemon.target(&self.cfg, &self.session_id, model))
             .map_err(|e| e.to_string())?;
+        let target_routing_pick = target.routing_pick.clone();
         let provider = target.provider;
         let effort = target.effort;
         let requested = target.model;
@@ -18026,6 +18548,9 @@ impl HostOps for NestedOps {
             .daemon
             .resolve_model_named(&requested, &self.cfg, provider.name(), complex)
             .map_err(|e| e.to_string())?;
+        let routing_pick = target_routing_pick
+            .as_deref()
+            .or_else(|| ProviderCfg::is_auto_model(&requested).then_some(model.as_str()));
         let (routing_call, (result, terminal)) = self.block_cancellable(async {
             let call =
                 crate::routing_observation::Call::new(self.daemon.routing_recorder.call_sink());
@@ -18057,6 +18582,17 @@ impl HostOps for NestedOps {
             }
         })?;
         self.data_observed("llm", &result.model_used)?;
+        let served = served_model_info(
+            &requested,
+            routing_pick,
+            &result.model_used,
+            result.used_fallback,
+        );
+        if let (Some(inv), Some(served)) = (self.parent_inv.as_deref(), served.as_ref()) {
+            let _ = self
+                .daemon
+                .with_store(|st| st.add_invocation_served_model(inv, served));
+        }
         let usage = result.usage;
         // A Tool's own model calls count toward its Cost per Success, and
         // as its model use (§10.4).
@@ -18695,6 +19231,7 @@ pub(crate) struct Target {
     pub provider: Provider,
     /// The model to request (may still be `auto`, resolved by routing).
     pub model: String,
+    pub routing_pick: Option<String>,
     pub effort: Option<String>,
     /// A role's system prompt addendum.
     pub system: Option<String>,
@@ -18953,7 +19490,10 @@ mod trust_precedence_tests {
             arguments: "{}".into(),
         };
         assert!(
-            daemon.held_calls(&cfg, &sid, &[call]).unwrap().is_empty(),
+            daemon
+                .held_calls(&cfg, &sid, &[call], None)
+                .unwrap()
+                .is_empty(),
             "a trusted call is never listed as held"
         );
         // With a stored grant too, the grant is the basis: no trusted audit.

@@ -662,12 +662,17 @@ fn update_plan_definition() -> Value {
 
 fn ask_user_definition() -> Value {
     let option = json!({
-        "type": "object",
-        "properties": {
-            "label": {"type": "string", "description": "1–5 words"},
-            "description": {"type": "string", "description": "What picking it means"}
-        },
-        "required": ["label"]
+        "anyOf": [
+            {"type": "string"},
+            {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "1–5 words"},
+                    "description": {"type": "string", "description": "What picking it means"}
+                },
+                "required": ["label"]
+            }
+        ]
     });
     json!({
         "type": "function",
@@ -1777,6 +1782,18 @@ mod skeleton_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_user_schema_accepts_plain_string_options() {
+        let schema = builtin_schema(ASK_USER).unwrap();
+        let validator = compile_schema(&schema).unwrap();
+        for input in [
+            json!({"question": "Pick one", "options": ["A", "B"]}),
+            json!({"questions": [{"question": "Pick one", "options": ["A", "B"]}]}),
+        ] {
+            validate_against(&validator, &input).unwrap();
+        }
+    }
 
     #[test]
     fn object_input_schema_semantics_follow_instance_types_and_combinators() {

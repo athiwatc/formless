@@ -36,7 +36,7 @@ test('authenticated browser requests reach the daemon send path within the plain
 const deferred=()=>{let resolve;const promise=new Promise(r=>{resolve=r;});return{promise,resolve};};
 async function until(predicate){const end=Date.now()+2000;while(!predicate()){assert.ok(Date.now()<end,'bounded browser fixture');await new Promise(r=>setTimeout(r,2));}}
 async function browser(keyGate=null,decryptGate=null){
-  const sent=[],closes=[],readyAcks=[],messages=[],elements=new Map();let loaded=0,flushed=0;
+  const sent=[],closes=[],readyAcks=[],messages=[],elements=new Map();let loaded=0,flushed=0,reconnects=0;
   const S={ws:null,channel:null,daemonOnline:false,room:'room',pending:new Map(),sendChain:Promise.resolve(),nextId:1,relayModule:transport,relayMemory:new transport.MemoryBudget(512*1024*1024),userClosed:false};
   class Socket{
     constructor(){this.readyState=1;}
@@ -47,15 +47,23 @@ async function browser(keyGate=null,decryptGate=null){
   const c=vm.createContext({S,WebSocket:Socket,location:{protocol:'https:',host:'fixture.invalid'},crypto,Uint8Array,TextEncoder,TextDecoder,btoa,atob,
     enc:s=>new TextEncoder().encode(s),aad:(direction,seq)=>new TextEncoder().encode('formless-relay/2 '+direction+' '+seq),FRAME_VERSION:2,HANDSHAKE_MS:8000,HANDSHAKE_TRIES:3,
     $:id=>{if(!elements.has(id))elements.set(id,{textContent:'',classList:{add(){},remove(){},contains(){return true;}}});return elements.get(id);},
-    setTimeout(){return 1;},clearTimeout(){},renderAll(){},renderChrome(){},renderHistory(){},clearLiveState(){},scheduleReconnect(){},note(){},markStable(){},restorePushSubscription(){},loadAll(){loaded++;},refreshOutbox(){},flushOutbox(){flushed++;},onMessage(message){messages.push(message);},
+    setTimeout(){return 1;},clearTimeout(){},renderAll(){},renderChrome(){},renderHistory(){},clearLiveState(){},scheduleReconnect(){reconnects++;},note(){},markStable(){},restorePushSubscription(){},loadAll(){loaded++;},refreshOutbox(){},flushOutbox(){flushed++;},onMessage(message){messages.push(message);},
   });
-  vm.runInContext(['openRelay','finishRelayReady','startHandshake','sendHello','confirmTag','finishHandshake','bytesToB64','b64ToBytes','decrypt','pushRefused'].map(fn).join('\n'),c);
+  vm.runInContext(['openRelay','resetRelayConnection','finishRelayReady','startHandshake','sendHello','confirmTag','finishHandshake','bytesToB64','b64ToBytes','decrypt','pushRefused'].map(fn).join('\n'),c);
   S.key=await webcrypto.subtle.importKey('raw',new Uint8Array(32).fill(7),'HKDF',false,['deriveBits','deriveKey']);
   c.openRelay();const ws=S.ws;ws.onopen();
   const control=(body,receipt)=>ws.onmessage({data:JSON.stringify({relay:'control',g:generation,receipt,f:JSON.stringify(body)})});
   control({relay:'transport',v:1,g:generation,cid:'private-client'},'A'.repeat(22));
   await until(()=>sent.length===1);
-  return{c,S,ws,sent,closes,readyAcks,messages,control,loaded:()=>loaded,flushed:()=>flushed};
+  return{c,S,ws,sent,closes,readyAcks,messages,control,loaded:()=>loaded,flushed:()=>flushed,reconnects:()=>reconnects};
+}
+async function readyBrowser(b){
+  b.control({relay:'daemon_online'},'B'.repeat(22));
+  await until(()=>b.sent.some(frame=>frame.v===2&&frame.hello));
+  const daemonHello=new Uint8Array(16).fill(9),proof=await b.c.confirmTag(daemonHello,'d2b');
+  b.control({v:2,hello:b.c.bytesToB64(daemonHello),confirm:b.c.bytesToB64(proof)},'C'.repeat(22));
+  b.control({relay:'ready',g:generation},'D'.repeat(22));
+  await until(()=>b.S.relayReady);
 }
 test('shipped browser waits for local E2E proof and consumed room readiness before bulk/grants',async()=>{
   const b=await browser();b.control({relay:'daemon_online'},'B'.repeat(22));
@@ -155,6 +163,20 @@ test('duplicate handshake replies around readiness never send a late confirm or 
   await until(()=>b.sent.some(frame=>frame.relay==='ack'&&frame.receipt==='G'.repeat(22)));
   assert.equal(JSON.stringify(b.messages),JSON.stringify([message]));assert.equal(channel.received,1);
   assert.deepEqual(b.closes,[]);await until(()=>b.S.relayMemory.used===0);b.ws.close(1000);
+});
+
+test('a dropped encrypted frame closes the channel and schedules a state-resync connection',async()=>{
+  const b=await browser();
+  await readyBrowser(b);
+  const channel=b.S.channel;
+  const gap='{"v":2,"seq":2}';
+  const [fragment]=transport.fragments(gap,'c'.repeat(32));
+  b.ws.onmessage({data:JSON.stringify({relay:'delivery',g:generation,receipt:'H'.repeat(22),fragment})});
+  await until(()=>b.closes.includes(4002));
+  assert.equal(channel.received,0);
+  assert.equal(b.S.channel,null);
+  assert.equal(b.reconnects(),1);
+  await until(()=>b.S.relayMemory.used===0);
 });
 
 
