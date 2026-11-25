@@ -222,6 +222,9 @@
     topicRevision: 0,
     topicFocus: null,
     current: null,
+    pullId: null,
+    pullActivity: null,
+    pullTracking: { generation: 0, order: 0, active: [], finished: [], warningNotices: [], expectedSizeNotices: [] },
     drafts: {},
     unpersistedDrafts: new Map(),
     unpersistedDraftSharedValues: new Map(),
@@ -6081,10 +6084,11 @@
       state.replaceChildren(statusRender.spinner, h("span", { "data-status-activity": "" }, statusRender.text));
     }
     const running = isRunning();
-    const stateClass = running ? "state busy" : "state";
+    const stateClass = running ? "state busy" : S.pullActivity ? "state pulling" : "state";
     if (state.className !== stateClass) state.className = stateClass;
     if (statusRender.spinner.hidden !== !running) statusRender.spinner.hidden = !running;
-    updateText(statusRender.text, running ? S.activity ? activityText(S.activity) : "running" : "● ready");
+    const activity = running ? S.activity : S.pullActivity;
+    updateText(statusRender.text, activity ? activityText(activity) : running ? "running" : "● ready");
     const s = S.sessions.find((x) => x.id === S.current);
     $("status-session").textContent = s ? s.name : "no session";
     $("status-session").title = s && s.cwd ? "Working directory: " + s.cwd : "";
@@ -8701,6 +8705,7 @@
     for (const q of questions) cancelAsk("question:" + q.id);
   }
   function clearLiveState() {
+    clearPullTracking();
     S.toolVersionDiff = null;
     invalidateBranchSummary();
     ++sessionSeq; // invalidate a snapshot requested on the old connection
@@ -9300,10 +9305,10 @@
           h("td", { class: "num" }, c.avg_ms != null ? uiFixed(c.avg_ms / 1000, 1) + "s" : ""),
           h("td", null, c.qualified === false ? "below the quality gate" : "")))))))), { trigger });
     } },
-    { name: "pull", args: "MODEL", group: "Settings", desc: "Ollama: download a model", run: async (arg) => {
-      const model = (arg || "").trim();
-      if (!model) return note("usage: /pull MODEL", true);
-      if (await act({ type: "ollama_pull", model })) note("pulling " + model + " with Ollama…");
+    { name: "pull", args: "MODEL [--provider NAME] | cancel [PULL_ID]", group: "Settings", desc: "Ollama: download, attach to, or cancel a model pull", run: async (arg) => {
+      const pullRequest = parsePullCommand(arg, S.pullId);
+      if (pullRequest.error) return note(pullRequest.error, true);
+      if (await requestPull(pullRequest)) note(pullRequest.type === "ollama_pull" ? "checking Ollama endpoint for " + pullRequest.model + "…" : "cancelling Ollama pull…");
     } },
     { name: "docs", args: "[TOPIC]", group: "App", desc: "open the guides: " + Object.keys(topics).join(", "), run: (arg) => {
       const base = "https://github.com/athiwatc/formless/blob/main/";
@@ -9520,6 +9525,82 @@
     note("context: " + r.used_tokens + " of " + r.context_tokens + " tokens (" + pct + "%" + (r.measured ? "" : ", estimated") + ") on " + r.model + " · window " + source);
     note("≈ system prompt " + b.system_prompt + " · Tool schemas " + b.tool_schemas + " · history " + b.history + " tokens · " + b.attachments + " attachment(s)");
   }
+  function parsePullCommand(arg, activePullId) {
+    const parts = (arg || "").trim().split(/\s+/).filter(Boolean);
+    if (parts[0] === "cancel") {
+      const pull_id = parts[1] || activePullId;
+      if (parts.length > 2 || !pull_id) return { error: "usage: /pull cancel [PULL_ID]" };
+      return { type: "cancel_ollama_pull", pull_id };
+    }
+    const model = parts[0];
+    if (!model) return { error: "usage: /pull MODEL [--provider NAME]" };
+    let provider;
+    if (parts.length > 1) {
+      if (parts.length !== 3 || parts[1] !== "--provider") return { error: "usage: /pull MODEL [--provider NAME]" };
+      provider = parts[2];
+    }
+    return { type: "ollama_pull", model, provider };
+  }
+
+  function pullTracking() {
+    return S.pullTracking || (S.pullTracking = { generation: 0, order: 0, active: [], finished: [] });
+  }
+
+  function beginPullRequest() {
+    const tracking = pullTracking();
+    tracking.order += 1;
+    return { generation: tracking.generation, order: tracking.order };
+  }
+
+  function acknowledgePull(ticket, pullId) {
+    const tracking = pullTracking();
+    if (!ticket || ticket.generation !== tracking.generation || tracking.finished.includes(pullId)) return;
+    const existing = tracking.active.find(entry => entry.id === pullId);
+    if (existing) existing.order = Math.max(existing.order, ticket.order);
+    else tracking.active.push({ order: ticket.order, id: pullId });
+    tracking.active.sort((a, b) => a.order - b.order);
+    S.pullId = tracking.active.length ? tracking.active[tracking.active.length - 1].id : null;
+  }
+
+  function completePull(pullId) {
+    if (!pullId) return;
+    const tracking = pullTracking();
+    tracking.active = tracking.active.filter(entry => entry.id !== pullId);
+    if (!tracking.finished.includes(pullId)) {
+      tracking.finished.push(pullId);
+    }
+    S.pullId = tracking.active.length ? tracking.active[tracking.active.length - 1].id : null;
+  }
+
+  function clearPullTracking() {
+    const tracking = pullTracking();
+    tracking.generation += 1;
+    tracking.order = 0;
+    tracking.active = [];
+    tracking.finished = [];
+    tracking.warningNotices = [];
+    tracking.expectedSizeNotices = [];
+    S.pullId = null;
+    S.pullActivity = null;
+  }
+
+  function hasPullJobsFeature(response) {
+    return Array.isArray(response && response.features) && response.features.includes("ollama_pull_jobs_v1");
+  }
+
+  async function requestPull(pullRequest) {
+    const ticket = pullRequest.type === "ollama_pull" ? beginPullRequest() : null;
+    const ping = await act({ type: "ping" });
+    if (!ping) return null;
+    if (!hasPullJobsFeature(ping)) {
+      note("the running daemon does not support tracked Ollama pulls; restart it with this version", true);
+      return null;
+    }
+    const response = await act(pullRequest);
+    if (ticket && response && response.pull_id) acknowledgePull(ticket, response.pull_id);
+    return response;
+  }
+
   async function slash(cmd) {
     // `/mcp:SERVER:PROMPT [ARGS]`: send the rendered MCP prompt (SPEC §7.9).
     const mp = /^mcp:([^:\s]+):(\S+)\s*(.*)$/s.exec(cmd);
@@ -9933,7 +10014,44 @@
       renderLive();
     }
     if (kinds.has("invocation_activity")) refreshRunning();
-    if (kinds.has("model_pull_progress")) setActivity("download progress unavailable for " + (ev.model || "model") + "; /models checks installed models");
+    if (kinds.has("model_pull_progress")) note("download progress unavailable for " + (ev.model || "model") + "; /models checks installed models");
+  }
+
+  function handlePullProgress(ev) {
+    const tracking = pullTracking();
+    const pullKey = ev.pull_id || ev.model || "unknown";
+    const warningNotices = tracking.warningNotices || (tracking.warningNotices = []);
+    const expectedSizeNotices = tracking.expectedSizeNotices || (tracking.expectedSizeNotices = []);
+    const details = [];
+    if (ev.expected_size != null && !expectedSizeNotices.includes(pullKey)) {
+      expectedSizeNotices.push(pullKey);
+      details.push("expected size " + ev.expected_size + " bytes");
+    }
+    if (ev.warning && !warningNotices.includes(pullKey)) {
+      warningNotices.push(pullKey);
+      details.push(ev.warning);
+    }
+    if (details.length) note("Ollama pull " + (ev.model || "model") + ": " + details.join("; "));
+    if (ev.done) {
+      completePull(ev.pull_id);
+      if (S.pullActivity && S.pullActivity.pull_id === ev.pull_id) {
+        S.pullActivity = null;
+        renderStatus();
+      }
+      if (ev.error) {
+        if (ev.status === "incomplete") {
+          const provider = ev.provider && ev.provider !== "default" ? " --provider " + ev.provider : "";
+          const resume = "/pull " + (ev.requested_model || ev.model) + provider;
+          const error = ev.error.includes("partial download can resume with") ? ev.error : ev.error + "; rerun `" + resume + "` to resume";
+          note("pull incomplete: " + error, true);
+        } else note("could not pull " + ev.model + ": " + ev.error, true);
+      } else if (ev.status === "success") note("pulled " + ev.model + "; pick it with /model");
+    } else {
+      const progress = ev.total ? " · " + Math.floor((ev.completed || 0) * 100 / ev.total) + "%" : "";
+      const label = (ev.status || "pulling") + " " + (ev.model || "model") + progress;
+      S.pullActivity = { pull_id: ev.pull_id, label, since: Date.now() };
+      renderStatus();
+    }
   }
 
   function onEvent(ev) {
@@ -9993,8 +10111,7 @@
         if (here) { setActivity("provider stalled"); note("no data from the provider for " + ev.idle_secs + "s; /resend re-sends the request", true); }
         break;
       case "model_pull_progress":
-        if (ev.done) note(ev.error ? "could not pull " + ev.model + ": " + ev.error : "pulled " + ev.model + "; pick it with /model", !!ev.error);
-        else setActivity("pulling " + ev.model + ": " + ev.status + (ev.total ? " " + Math.floor((ev.completed || 0) * 100 / ev.total) + "%" : ""));
+        handlePullProgress(ev);
         return;
       case "comparison_ready":
         if (here) {
@@ -10724,6 +10841,7 @@
     return true;
   }
   function openRelay() {
+    clearPullTracking();
     S.local = false;
     if (S.ws || S.channel || S.relayLink || S.pending.size || S.daemonOnline) {
       resetRelayConnection(S.ws, "relay connection replaced", true);
@@ -10880,6 +10998,7 @@
   // Local mode (SPEC §12): `formless web` serves this page on 127.0.0.1
   // and the protocol runs over a same-origin WebSocket, no relay crypto.
   async function connectLocal(token) {
+    clearPullTracking();
     S.toolVersionDiff = null;
     if (S.relayLink) S.relayLink.endpoint.dispose();
     S.relayLink = null; S.relayReady = false;

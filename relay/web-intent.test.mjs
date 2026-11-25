@@ -7,6 +7,7 @@ import { webcrypto, createHash } from 'node:crypto';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 const source = readFileSync(new URL('./web/app.js', import.meta.url), 'utf8');
+const cssSource = readFileSync(new URL('./web/app.css', import.meta.url), 'utf8');
 test('web actions avoid native synchronous prompt and confirm calls', () => {
   assert.doesNotMatch(source.replace(/^\s*\/\/.*$/gm, ''), /\b(?:prompt|confirm)\s*\(/);
 });
@@ -46,7 +47,7 @@ function setup(names, extras = {}) {
     if (!elements.has(id)) elements.set(id, { value: '', style: {}, textContent: '', classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } }, attrs: {}, setAttribute(k,v) { this.attrs[k]=v; }, getAttribute(k) { return this.attrs[k] ?? null; }, removeAttribute(k) { delete this.attrs[k]; }, replaceChildren() {}, select() {}, focus() {} });
     return elements.get(id);
   };
-  const context = vm.createContext({ $, TextEncoder, tr: text => text, prefs, navigator: { locks: testLocks() }, queueMicrotask: callback => Promise.resolve().then(callback), mentionAttached: {}, S: { approvalHelpSeen: true, current: 'A', storageScope: 'test-room', chips: {}, attachmentInventories: {}, drafts: {}, outbox: [], outboxFlushing: false, outboxFlushRequested: false, submitting: new Set(), shareApplyPending: false, running: new Set(), liveRun: null, daemonOnline: true, channel: {}, local: true, messages: [], sessions: [], view: 'chat', tools: [] },
+  const context = vm.createContext({ $, TextEncoder, tr: text => text, prefs, navigator: { locks: testLocks() }, queueMicrotask: callback => Promise.resolve().then(callback), mentionAttached: {}, S: { approvalHelpSeen: true, current: 'A', storageScope: 'test-room', chips: {}, attachmentInventories: {}, drafts: {}, outbox: [], outboxFlushing: false, outboxFlushRequested: false, submitting: new Set(), shareApplyPending: false, running: new Set(), liveRun: null, daemonOnline: true, channel: {}, local: true, pullId: null, pullActivity: null, pullTracking: { generation: 0, order: 0, active: [], finished: [] }, messages: [], sessions: [], view: 'chat', tools: [] },
     forecastRevision: 0, scheduleForecast() {}, invalidateBranchSummary() {}, branchSummaryEvent() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {},
     // These tests isolate intent/data behavior; real focus/inert behavior runs
     // against the complete shipped UI in web-focus.browser-test.py.
@@ -78,6 +79,192 @@ function setup(names, extras = {}) {
   vm.runInContext([...new Set([...dependencies, ...implementations])].map(fn).join('\n'), context);
   return context;
 }
+test('pull commands preserve provider selection and resolve explicit or implicit cancellation', () => {
+  const c = setup(['parsePullCommand']);
+  const parsed = value => JSON.parse(JSON.stringify(value));
+  assert.deepEqual(parsed(c.parsePullCommand('llama3 --provider remote', null)), {
+    type: 'ollama_pull', model: 'llama3', provider: 'remote',
+  });
+  assert.deepEqual(parsed(c.parsePullCommand('cancel', 'pull-active')), {
+    type: 'cancel_ollama_pull', pull_id: 'pull-active',
+  });
+  assert.deepEqual(parsed(c.parsePullCommand('cancel pull-explicit', null)), {
+    type: 'cancel_ollama_pull', pull_id: 'pull-explicit',
+  });
+});
+test('pull requests check tracked-pull support before dispatch', async () => {
+  const requests = [], notices = [];
+  const parsed = value => JSON.parse(JSON.stringify(value));
+  const c = setup(['hasPullJobsFeature', 'requestPull', 'pullTracking', 'beginPullRequest', 'acknowledgePull'], {
+    act: async request => {
+      requests.push(request);
+      return request.type === 'ping' ? { features: [] } : { pull_id: 'pull-1' };
+    },
+    note: (text, error) => notices.push({ text, error }),
+  });
+  assert.equal(await c.requestPull({ type: 'ollama_pull', model: 'llama3', provider: 'remote' }), null);
+  assert.deepEqual(parsed(requests), [{ type: 'ping' }]);
+  assert.match(notices[0].text, /does not support tracked Ollama pulls/);
+
+  requests.length = 0;
+  c.act = async request => {
+    requests.push(request);
+    return request.type === 'ping' ? { features: ['ollama_pull_jobs_v1'] } : { pull_id: 'pull-1' };
+  };
+  assert.deepEqual(JSON.parse(JSON.stringify(await c.requestPull({ type: 'ollama_pull', model: 'llama3' }))), { pull_id: 'pull-1' });
+  assert.equal(c.S.pullId, 'pull-1');
+  assert.deepEqual(parsed(requests), [{ type: 'ping' }, { type: 'ollama_pull', model: 'llama3' }]);
+});
+
+test('terminal progress before pull response does not restore its cancel ID', async () => {
+  const pullResponse = deferred(), pullRequested = deferred();
+  const c = setup([
+    'hasPullJobsFeature', 'requestPull', 'pullTracking', 'beginPullRequest',
+    'acknowledgePull', 'handlePullProgress', 'completePull',
+  ], {
+    act: async request => {
+      if (request.type === 'ping') return { features: ['ollama_pull_jobs_v1'] };
+      pullRequested.resolve();
+      return pullResponse.promise;
+    },
+    note() {}, renderStatus() {},
+  });
+  const request = c.requestPull({ type: 'ollama_pull', model: 'A' });
+  await pullRequested.promise;
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'A', status: 'success', done: true, pull_id: 'pull-1' });
+  pullResponse.resolve({ pull_id: 'pull-1' });
+  await request;
+  assert.equal(c.S.pullId, null);
+});
+
+test('pull cancellation follows initiation order and resumes the requested alias', () => {
+  const notices = [];
+  const c = setup(['handlePullProgress', 'pullTracking', 'beginPullRequest', 'acknowledgePull', 'completePull'], {
+    note: (text, error) => notices.push({ text, error }),
+    renderStatus() {},
+  });
+  const earlier = c.beginPullRequest();
+  const latest = c.beginPullRequest();
+  c.acknowledgePull(latest, 'pull-latest');
+  c.acknowledgePull(earlier, 'pull-earlier');
+  assert.equal(c.S.pullId, 'pull-latest');
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'B', requested_model: 'A', status: 'pulling', done: false, pull_id: 'pull-earlier', completed: 1, total: 2, expected_size: 20, warning: 'advisory' });
+  assert.equal(c.S.pullActivity.label, 'pulling B · 50%');
+  assert.equal(c.S.activity, undefined);
+  assert.ok(notices.some(notice => /expected size 20 bytes; advisory/.test(notice.text)));
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'B', requested_model: 'A', status: 'incomplete', done: true, pull_id: 'pull-latest', provider: 'remote', error: 'stream ended' });
+  assert.equal(c.S.pullId, 'pull-earlier');
+  assert.match(notices.pop().text, /\/pull A --provider remote/);
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'B', requested_model: 'A', status: 'success', done: true, pull_id: 'pull-earlier', provider: 'remote' });
+  assert.equal(c.S.pullId, null);
+  assert.equal(c.S.pullActivity, null);
+  assert.equal(c.S.activity, undefined);
+});
+
+test('terminal progress and acknowledgement are idempotent in either order', () => {
+  const c = setup(['handlePullProgress', 'pullTracking', 'beginPullRequest', 'acknowledgePull', 'completePull'], {
+    note() {}, renderStatus() {},
+  });
+  const ackFirst = c.beginPullRequest();
+  c.acknowledgePull(ackFirst, 'pull-ack-first');
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'A', status: 'success', done: true, pull_id: 'pull-ack-first' });
+  assert.equal(c.S.pullId, null);
+
+  const eventFirst = c.beginPullRequest();
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'A', status: 'success', done: true, pull_id: 'pull-event-first' });
+  c.acknowledgePull(eventFirst, 'pull-event-first');
+  assert.equal(c.S.pullId, null);
+});
+
+test('new browser connection clears pull state and invalidates old acknowledgements', () => {
+  const c = setup(['handlePullProgress', 'pullTracking', 'beginPullRequest', 'acknowledgePull', 'completePull', 'clearPullTracking'], {
+    note() {}, renderStatus() {},
+  });
+  const oldRequest = c.beginPullRequest();
+  c.acknowledgePull(oldRequest, 'pull-old');
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'A', status: 'pulling', done: false, pull_id: 'pull-old' });
+  c.clearPullTracking();
+  c.acknowledgePull(oldRequest, 'pull-late');
+  assert.equal(c.S.pullId, null);
+  assert.equal(c.S.pullActivity, null);
+  assert.deepEqual(JSON.parse(JSON.stringify(c.S.pullTracking.active)), []);
+  assert.match(fn('clearLiveState'), /clearPullTracking\(\)/);
+  assert.match(fn('openRelay'), /clearPullTracking\(\)/);
+  assert.match(fn('connectLocal'), /clearPullTracking\(\)/);
+});
+test('pull status stays compact, details are noted once per pull, and matching terminal clears it', () => {
+  let running = false;
+  const notices = [];
+  const c = setup(['renderStatus', 'handlePullProgress', 'pullTracking', 'completePull'], {
+    document: { activeElement: null, createTextNode: () => ({ textContent: '' }) },
+    statusRender: { root: null, spinner: null, text: null },
+    h: () => ({ hidden: false }),
+    updateText: (node, value) => { node.textContent = value; },
+    isRunning: () => running,
+    activityText: activity => activity.label,
+    note: (text, err) => notices.push({ text, err }),
+    storedSessionModel: () => null,
+  });
+  c.S.pullId = 'pull-1';
+  Object.assign(c.S, {
+    activity: null,
+    approvals: [],
+    contextFill: {},
+    notes: [],
+    others: [],
+    pendingQuestion: null,
+    questionOpen: false,
+    sessions: [],
+    unread: 0,
+    usage: {},
+  });
+
+  c.handlePullProgress({
+    type: 'model_pull_progress', model: 'llama3', status: 'pulling', done: false,
+    pull_id: 'pull-1', completed: 1, total: 2, expected_size: 100, warning: 'low disk',
+  });
+  assert.equal(c.statusRender.text.textContent, 'pulling llama3 · 50%');
+  assert.equal(c.$('state').className, 'state pulling');
+  assert.equal(c.S.activity, null);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0].text, /expected size 100 bytes.*low disk/);
+  c.handlePullProgress({
+    type: 'model_pull_progress', model: 'llama3', status: 'pulling', done: false,
+    pull_id: 'pull-1', completed: 3, total: 4, expected_size: 100, warning: 'low disk',
+  });
+  assert.equal(c.statusRender.text.textContent, 'pulling llama3 · 75%');
+  assert.equal(notices.length, 1);
+  c.S.pullId = 'pull-2';
+  running = true;
+  const runActivity = { label: 'rate limited · retrying in 8s (2/5) · Esc to stop', since: 0 };
+  c.S.activity = runActivity;
+  c.renderStatus();
+  c.handlePullProgress({
+    type: 'model_pull_progress', model: 'another-model', status: 'pulling', done: false,
+    pull_id: 'pull-2', completed: 1, total: 4, expected_size: 200, warning: 'low disk',
+  });
+  assert.equal(c.statusRender.text.textContent, runActivity.label);
+  assert.equal(c.$('state').className, 'state busy');
+  assert.equal(c.S.activity.label, runActivity.label);
+  assert.equal(c.S.pullActivity.label, 'pulling another-model · 25%');
+  assert.equal(notices.length, 2);
+  c.handlePullProgress({
+    type: 'model_pull_progress', model: 'llama3', status: 'success', done: true,
+    pull_id: 'pull-2',
+  });
+  assert.equal(c.statusRender.text.textContent, runActivity.label);
+  assert.equal(c.$('state').className, 'state busy');
+  assert.equal(c.S.activity.label, runActivity.label);
+  assert.equal(c.S.pullActivity, null);
+  assert.match(cssSource, /\.state\.pulling \[data-status-activity\] \{[^}]*text-overflow: ellipsis;/s);
+  assert.doesNotMatch(cssSource, /\.state \[data-status-activity\] \{[^}]*text-overflow: ellipsis;/s);
+  assert.doesNotMatch(cssSource, /\.state\.busy \[data-status-activity\] \{[^}]*text-overflow: ellipsis;/s);
+  running = false;
+  c.S.activity = { label: 'stale unrelated activity', since: 0 };
+  c.renderStatus();
+  assert.equal(c.statusRender.text.textContent, '● ready');
+  assert.equal(c.$('state').className, 'state');
+});
 test('queued edits submit the revision opened by the editor', () => {
   const notices = [];
   let rendered, dialog, input;
@@ -1369,7 +1556,7 @@ test('parallel questions queue across Sessions; closing queued question preserve
 test('local and relay reconnect rebuild pending prompts/running and reject stale snapshot state', async () => {
   for (const transport of ['local', 'relay']) {
     let reply = deferred();
-    const c = setup(['openSession', 'onEvent', 'clearQuestions', 'clearLiveState', 'applySessionLiveState', 'addApproval', 'queueQuestion', 'removeQuestion'], {
+    const c = setup(['openSession', 'onEvent', 'clearQuestions', 'clearLiveState', 'pullTracking', 'clearPullTracking', 'applySessionLiveState', 'addApproval', 'queueQuestion', 'removeQuestion'], {
       act: () => reply.promise, request: async () => ({}), prefs: memoryPrefs(), rendered: new Map(),
       closeSidebar() {}, renderHistory() {}, renderRunTools() {}, renderStatus() {}, renderQueue() {}, renderPlan() {}, renderStep() {}, renderRunBanner() {}, renderAll() {},
       renderApproval() {}, renderComposer() {}, showQuestion() {}, cancelAsk() {}, notifyFor() {}, setActivity() {},
@@ -1409,7 +1596,7 @@ test('local and relay reconnect rebuild pending prompts/running and reject stale
 
 function liveSetup(extras = {}) {
   const wait = deferred();
-  const c = setup(['openSession', 'onEvent', 'clearQuestions', 'clearLiveState', 'applySessionLiveState', 'addApproval', 'queueQuestion', 'removeQuestion'], {
+  const c = setup(['openSession', 'onEvent', 'clearQuestions', 'clearLiveState', 'pullTracking', 'clearPullTracking', 'applySessionLiveState', 'addApproval', 'queueQuestion', 'removeQuestion'], {
     act: () => wait.promise, request: async () => ({}), prefs: memoryPrefs(), rendered: new Map(),
     closeSidebar() {}, renderHistory() {}, renderRunTools() {}, renderStatus() {}, renderQueue() {}, renderPlan() {}, renderStep() {}, renderRunBanner() {}, renderAll() {},
     renderApproval() {}, renderComposer() {}, showQuestion() {}, cancelAsk() {}, notifyFor() {}, setActivity() {},
@@ -1666,9 +1853,12 @@ test('dropped updates refresh durable usage and mark transient progress unavaila
   const replies = [], notes = [];
   let running = 0;
   const c = setup(['reconcileDropped'], {
-    S: { current: 'A', usage: { A: { steps: 1 } }, liveTools: [{ status: 'running', progress: { fraction: 0.9, label: 'stale' } }] },
+    S: {
+      current: 'A', activity: { label: 'active run', since: 0 }, pullActivity: null,
+      usage: { A: { steps: 1 } }, liveTools: [{ status: 'running', progress: { fraction: 0.9, label: 'stale' } }],
+    },
     note: s => notes.push(s), sessionName: id => id, renderStatus() {}, renderLive() {},
-    refreshRunning() { running++; }, setActivity(s) { notes.push(s); },
+    refreshRunning() { running++; },
     request(r) { const d = deferred(); replies.push({ r, d }); return d.promise; },
   });
   const gap = { session_id: 'A', run_id: 'run', kinds: ['run_usage', 'tool_progress', 'invocation_activity'] };
@@ -1690,6 +1880,8 @@ test('dropped updates refresh durable usage and mark transient progress unavaila
   c.reconcileDropped({ session_id: '', run_id: '', kinds: ['model_pull_progress'], model: 'model' });
   assert.ok(notes.some(n => /download progress unavailable for model/.test(n)));
   assert.ok(notes.some(n => /live text, reasoning or progress updates were skipped/.test(n)));
+  assert.equal(c.S.activity.label, 'active run');
+  assert.equal(c.S.pullActivity, null);
 });
 
 function forecastContext(names, extras = {}) {
@@ -2857,7 +3049,7 @@ function summaryQueue() {
 function summaryHarness() {
   const requests=summaryQueue(),dialogs=summaryQueue(),calls=[],prompts=new Map(),notes=[],events=[];
   const document={createTreeWalker(root){const items=[];function walk(n){if(!n||typeof n==='string')return;(n.children||[]).forEach((child,i)=>{if(typeof child==='string')items.push({get data(){return n.children[i];},set data(value){n.children[i]=value;}});else walk(child);});}walk(root);return{nextNode:()=>items.shift()||null};}};
-  const c=setup(['invalidateBranchSummary','branchSummaryStampMatches','branchSummaryCurrent','branchSummaryEvent','branchSummaryHash','branchSummaryPreviewMatches','branchSummaryReviewText','summariseBranchCommand','resolveSessionRef','showBidi','clearLiveState'],{crypto:webcrypto,TextEncoder,h:node,document,NodeFilter:{SHOW_TEXT:4},sessionSeq:0,clearQuestions(){},renderApproval(){},note:text=>notes.push(text),onEvent:ev=>events.push(ev),
+  const c=setup(['invalidateBranchSummary','branchSummaryStampMatches','branchSummaryCurrent','branchSummaryEvent','branchSummaryHash','branchSummaryPreviewMatches','branchSummaryReviewText','summariseBranchCommand','resolveSessionRef','showBidi','clearLiveState','pullTracking','clearPullTracking'],{crypto:webcrypto,TextEncoder,h:node,document,NodeFilter:{SHOW_TEXT:4},sessionSeq:0,clearQuestions(){},renderApproval(){},note:text=>notes.push(text),onEvent:ev=>events.push(ev),
     ask(opts){const d=deferred(),prompt={opts,...d};prompts.set(opts.tag,prompt);dialogs.push(prompt);return d.promise;},
     cancelAsk(tag){const prompt=prompts.get(tag);if(prompt){prompts.delete(tag);prompt.resolve(null);}},
     act(request){const d=deferred();calls.push(JSON.parse(JSON.stringify(request)));requests.push({request,...d});return d.promise;}});

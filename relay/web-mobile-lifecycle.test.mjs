@@ -142,6 +142,7 @@ test('a replacement relay reauthenticates after daemon_online', async () => {
   const S = {
     ws: { readyState: 1 }, local: false, daemonOnline: true, relayReady: true, channel: {}, room: 'room',
     approvals: [{ id: 'stale-approval' }], questions: [{ id: 'stale-question' }], pendingQuestion: { id: 'stale-question' },
+    pullId: 'old-pull', pullActivity: { pull_id: 'old-pull' },
     relayLink: { ws: null, endpoint: { dispose() { endpointDisposed = true; } } }, pending: new Map(),
   };
   S.relayLink.ws = S.ws;
@@ -149,6 +150,8 @@ test('a replacement relay reauthenticates after daemon_online', async () => {
     constructor(url) {
       assert.equal(S.approvals.length, 0, 'replacement clears stale approvals before opening');
       assert.equal(S.questions.length, 0, 'replacement clears stale questions before opening');
+      assert.equal(S.pullId, null, 'replacement clears stale pull tracking before opening');
+      assert.equal(S.pullActivity, null);
       this.url = url; this.readyState = 1; this.sent = []; sockets.push(this);
     }
     send(frame) { this.sent.push(JSON.parse(frame)); }
@@ -175,6 +178,8 @@ test('a replacement relay reauthenticates after daemon_online', async () => {
   vm.runInContext(fn('sendHello'), context);
   vm.runInContext(fn('startHandshake'), context);
   vm.runInContext(fn('resetRelayConnection'), context);
+  vm.runInContext(fn('pullTracking'), context);
+  vm.runInContext(fn('clearPullTracking'), context);
   vm.runInContext(fn('openRelay'), context);
   context.openRelay();
   assert.equal(endpointDisposed, true);

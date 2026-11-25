@@ -3,6 +3,7 @@
 //! are printed once, in order, and approvals and questions become plain
 //! prompts answered on the next line.
 
+use super::PullTracker;
 use crate::client::DaemonClient;
 use crate::text::escape_approval_controls;
 use anyhow::Result;
@@ -784,6 +785,55 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool, call_label: &str) -
             "Tool {}: {tool_name}{}.",
             if *ok { "finished" } else { "failed" }, call_label
         ),
+        Event::ModelPullProgress {
+            model,
+            requested_model,
+            status,
+            completed,
+            total,
+            done,
+            error,
+            pull_id,
+            provider,
+            expected_size,
+            warning,
+            ..
+        } => {
+            let progress = match (completed, total) {
+                (Some(completed), Some(total)) if *total > 0 => {
+                    format!(" {}% ({} / {} bytes)", completed * 100 / total, completed, total)
+                }
+                _ => String::new(),
+            };
+            let expected = expected_size
+                .map(|size| format!("; expected size {size} bytes"))
+                .unwrap_or_default();
+            let warning = warning
+                .as_ref()
+                .map(|warning| format!("; warning: {warning}"))
+                .unwrap_or_default();
+            if *done {
+                match (status.as_str(), error.as_deref()) {
+                    ("success", None) => format!("{}Pulled {model}; select it with /model.", end_stream(streaming)),
+                    ("incomplete", Some(error)) => {
+                        let provider = provider
+                            .as_deref()
+                            .filter(|name| *name != formless_core::config::DEFAULT_PROVIDER)
+                            .map(|name| format!(" --provider {name}"))
+                            .unwrap_or_default();
+                        format!("{}Pull for {model} is incomplete: {error}; rerun `formless pull {}{provider}` to resume.", end_stream(streaming), requested_model.as_deref().unwrap_or(model))
+                    }
+                    (_, Some(error)) => format!("{}Pull for {model} failed: {error}.", end_stream(streaming)),
+                    _ => format!("{}Pull for {model} ended in state {status}.", end_stream(streaming)),
+                }
+            } else {
+                let id = pull_id
+                    .as_ref()
+                    .map(|id| format!(" [{id}]"))
+                    .unwrap_or_default();
+                format!("{}Pull{id} {model}: {status}{progress}{expected}{warning}", end_stream(streaming))
+            }
+        }
         // A paused Run was already reported by RunPaused.
         Event::RunFinished { status, .. } if status == "paused" => return None,
         Event::RunFinished { status, .. } => {
@@ -902,6 +952,50 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool, call_label: &str) -
     })
 }
 
+fn plain_pull_request(
+    arguments: &str,
+    active_pull_id: Option<&str>,
+) -> std::result::Result<Request, String> {
+    let parts = arguments.split_whitespace().collect::<Vec<_>>();
+    if parts.first() == Some(&"cancel") {
+        let pull_id = parts.get(1).copied().or(active_pull_id);
+        if parts.len() > 2 || pull_id.is_none() {
+            return Err("usage: /pull cancel [PULL_ID]".into());
+        }
+        return Ok(Request::CancelOllamaPull {
+            pull_id: pull_id.unwrap().to_string(),
+        });
+    }
+    let Some(model) = parts.first() else {
+        return Err("usage: /pull MODEL [--provider NAME]".into());
+    };
+    let provider = match parts.as_slice() {
+        [_] => None,
+        [_, "--provider", provider] => Some((*provider).to_string()),
+        _ => return Err("usage: /pull MODEL [--provider NAME]".into()),
+    };
+    Ok(Request::OllamaPull {
+        model: (*model).to_string(),
+        provider,
+    })
+}
+
+fn plain_pull_jobs_supported(result: &serde_json::Value) -> bool {
+    result["features"].as_array().is_some_and(|features| {
+        features
+            .iter()
+            .any(|feature| feature.as_str() == Some(formless_protocol::OLLAMA_PULL_JOBS_FEATURE))
+    })
+}
+
+fn dispatch_plain_pull<T>(
+    arguments: &str,
+    active_pull_id: Option<&str>,
+    send: impl FnOnce(Request) -> T,
+) -> std::result::Result<T, String> {
+    plain_pull_request(arguments, active_pull_id).map(send)
+}
+
 /// A question as plain text: its number, text and numbered options.
 pub(crate) fn question_text(q: &Question, n: usize, total: usize) -> String {
     let mut s = String::from("Question");
@@ -1007,6 +1101,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
     let mut streaming = false;
     let mut running = false;
     let mut feedback = PlainFeedback::default();
+    let mut pulls = PullTracker::default();
     let mut template_diagnostics = VecDeque::new();
     let mut run_state = RunState::default();
     let mut snapshots = HashMap::new();
@@ -1078,6 +1173,16 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             }
             if !run_state.accept(&ev) {
                 continue;
+            }
+            if let Event::ModelPullProgress {
+                pull_id: Some(event_pull_id),
+                done,
+                ..
+            } = &ev
+            {
+                if *done {
+                    pulls.complete(event_pull_id);
+                }
             }
             for (kind, request) in gap_requests(&ev) {
                 if !gap_refreshes.values().any(|pending| *pending == kind) {
@@ -1247,8 +1352,50 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
         match text.as_str() {
             "" => {}
             "/quit" | "/exit" => break,
+            cmd if cmd == "/pull" || cmd.starts_with("/pull ") => {
+                let arguments = cmd.strip_prefix("/pull").unwrap_or_default();
+                let cancelling = arguments.split_whitespace().next() == Some("cancel");
+                let ticket = (!cancelling).then(|| pulls.begin());
+                let features =
+                    match wait_response(&rx, &sends, &backlog, client.send(Request::Ping)) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            say(&format!("Pull support check failed: {error}"));
+                            continue;
+                        }
+                    };
+                if !plain_pull_jobs_supported(&features) {
+                    say("The running daemon does not support tracked Ollama pulls; restart it with this version.");
+                    continue;
+                }
+                let request_id =
+                    match dispatch_plain_pull(arguments, pulls.current_id(), |request| {
+                        client.send(request)
+                    }) {
+                        Ok(request_id) => request_id,
+                        Err(error) => {
+                            say(&error);
+                            continue;
+                        }
+                    };
+                match wait_response(&rx, &sends, &backlog, request_id) {
+                    Ok(result) => {
+                        if let Some(started_pull_id) = result["pull_id"].as_str() {
+                            if let Some(ticket) = ticket {
+                                pulls.acknowledge(ticket, started_pull_id.to_string());
+                            }
+                        }
+                        say(if cancelling {
+                            "Ollama pull cancellation requested."
+                        } else {
+                            "Ollama pull registered; progress follows."
+                        });
+                    }
+                    Err(error) => say(&format!("Pull: {error}")),
+                }
+            }
             "/help" => {
-                say("Commands: /new starts a Session, /sessions lists them, /switch N opens one, /stop stops the Run, /files [RUN] shows tracked changes, /rewind [PATH] attempts safe restoration, /recap shows the recorded recap, /docs [topic] gives the guides' addresses; /docs --text [topic] reads bundled Markdown, /quit exits (Runs keep going in the daemon). Anything else is sent as a message; to send text that starts with /, begin it with //.");
+                say("Commands: /new starts a Session, /sessions lists them, /switch N opens one, /stop stops the Run, /pull MODEL [--provider NAME] starts or attaches to a pull, /pull cancel [PULL_ID] cancels one, /files [RUN] shows tracked changes, /rewind [PATH] attempts safe restoration, /recap shows the recorded recap, /docs [topic] gives the guides' addresses; /docs --text [topic] reads bundled Markdown, /quit exits (Runs keep going in the daemon). Anything else is sent as a message; to send text that starts with /, begin it with //.");
                 for line in crate::user_commands_ui::help_lines(&templates) {
                     say(&line);
                 }
@@ -1817,6 +1964,117 @@ mod tests {
             question_text(&q, 1, 2),
             "Question 1 of 2: Which db?\n  1. Postgres, relational\nType an option number or your own answer."
         );
+    }
+
+    #[test]
+    fn ollama_pull_progress_and_incomplete_completion_print_as_plain_text() {
+        let mut streaming = false;
+        let progress = Event::ModelPullProgress {
+            model: "llama3".into(),
+            requested_model: None,
+            status: "pulling".into(),
+            completed: Some(1),
+            total: Some(2),
+            done: false,
+            error: None,
+            pull_id: Some("pull-1".into()),
+            provider: Some("local".into()),
+            expected_size: Some(20),
+            warning: Some("low disk".into()),
+        };
+        let output = format_event(&progress, &mut streaming, "").unwrap();
+        assert!(
+            output.contains("Pull [pull-1] llama3: pulling 50%"),
+            "{output}"
+        );
+        assert!(output.contains("expected size 20 bytes"), "{output}");
+        assert!(output.contains("warning: low disk"), "{output}");
+        let incomplete = Event::ModelPullProgress {
+            model: "B".into(),
+            requested_model: Some("A".into()),
+            status: "incomplete".into(),
+            completed: None,
+            total: None,
+            done: true,
+            error: Some("pull ended before completing".into()),
+            pull_id: Some("pull-1".into()),
+            provider: Some("local".into()),
+            expected_size: None,
+            warning: None,
+        };
+        let output = format_event(&incomplete, &mut streaming, "").unwrap();
+        assert!(output.contains("is incomplete"), "{output}");
+        assert!(
+            output.contains("formless pull A --provider local"),
+            "{output}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pull_command_tests {
+    use super::*;
+
+    #[test]
+    fn plain_pull_commands_create_start_and_cancel_requests() {
+        assert!(matches!(
+            plain_pull_request("llama3 --provider remote", None),
+            Ok(Request::OllamaPull { model, provider: Some(provider) })
+                if model == "llama3" && provider == "remote"
+        ));
+        assert!(matches!(
+            plain_pull_request("cancel", Some("pull-active")),
+            Ok(Request::CancelOllamaPull { pull_id }) if pull_id == "pull-active"
+        ));
+        assert!(matches!(
+            plain_pull_request("cancel pull-explicit", None),
+            Ok(Request::CancelOllamaPull { pull_id }) if pull_id == "pull-explicit"
+        ));
+    }
+
+    #[test]
+    fn plain_pull_dispatch_sends_the_parsed_request() {
+        let mut sent = None;
+        let request_id = dispatch_plain_pull("llama3 --provider remote", None, |request| {
+            sent = Some(request);
+            42
+        })
+        .unwrap();
+        assert_eq!(request_id, 42);
+        assert!(matches!(
+            sent,
+            Some(Request::OllamaPull { model, provider: Some(provider) })
+                if model == "llama3" && provider == "remote"
+        ));
+    }
+
+    #[test]
+    fn interleaved_progress_does_not_retarget_plain_cancel_id() {
+        let mut pulls = PullTracker::default();
+        let earlier = pulls.begin();
+        let latest = pulls.begin();
+        pulls.acknowledge(latest, "pull-latest".into());
+        pulls.acknowledge(earlier, "pull-earlier".into());
+        assert!(matches!(
+            plain_pull_request("cancel", pulls.current_id()),
+            Ok(Request::CancelOllamaPull { pull_id }) if pull_id == "pull-latest"
+        ));
+        pulls.complete("pull-latest");
+        assert!(matches!(
+            plain_pull_request("cancel", pulls.current_id()),
+            Ok(Request::CancelOllamaPull { pull_id }) if pull_id == "pull-earlier"
+        ));
+    }
+
+    #[test]
+    fn plain_pull_feature_gate_rejects_daemons_without_tracked_pull_support() {
+        assert!(plain_pull_jobs_supported(&serde_json::json!({
+            "features": [formless_protocol::OLLAMA_PULL_JOBS_FEATURE]
+        })));
+        assert!(!plain_pull_jobs_supported(
+            &serde_json::json!({"features": []})
+        ));
+        assert!(!plain_pull_jobs_supported(&serde_json::Value::Null));
     }
 }
 

@@ -436,7 +436,7 @@ pub const COMMANDS: &[Command] = &[
         "why routing picked each model lately",
         Settings,
     ),
-    cmd("pull", "MODEL", "Ollama: download a model", Settings),
+    cmd("pull", "MODEL [--provider NAME] | cancel [PULL_ID]", "Ollama: download, attach to, or cancel a model pull", Settings),
     cmd(
         "mcp log",
         "NAME",

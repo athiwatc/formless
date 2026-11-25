@@ -1632,6 +1632,32 @@ impl Provider {
         &self.cfg
     }
 
+    pub(crate) async fn endpoint_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<&Value>,
+    ) -> Result<reqwest::Response> {
+        let mut auth = AuthRecovery::default();
+        let (response, _) = self
+            .send_authenticated(
+                |credential| {
+                    let request = apply_headers(
+                        self.http.request(method.clone(), url),
+                        &self.cfg,
+                        credential,
+                    );
+                    match body {
+                        Some(body) => request.json(body),
+                        None => request,
+                    }
+                },
+                &mut auth,
+            )
+            .await?;
+        Ok(response)
+    }
+
     /// A provider with a fixed key on a shared HTTP client (named
     /// providers, SPEC §4.5).
     pub fn with_key(cfg: ProviderCfg, api_key: String, http: reqwest::Client) -> Self {
