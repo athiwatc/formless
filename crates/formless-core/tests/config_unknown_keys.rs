@@ -95,19 +95,37 @@ commnad = "typo"
 }
 
 #[test]
-fn quotes_dynamic_map_key_segments_in_paths_and_suggestions() {
-    let text = r#"
-[provider.prices."gpt-4.1"]
+fn quotes_dynamic_map_key_segments_with_single_line_toml_escaping() {
+    let cases = [
+        (
+            r#"
+[provider.prices."gpt-4.1 \"double\" 'single'\\path\nline"]
 inpt = 1.0
-"#;
+"#,
+            r#"provider.prices."gpt-4.1 \"double\" 'single'\\path\nline".inpt"#,
+            r#"provider.prices."gpt-4.1 \"double\" 'single'\\path\nline".input"#,
+        ),
+        (
+            r#"
+[provider.prices."gpt-\u0001-4.1"]
+inpt = 1.0
+"#,
+            r#"provider.prices."gpt-\u0001-4.1".inpt"#,
+            r#"provider.prices."gpt-\u0001-4.1".input"#,
+        ),
+    ];
 
-    assert_eq!(
-        unknown_keys_from_text(text).unwrap(),
-        vec![UnknownConfigKey {
-            key: "provider.prices.\"gpt-4.1\".inpt".into(),
-            suggestion: Some("provider.prices.\"gpt-4.1\".input".into()),
-        }]
-    );
+    for (text, expected_key, expected_suggestion) in cases {
+        let unknown = unknown_keys_from_text(text).unwrap();
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].key, expected_key);
+        assert_eq!(unknown[0].suggestion.as_deref(), Some(expected_suggestion));
+
+        for path in [unknown[0].key.as_str(), expected_suggestion] {
+            toml::from_str::<toml::Value>(&format!("{path} = 1.0\n"))
+                .unwrap_or_else(|error| panic!("diagnostic path did not parse: {path:?}: {error}"));
+        }
+    }
 }
 
 #[test]

@@ -446,13 +446,40 @@ fn config_key_path(prefix: &str, segment: &str) -> String {
     {
         segment.to_string()
     } else {
-        toml::Value::String(segment.to_string()).to_string()
+        toml_basic_string_key(segment)
     };
     if prefix.is_empty() {
         segment
     } else {
         format!("{prefix}.{segment}")
     }
+}
+
+fn toml_basic_string_key(segment: &str) -> String {
+    let mut key = String::with_capacity(segment.len() + 2);
+    key.push('"');
+    for character in segment.chars() {
+        match character {
+            '"' => key.push_str("\\\""),
+            '\\' => key.push_str("\\\\"),
+            '\u{8}' => key.push_str("\\b"),
+            '\t' => key.push_str("\\t"),
+            '\n' => key.push_str("\\n"),
+            '\u{c}' => key.push_str("\\f"),
+            '\r' => key.push_str("\\r"),
+            character
+                if matches!(
+                    character as u32,
+                    0x0000..=0x0008 | 0x000B..=0x001F | 0x007F..=0x009F
+                ) =>
+            {
+                key.push_str(&format!("\\u{:04X}", character as u32));
+            }
+            character => key.push(character),
+        }
+    }
+    key.push('"');
+    key
 }
 
 fn nearest_config_key(key: &str, fields: &toml::map::Map<String, toml::Value>) -> Option<String> {
