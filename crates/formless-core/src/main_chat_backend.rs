@@ -13,6 +13,87 @@ const UNSUPPORTED_RUN: &str =
     "Main Chat harnesses support new text messages only; send a new message or select a provider";
 const TRANSCRIPT_BYTES: usize = 64 * 1024;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn main_harness_prompts_close_on_drop_and_answered_clarifications_enter_context() {
+        let root = std::env::temp_dir().join(format!("fl-main-prompts-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+        let daemon = Arc::new(Daemon::new(paths).unwrap());
+        let session_id = daemon.with_store(Store::main_chat).unwrap().id;
+        let handler = MainInteraction {
+            daemon: daemon.clone(),
+            session_id: session_id.clone(),
+            harness: MainChatHarness {
+                kind: HarnessKind::Muse,
+                agent: None,
+                executable: PathBuf::new(),
+                argv0: None,
+            },
+        };
+        let cancel = CancellationToken::new();
+        let mut permission = handler.request_permission(
+            HarnessPermissionRequest {
+                title: "Trust this workspace?".into(),
+                kind: "trust".into(),
+                raw_input: None,
+                options: vec![formless_protocol::HarnessPermissionOption {
+                    option_id: "allow".into(),
+                    name: "Allow once".into(),
+                    kind: formless_protocol::HarnessPermissionOptionKind::AllowOnce,
+                }],
+            },
+            &cancel,
+        );
+        assert!(futures_util::poll!(&mut permission).is_pending());
+        assert_eq!(daemon.harness_permissions.locked().len(), 1);
+        drop(permission);
+        assert!(daemon.harness_permissions.locked().is_empty());
+        assert!(daemon.pending_attention.locked().is_empty());
+
+        let question = Question {
+            question: "Which city?".into(),
+            header: None,
+            options: vec![],
+            multi_select: false,
+        };
+        let mut abandoned = handler.ask_question(vec![question.clone()], &cancel);
+        assert!(futures_util::poll!(&mut abandoned).is_pending());
+        assert_eq!(daemon.questions.locked().len(), 1);
+        drop(abandoned);
+        assert!(daemon.questions.locked().is_empty());
+        assert!(daemon.pending_attention.locked().is_empty());
+
+        let mut answered = handler.ask_question(vec![question], &cancel);
+        assert!(futures_util::poll!(&mut answered).is_pending());
+        let question_id = daemon.questions.locked().keys().next().unwrap().clone();
+        let reply = daemon
+            .handle(Request::AnswerQuestion {
+                question_id,
+                answer: "Bangkok".into(),
+                answers: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({"answered": true}));
+        assert_eq!(answered.await.unwrap()[0].text.as_deref(), Some("Bangkok"));
+        assert_eq!(
+            daemon
+                .with_reader(|st| st.main_harness_turns(&session_id, TRANSCRIPT_BYTES))
+                .unwrap(),
+            [
+                ("assistant".into(), "Which city?".into()),
+                ("user".into(), "Bangkok".into())
+            ],
+        );
+        drop(handler);
+        drop(daemon);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct MainChatHarness {
     kind: HarnessKind,
