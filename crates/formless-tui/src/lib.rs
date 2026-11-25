@@ -556,7 +556,7 @@ struct ModelOverlay {
     picker: picker::ModelPicker,
     /// `ListModels` metadata per id (efforts, context, prices).
     meta: serde_json::Value,
-    effort_idx: usize,
+    selected_effort: Option<String>,
     /// Opened from Settings: Enter sets the global default.
     default_only: bool,
 }
@@ -564,38 +564,50 @@ struct ModelOverlay {
 impl ModelOverlay {
     /// The efforts the highlighted model accepts (SPEC §4.2): its listed
     /// ones, none when effort has no effect, else all of them.
-    fn efforts(&self) -> Vec<Option<&'static str>> {
+    fn efforts(&self) -> Vec<Option<String>> {
         let id = self.picker.choice().unwrap_or_default();
         let listed = &self.meta[&id]["efforts"];
         match listed.as_array() {
             Some(a) if a.is_empty() => vec![None],
-            Some(a) => {
-                let names: Vec<&str> = a.iter().filter_map(|v| v.as_str()).collect();
-                std::iter::once(None)
-                    .chain(
-                        ALL_EFFORTS
-                            .iter()
-                            .copied()
-                            .filter(|e| names.contains(e))
-                            .map(Some),
-                    )
-                    .collect()
-            }
-            None => EFFORTS.to_vec(),
+            Some(a) => std::iter::once(None)
+                .chain(
+                    a.iter()
+                        .filter_map(|value| value.as_str())
+                        .filter(|effort| !effort.is_empty())
+                        .map(|effort| Some(effort.to_string())),
+                )
+                .collect(),
+            None => EFFORTS
+                .iter()
+                .map(|effort| effort.map(str::to_string))
+                .collect(),
         }
     }
 
     /// The chosen effort, if the highlighted model accepts it.
-    fn effort(&self) -> Option<&'static str> {
+    fn effort(&self) -> Option<String> {
         let all = self.efforts();
-        all.get(self.effort_idx % all.len().max(1))
-            .copied()
-            .flatten()
+        let idx = all
+            .iter()
+            .position(|effort| effort == &self.selected_effort)
+            .unwrap_or(0);
+        all[idx].clone()
+    }
+
+    fn cycle_effort(&mut self, backwards: bool) {
+        let all = self.efforts();
+        let current = all
+            .iter()
+            .position(|effort| effort == &self.selected_effort)
+            .unwrap_or(0);
+        let next = if backwards {
+            (current + all.len() - 1) % all.len()
+        } else {
+            (current + 1) % all.len()
+        };
+        self.selected_effort = all[next].clone();
     }
 }
-
-/// Every effort level a model may accept, lowest first.
-const ALL_EFFORTS: [&str; 4] = ["minimal", "low", "medium", "high"];
 
 /// A Session's unsent input and attachments.
 #[derive(Default)]
@@ -1928,6 +1940,7 @@ struct App {
     /// (key, text), the key being saved and the last error by key.
     settings_sel: usize,
     settings_edit: Option<(String, input::InputLine)>,
+    settings_download_armed: bool,
     settings_saving: Option<String>,
     settings_error: Option<(String, String)>,
     settings_form: Option<settings::Form>,
@@ -2293,6 +2306,7 @@ impl App {
             palette_hidden: None,
             settings_sel: 0,
             settings_edit: None,
+            settings_download_armed: false,
             settings_saving: None,
             settings_error: None,
             settings_form: None,
@@ -3767,8 +3781,8 @@ impl App {
                             }
                         }
                         Pending::ListTools => {
-                            if let Ok(v) = serde_json::from_value::<Vec<ToolInfo>>(result) {
-                                self.tools = v;
+                            if let Ok(v) = serde_json::from_value::<Vec<ToolSummary>>(result) {
+                                self.tools = v.into_iter().map(ToolInfo::from).collect();
                             }
                         }
                         Pending::RunToolInput => {
@@ -7557,8 +7571,8 @@ impl App {
         }
     }
 
-    /// Whether the current model takes images (`provider.vision`, else a
-    /// guess from its name).
+    /// Whether the current model takes images (per-model setting, provider
+    /// default, else a guess from its name).
     fn vision_model(&self) -> bool {
         let Ok(cfg) = Config::load(&self.paths) else {
             return true;
@@ -7568,10 +7582,8 @@ impl App {
             .as_ref()
             .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
             .and_then(|s| s.model.clone())
-            .unwrap_or(cfg.provider.model);
-        cfg.provider
-            .vision
-            .unwrap_or_else(|| formless_core::provider::is_vision_model(&model))
+            .unwrap_or_else(|| cfg.provider.model.clone());
+        formless_core::provider::model_sends_images(&cfg.provider, &model)
     }
 
     /// `/compact [focus]`: summarise the Session now (SPEC §11).
@@ -7935,6 +7947,7 @@ impl App {
 
     /// Switch view and fetch what it shows.
     fn open_view(&mut self, view: View) {
+        self.settings_download_armed = false;
         self.search_serial = self.search_serial.wrapping_add(1);
         if view != View::Chat {
             self.cancel_rename();
@@ -9025,14 +9038,10 @@ impl App {
                 .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
                 .and_then(|s| s.reasoning_effort.clone())
         };
-        let effort_idx = EFFORTS
-            .iter()
-            .position(|e| e.map(str::to_string) == effort)
-            .unwrap_or(0);
         self.model_overlay = Some(ModelOverlay {
             picker: picker::ModelPicker::loading(),
             meta: serde_json::Value::Null,
-            effort_idx,
+            selected_effort: effort,
             default_only: self.view == View::Settings,
         });
         self.request(Pending::ListModels, Request::ListModels);
@@ -9067,7 +9076,7 @@ impl App {
             let Some(model) = o.picker.choice() else {
                 return;
             };
-            let effort = o.effort().map(str::to_string);
+            let effort = o.effort();
             self.model_overlay = None;
             if global {
                 // Settings go through the daemon (principle 6).
@@ -9090,11 +9099,8 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => self.model_overlay = None,
-            KeyCode::Tab => o.effort_idx = (o.effort_idx + 1) % o.efforts().len().max(1),
-            KeyCode::BackTab => {
-                let n = o.efforts().len().max(1);
-                o.effort_idx = (o.effort_idx % n + n - 1) % n;
-            }
+            KeyCode::Tab => o.cycle_effort(false),
+            KeyCode::BackTab => o.cycle_effort(true),
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(model) = o.picker.choice() {
                     self.notes.push(format!("testing {model}…"));
@@ -9939,6 +9945,17 @@ impl App {
             }
             if let Some(editor) = &mut self.editor {
                 editor.vim.cancel_pending_argument();
+            }
+        }
+        if self.view == View::Settings && self.settings_download_armed {
+            if key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::SHIFT)
+            {
+                self.settings_download_armed = false;
+            } else {
+                self.settings_key(key);
+                return;
             }
         }
         if self.topic.has_permission()
@@ -11416,6 +11433,29 @@ impl App {
 
     /// Settings view keys (SPEC §10.4).
     fn settings_key(&mut self, key: KeyEvent) {
+        if self.settings_download_armed {
+            self.settings_download_armed = false;
+            if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
+                let rows = self.settings_rows();
+                let selected = self.settings_sel.min(rows.len().saturating_sub(1));
+                if let Some(row) = rows.get(selected) {
+                    if row.key == "naming.auto_download" && row.value != "on" {
+                        let model_supported = rows.iter().any(|candidate| {
+                            candidate.key == "naming.model_size" && candidate.value != "—"
+                        });
+                        if model_supported {
+                            self.save_setting(&row.key, serde_json::json!(true));
+                        } else {
+                            self.notes.push(
+                                "No supported session-naming model is configured; automatic model downloads are unavailable."
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+        }
         if let Some(form) = &mut self.settings_form {
             if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) && key.modifiers.is_empty() {
                 form.viewport.get_mut().page(key.code == KeyCode::PageDown);
@@ -11543,7 +11583,23 @@ impl App {
                     }
                 }
                 settings::Kind::Bool => {
-                    self.save_setting(&row.key, serde_json::json!(row.value != "on"))
+                    if row.key == "naming.auto_download" && row.value != "on" {
+                        let model_supported = rows.iter().any(|candidate| {
+                            candidate.key == "naming.model_size" && candidate.value != "—"
+                        });
+                        if !model_supported {
+                            self.settings_download_armed = false;
+                            self.notes.push(
+                                "No supported session-naming model is configured; automatic model downloads are unavailable."
+                                    .into(),
+                            );
+                            return;
+                        }
+                        self.settings_download_armed = true;
+                    } else {
+                        self.settings_download_armed = false;
+                        self.save_setting(&row.key, serde_json::json!(row.value != "on"));
+                    }
                 }
                 settings::Kind::Choice(choices) => {
                     self.save_setting(&row.key, settings::next_choice(choices, &row.value))
@@ -13314,7 +13370,7 @@ fn draw_model_overlay(f: &mut Frame, o: &ModelOverlay, color: bool) {
     } else {
         Line::from(vec![
             Span::styled("Effort   ", ui::dim(color)),
-            Span::raw(o.effort().unwrap_or("default (provider)")),
+            Span::raw(o.effort().unwrap_or_else(|| "default (provider)".into())),
             Span::styled("  (Tab to change)", ui::dim(color)),
         ])
     };
@@ -17925,8 +17981,11 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(vec![Span::styled(label, label_style), value]));
         if selected {
             let width = area.width.saturating_sub(6) as usize;
+            let confirmation = (row.key == "naming.auto_download" && app.settings_download_armed)
+                .then(|| "Type y to allow; Enter/Space cannot confirm.".to_string());
             for text in std::iter::once(format!("{} · ? full description", row.hint()))
                 .chain(row.help.clone())
+                .chain(confirmation)
             {
                 for line in wrap_rows(&text, width) {
                     lines.push(Line::styled(format!("    {line}"), ui::dim(app.color)));
@@ -18373,44 +18432,6 @@ fn tool_cells(t: &ToolInfo, color: bool) -> Vec<Cell<'static>> {
             .right_aligned(),
         ),
     ]
-}
-
-/// Success trend: the last 20 finished calls against the 20 before, when
-/// both have at least 5 (↑/↓ for a 10-point change or more).
-fn tool_trend(recent: &str) -> Option<char> {
-    let outcomes: Vec<bool> = recent.chars().map(|c| c == 's').collect();
-    let split = outcomes.len().saturating_sub(20);
-    let (before, now) = outcomes.split_at(split);
-    if before.len() < 5 || now.len() < 5 {
-        return None;
-    }
-    let rate = |w: &[bool]| w.iter().filter(|s| **s).count() as f64 / w.len() as f64;
-    match rate(now) - rate(before) {
-        d if d >= 0.1 => Some('↑'),
-        d if d <= -0.1 => Some('↓'),
-        _ => None,
-    }
-}
-
-/// The last 20 finished calls, one bar each (tall green success, short
-/// red failure), then the trend arrow.
-fn tool_spark(t: &ToolInfo, color: bool) -> Line<'static> {
-    let skip = t.recent.chars().count().saturating_sub(20);
-    let mut spans: Vec<Span> = t
-        .recent
-        .chars()
-        .skip(skip)
-        .map(|c| match c {
-            's' => Span::styled("▆", fg(color, Color::Green)),
-            _ => Span::styled("▂", bold_fg(color, Color::Red)),
-        })
-        .collect();
-    match tool_trend(&t.recent) {
-        Some('↑') => spans.push(Span::styled(" ↑", bold_fg(color, Color::Green))),
-        Some(_) => spans.push(Span::styled(" ↓", bold_fg(color, Color::Red))),
-        None => {}
-    }
-    Line::from(spans)
 }
 
 fn table_header(cols: &[&'static str], color: bool) -> Row<'static> {
@@ -19362,7 +19383,6 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
                 let t = &app.tools[visible[*p]];
                 {
                     let mut cells = tool_cells(t, app.color);
-                    cells.push(Cell::from(tool_spark(t, app.color)));
                     cells.push(Cell::from(tool_status(t, app.color)));
                     cells.push(Cell::from(Span::styled(
                         if t.capabilities.is_empty() {
@@ -19384,21 +19404,12 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
                     Constraint::Length(5),
                     Constraint::Length(7),
                     Constraint::Length(ui::rate_width(app.color)),
-                    Constraint::Length(22),
                     Constraint::Length(if theme::redundant(app.color) { 16 } else { 9 }),
                     Constraint::Min(10),
                 ],
             )
             .header(table_header(
-                &[
-                    "TOOL",
-                    "VER",
-                    "CALLS",
-                    "SUCCESS",
-                    "LAST 20 (▆ok ▂fail)",
-                    "STATUS",
-                    "CAPABILITIES",
-                ],
+                &["TOOL", "VER", "CALLS", "SUCCESS", "STATUS", "CAPABILITIES"],
                 app.color,
             ))
             .column_spacing(2)
@@ -20635,6 +20646,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
     if Config::load(&paths).is_ok_and(|c| c.tui.screen_reader) {
         return plain::run(paths);
     }
+    let _ = Config::persist_naming_download_migration(&paths);
     let mut app = App::new(paths)?;
     if let Some(s) = start {
         app.on_start = s.to_string();
@@ -20976,6 +20988,7 @@ mod tests {
             palette_hidden: None,
             settings_sel: 0,
             settings_edit: None,
+            settings_download_armed: false,
             settings_saving: None,
             settings_error: None,
             settings_form: None,
@@ -25567,6 +25580,164 @@ mod tests {
     }
 
     #[test]
+    fn naming_auto_download_requires_tui_confirmation() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.open_view(View::Settings);
+        let row = app
+            .settings_rows()
+            .iter()
+            .position(|row| row.key == "naming.auto_download")
+            .unwrap();
+        app.settings_sel = row;
+        assert_eq!(app.settings_rows()[row].value, "off");
+
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_download_armed);
+        assert!(app.settings_saving.is_none());
+        let screen = render(&mut app, 80, 24);
+        assert!(screen.contains("409 MiB"), "{screen}");
+        assert!(screen.contains("heuristic"), "{screen}");
+        assert!(screen.contains("Type y to allow"), "{screen}");
+
+        for code in [KeyCode::Enter, KeyCode::Char(' ')] {
+            app.key(key(code));
+            assert!(app.settings_download_armed);
+            assert!(app.settings_saving.is_none());
+        }
+
+        app.key(key(KeyCode::Esc));
+        assert!(!app.settings_download_armed);
+        assert!(app.settings_saving.is_none());
+        assert_eq!(
+            app.settings_rows()
+                .iter()
+                .find(|row| row.key == "naming.auto_download")
+                .unwrap()
+                .value,
+            "off"
+        );
+
+        app.open_view(View::Settings);
+        assert_eq!(app.view, View::Settings);
+        assert!(!app.settings_download_armed);
+        let row = app
+            .settings_rows()
+            .iter()
+            .position(|row| row.key == "naming.auto_download")
+            .unwrap();
+        app.settings_sel = row;
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_download_armed);
+        app.open_view(View::Chat);
+        assert_eq!(app.view, View::Chat);
+        assert!(!app.settings_download_armed);
+        app.open_view(View::Settings);
+        assert_eq!(app.view, View::Settings);
+        assert!(!app.settings_download_armed);
+        app.settings_sel = row;
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_download_armed);
+        app.key(key(KeyCode::Char('y')));
+        assert_eq!(app.settings_saving.as_deref(), Some("naming.auto_download"));
+        assert!(!app.settings_download_armed);
+    }
+
+    #[test]
+    fn naming_auto_download_confirmation_precedes_pending_approval_decision() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.open_view(View::Settings);
+        let row = app
+            .settings_rows()
+            .iter()
+            .position(|row| row.key == "naming.auto_download")
+            .unwrap();
+        app.settings_sel = row;
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_download_armed);
+
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.on_event(Event::ApprovalRequested {
+            context: None,
+            approval_id: "pending-approval".into(),
+            session_id: "s1".into(),
+            tool_name: "create_tool".into(),
+            version: 1,
+            capabilities: Vec::new(),
+            memory_mb: 256,
+            detail: None,
+            already_allowed: Vec::new(),
+            code_preview: None,
+            tool_id: Some("tool-1".into()),
+            batch: None,
+            path_options: Vec::new(),
+        });
+        assert_eq!(app.view, View::Settings);
+        assert!(app.settings_download_armed);
+        assert_eq!(app.approvals.len(), 1);
+
+        app.key(key(KeyCode::Char('y')));
+
+        assert_eq!(app.settings_saving.as_deref(), Some("naming.auto_download"));
+        assert!(!app.settings_download_armed);
+        assert_eq!(
+            app.approvals.front().unwrap().approval_id,
+            "pending-approval"
+        );
+        let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            request.request,
+            Request::SetSetting { key, value }
+                if key == "naming.auto_download" && value == serde_json::json!(true)
+        ));
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn naming_auto_download_cannot_be_enabled_without_a_supported_model() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        let mut cfg = Config::default();
+        cfg.naming.model = "not-in-catalog".into();
+        cfg.save(&app.paths).unwrap();
+        app.open_view(View::Settings);
+
+        let rows = app.settings_rows();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.key == "naming.model_size")
+                .unwrap()
+                .value,
+            "—"
+        );
+        let row = rows
+            .iter()
+            .position(|row| row.key == "naming.auto_download")
+            .unwrap();
+        app.settings_sel = row;
+        app.key(key(KeyCode::Enter));
+
+        assert!(!app.settings_download_armed);
+        assert!(app.settings_saving.is_none());
+        assert!(app
+            .notes
+            .iter()
+            .any(|note| note.contains("downloads are unavailable")));
+        app.key(key(KeyCode::Char('y')));
+        assert!(app.settings_saving.is_none());
+        assert_eq!(
+            app.settings_rows()
+                .iter()
+                .find(|row| row.key == "naming.auto_download")
+                .unwrap()
+                .value,
+            "off"
+        );
+    }
+
+    #[test]
     fn question_panel_answers_with_arrow_keys_and_goes_back() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let opt = |l: &str, d: Option<&str>| QuestionOption {
@@ -26171,6 +26342,57 @@ mod tests {
                     .iter()
                     .any(|note| note.contains("may not read images")),
                 !vision
+            );
+        }
+        for (model, resolved, per_model_vision, provider_vision, warns) in [
+            ("o3-alias", "o3-mini", true, Some(false), false),
+            ("gpt-5", "gpt-5", false, Some(true), true),
+        ] {
+            let mut cfg = Config::default();
+            cfg.provider.model = model.into();
+            cfg.provider.vision = provider_vision;
+            cfg.provider.model_meta.insert(
+                resolved.into(),
+                formless_core::config::ModelMetaCfg {
+                    vision: Some(per_model_vision),
+                    ..Default::default()
+                },
+            );
+            if model == "o3-alias" {
+                cfg.provider.aliases.insert(model.into(), resolved.into());
+            }
+            cfg.save(&app.paths).unwrap();
+            app.notes.clear();
+            app.add_attachment("fixture.png".into(), vec![1]);
+            assert_eq!(
+                app.notes
+                    .iter()
+                    .any(|note| note.contains("may not read images")),
+                warns,
+                "per-model vision override for {model}"
+            );
+        }
+        for (api_style, warns) in [("chat", true), ("anthropic", false)] {
+            let mut cfg = Config::default();
+            cfg.provider.model = "gpt-5".into();
+            cfg.provider.vision = Some(true);
+            cfg.provider.tool_mode = "prompt".into();
+            cfg.provider.api_style = api_style.into();
+            cfg.save(&app.paths).unwrap();
+            app.notes.clear();
+            app.attachments.clear();
+            app.add_attachment("fixture.png".into(), vec![1]);
+            assert_eq!(
+                formless_core::provider::model_sends_images(&cfg.provider, "gpt-5"),
+                !warns,
+                "provider image gate for {api_style} prompt tools"
+            );
+            assert_eq!(
+                app.notes
+                    .iter()
+                    .any(|note| note.contains("may not read images")),
+                warns,
+                "TUI attachment warning for {api_style} prompt tools"
             );
         }
     }
@@ -27200,7 +27422,7 @@ mod tests {
         app.model_overlay = Some(ModelOverlay {
             picker: picker::ModelPicker::new(Vec::new()),
             meta: serde_json::Value::Null,
-            effort_idx: 0,
+            selected_effort: None,
             default_only: false,
         });
         app.paste("literal\nmodel");
@@ -27241,7 +27463,7 @@ mod tests {
         app.model_overlay = Some(ModelOverlay {
             picker: picker::ModelPicker::new(Vec::new()),
             meta: serde_json::Value::Null,
-            effort_idx: 0,
+            selected_effort: None,
             default_only: false,
         });
         app.on_event(reconnect_approval("fixture", "s1"));
@@ -31206,12 +31428,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_show_recent_calls_and_their_trend() {
-        // 20 good, then 20 mostly failing: trending down.
-        let falling = format!("{}{}", "s".repeat(20), "sfff".repeat(5));
-        assert_eq!(tool_trend(&falling), Some('↓'));
-        assert_eq!(tool_trend(&"s".repeat(40)), None);
-        assert_eq!(tool_trend("ffffff"), None, "no earlier window");
+    fn tools_list_omits_recent_outcome_metrics() {
         let mut app = test_app();
         app.tools = vec![ToolInfo {
             id: "t".into(),
@@ -31231,14 +31448,14 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             last_used_at: None,
-            recent: falling,
+            recent: "s".repeat(40),
             author: "agent".into(),
         }];
         app.view = View::Tools;
         let screen = render(&mut app, 140, 20);
-        assert!(screen.contains("LAST 20"), "{screen}");
-        assert!(screen.contains("▆▂▂▂▆▂▂▂"), "{screen}");
-        assert!(screen.contains("↓"), "{screen}");
+        assert!(screen.contains("SUCCESS"), "{screen}");
+        assert!(!screen.contains("LAST 20"), "{screen}");
+        assert!(!screen.contains("▆"), "{screen}");
     }
 
     #[test]
@@ -32485,7 +32702,7 @@ mod tests {
         let overlay = ModelOverlay {
             picker,
             meta: serde_json::json!({}),
-            effort_idx: 0,
+            selected_effort: None,
             default_only: false,
         };
         let render_overlay = |width, height| {
@@ -32568,13 +32785,66 @@ mod tests {
             o.picker.choice().as_deref(),
             Some("anthropic/claude-sonnet-4")
         );
-        assert_eq!(EFFORTS[o.effort_idx], Some("low"));
+        assert_eq!(o.selected_effort.as_deref(), Some("low"));
         for (w, h) in [(1, 1), (12, 4), (80, 24)] {
             render(&mut app, w, h);
         }
         assert!(render(&mut app, 80, 24).contains("Effort"));
         app.key(key(KeyCode::Esc));
         assert!(app.model_overlay.is_none());
+    }
+
+    #[test]
+    fn model_overlay_keeps_custom_effort_options() {
+        let mut picker = picker::ModelPicker::loading();
+        picker.set_items(
+            vec![picker::ModelItem {
+                id: "custom-model".into(),
+                source: None,
+                recent: false,
+                detail: None,
+            }],
+            "custom-model",
+        );
+        let overlay = ModelOverlay {
+            picker,
+            meta: serde_json::json!({"custom-model":{"efforts":["ultra"]}}),
+            selected_effort: Some("ultra".into()),
+            default_only: false,
+        };
+
+        assert_eq!(overlay.efforts(), vec![None, Some("ultra".into())]);
+        assert_eq!(overlay.effort().as_deref(), Some("ultra"));
+    }
+
+    #[test]
+    fn model_overlay_preserves_saved_effort_by_value() {
+        for (saved, listed) in [
+            ("xhigh", vec!["low", "xhigh"]),
+            ("low", vec!["high", "low"]),
+        ] {
+            let mut app = test_app();
+            app.view = View::Settings;
+            let mut cfg = Config::default();
+            cfg.provider.reasoning_effort = Some(saved.into());
+            cfg.save(&app.paths).unwrap();
+            let (client, _) = DaemonClient::recording();
+            app.client = Some(client);
+            app.open_model_picker();
+
+            let overlay = app.model_overlay.as_mut().unwrap();
+            overlay.picker.set_items(
+                vec![picker::ModelItem {
+                    id: "custom-model".into(),
+                    source: None,
+                    recent: false,
+                    detail: None,
+                }],
+                "custom-model",
+            );
+            overlay.meta = serde_json::json!({"custom-model":{"efforts":listed}});
+            assert_eq!(overlay.effort().as_deref(), Some(saved));
+        }
     }
 
     #[test]

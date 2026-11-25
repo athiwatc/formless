@@ -2,7 +2,7 @@
 //! They never dispatch a command, open a profile, or contact a daemon/provider.
 
 use clap::{error::ErrorKind, Command, CommandFactory, Parser};
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, io::Write, process::Command as ProcessCommand};
 
 fn command_tree() -> Command {
     let mut command = super::Cli::command();
@@ -571,6 +571,115 @@ fn docs_zsh_completions_offer_topic_names_from_the_table() {
             "missing description for {name}: {docs}"
         );
     }
+}
+
+#[test]
+fn docs_fish_completions_include_topic_names_and_descriptions() {
+    let mut script = Vec::new();
+    super::generate_completions(clap_complete::Shell::Fish, &mut script).unwrap();
+    let script = String::from_utf8(script).expect("fish completion script is utf-8");
+
+    for (name, _, description) in formless_core::docs::TOPICS {
+        let expected = format!(
+            "complete -c formless -f -n '__fish_formless_docs_topic_argument' -a {} -d {}",
+            super::fish_quote(name),
+            super::fish_quote(description)
+        );
+        assert!(
+            script.lines().any(|line| line == expected),
+            "missing fish topic completion for {name}: {script}"
+        );
+    }
+}
+
+#[test]
+fn docs_fish_completions_follow_topic_argument_position() {
+    let fish_version = ProcessCommand::new("fish").arg("--version").output();
+    let Ok(fish_version) = fish_version else {
+        eprintln!("skipping Fish completion behavior checks; fish is not installed");
+        return;
+    };
+    assert!(fish_version.status.success(), "fish --version failed");
+
+    let mut script = Vec::new();
+    super::generate_completions(clap_complete::Shell::Fish, &mut script).unwrap();
+    let mut script_file = tempfile::NamedTempFile::new().unwrap();
+    script_file.write_all(&script).unwrap();
+    script_file.flush().unwrap();
+
+    let mut all_topics: Vec<_> = formless_core::docs::TOPICS
+        .iter()
+        .map(|(name, _, _)| *name)
+        .collect();
+    all_topics.sort_unstable();
+
+    let topic_suggestions = |input: &str| {
+        let output = ProcessCommand::new("fish")
+            .args(["--no-config", "-c", "source $argv[1]; complete -C $argv[2]"])
+            .arg(script_file.path())
+            .arg(input)
+            .output()
+            .expect("fish completion command runs");
+        assert!(
+            output.status.success(),
+            "fish failed for {input:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("fish output is utf-8")
+            .lines()
+            .filter_map(|line| {
+                let name = line.split('\t').next().unwrap_or(line);
+                formless_core::docs::TOPICS
+                    .iter()
+                    .any(|(topic, _, _)| *topic == name)
+                    .then(|| name.to_owned())
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for input in [
+        "formless docs ",
+        "/usr/bin/formless docs ",
+        "./target/debug/formless docs ",
+    ] {
+        let mut visible = topic_suggestions(input);
+        visible.sort_unstable();
+        assert_eq!(
+            visible, all_topics,
+            "unexpected topic candidates for {input:?}"
+        );
+    }
+    assert_eq!(topic_suggestions("formless docs cap"), ["capabilities"]);
+    for input in [
+        "formless docs cap ",
+        "formless docs Troubleshooting ",
+        "formless docs unknown-topic ",
+        "formless docs --text cap ",
+        "formless docs --keys ",
+        "formless --plain docs ",
+        "formless config ",
+    ] {
+        assert!(
+            topic_suggestions(input).is_empty(),
+            "unexpected docs topic suggestions for {input:?}"
+        );
+    }
+    let mut visible_after_print = topic_suggestions("formless docs --print ");
+    visible_after_print.sort_unstable();
+    assert_eq!(visible_after_print, all_topics);
+    let mut visible_after_text = topic_suggestions("formless docs --text ");
+    visible_after_text.sort_unstable();
+    assert_eq!(visible_after_text, all_topics);
+    let mut visible_after_secure = topic_suggestions("formless docs --secure ");
+    visible_after_secure.sort_unstable();
+    assert_eq!(visible_after_secure, all_topics);
+    let mut visible_after_profile = topic_suggestions("formless docs --profile demo ");
+    visible_after_profile.sort_unstable();
+    assert_eq!(visible_after_profile, all_topics);
+    let mut visible_after_root_profile = topic_suggestions("formless --profile demo docs ");
+    visible_after_root_profile.sort_unstable();
+    assert_eq!(visible_after_root_profile, all_topics);
 }
 
 #[test]

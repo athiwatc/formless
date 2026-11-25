@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use crate::main_topic_suggestions::{self, PROPOSE_TOPIC, READ_TOPIC_CONTEXT};
-use crate::storage::Store;
+use crate::storage::{RegistryToolSummary, Store};
 use formless_protocol::ToolInfo;
 
 pub const TOPIC_RUN_STEP: &str = "topic_run_step";
@@ -971,42 +971,27 @@ pub fn normalize_tags<'a>(raw: impl IntoIterator<Item = &'a str>) -> Vec<String>
 }
 
 /// The Tools the agent may see: neither retired nor switched off.
-fn agent_tools(store: &Store) -> Result<Vec<ToolInfo>> {
-    let mut tools = store.list_tools(false)?;
+fn agent_tools(store: &Store) -> Result<Vec<RegistryToolSummary>> {
+    let mut tools = store.registry_tool_summaries(false)?;
     tools.retain(|t| {
-        !t.disabled && !main_topic_suggestions::is_topic_tool(&t.name.to_ascii_lowercase())
+        t.has_current_version
+            && !t.disabled
+            && !main_topic_suggestions::is_topic_tool(&t.name.to_ascii_lowercase())
     });
     Ok(tools)
 }
 
-fn provider_compatible_tools(
-    store: &Store,
-) -> Result<(
-    Vec<ToolInfo>,
-    std::collections::HashMap<String, (i64, String)>,
-)> {
+fn provider_compatible_tools(store: &Store) -> Result<Vec<RegistryToolSummary>> {
     let tools = agent_tools(store)?;
-    let input_schemas = current_input_schemas(store, &tools)?;
     let mut compatible = Vec::new();
     for info in tools {
-        let Some((_, input_schema)) = input_schemas.get(&info.id) else {
-            continue;
-        };
-        if let Err(error) = validate_stored_input_schema(input_schema) {
+        if let Err(error) = validate_stored_input_schema(&info.input_schema) {
             warn_omitted_tool_schema(&info.id, &info.name, &error);
             continue;
         }
         compatible.push(info);
     }
-    Ok((compatible, input_schemas))
-}
-
-fn current_input_schemas(
-    store: &Store,
-    tools: &[ToolInfo],
-) -> Result<std::collections::HashMap<String, (i64, String)>> {
-    let ids: Vec<&str> = tools.iter().map(|tool| tool.id.as_str()).collect();
-    store.current_input_schemas_for(&ids)
+    Ok(compatible)
 }
 
 /// Search active Tools with the configured ranking (`tools.search`).
@@ -1016,12 +1001,28 @@ pub fn search_tools_with(
     limit: usize,
     method: &str,
 ) -> Result<Vec<ToolInfo>> {
-    let (tools, input_schemas) = provider_compatible_tools(store)?;
+    Ok(search_tool_summaries_with(store, query, limit, method)?
+        .into_iter()
+        .map(registry_summary_as_tool_info)
+        .collect())
+}
+
+fn search_tool_summaries_with(
+    store: &Store,
+    query: &str,
+    limit: usize,
+    method: &str,
+) -> Result<Vec<RegistryToolSummary>> {
+    let tools = provider_compatible_tools(store)?;
     if method.eq_ignore_ascii_case("keyword") {
-        search_tools_from(store, tools, query, limit)
+        search_tools_from(tools, query, limit)
     } else {
-        search_tools_bm25_from(tools, &input_schemas, query, limit)
+        search_tools_bm25_from(tools, query, limit)
     }
+}
+
+fn registry_summary_as_tool_info(summary: RegistryToolSummary) -> ToolInfo {
+    formless_protocol::ToolSummary::from(&summary).into()
 }
 
 /// Word groups treated as related when searching ("download web page"
@@ -1071,17 +1072,17 @@ fn stems(s: &str) -> Vec<String> {
 /// matches and the [`SYNONYMS`] groups at reduced weight. Ties go to the
 /// more used, more reliable Tool.
 pub fn search_tools_bm25(store: &Store, query: &str, limit: usize) -> Result<Vec<ToolInfo>> {
-    let tools = agent_tools(store)?;
-    let input_schemas = current_input_schemas(store, &tools)?;
-    search_tools_bm25_from(tools, &input_schemas, query, limit)
+    Ok(search_tools_bm25_from(agent_tools(store)?, query, limit)?
+        .into_iter()
+        .map(registry_summary_as_tool_info)
+        .collect())
 }
 
 fn search_tools_bm25_from(
-    tools: Vec<ToolInfo>,
-    input_schemas: &std::collections::HashMap<String, (i64, String)>,
+    tools: Vec<RegistryToolSummary>,
     query: &str,
     limit: usize,
-) -> Result<Vec<ToolInfo>> {
+) -> Result<Vec<RegistryToolSummary>> {
     let docs: Vec<Vec<String>> = tools
         .iter()
         .map(|t| {
@@ -1094,12 +1095,10 @@ fn search_tools_bm25_from(
             }
             doc.extend(stems(&t.title));
             doc.extend(stems(&t.description));
-            if let Some((_, input_schema)) = input_schemas.get(&t.id) {
-                if let Ok(schema) = serde_json::from_str::<Value>(input_schema) {
-                    for (prop, def) in schema["properties"].as_object().into_iter().flatten() {
-                        doc.extend(stems(prop));
-                        doc.extend(stems(def["description"].as_str().unwrap_or_default()));
-                    }
+            if let Ok(schema) = serde_json::from_str::<Value>(&t.input_schema) {
+                for (prop, def) in schema["properties"].as_object().into_iter().flatten() {
+                    doc.extend(stems(prop));
+                    doc.extend(stems(def["description"].as_str().unwrap_or_default()));
                 }
             }
             doc
@@ -1140,7 +1139,7 @@ fn search_tools_bm25_from(
             })
             .sum()
     };
-    let mut scored: Vec<(f64, ToolInfo)> = tools
+    let mut scored: Vec<(f64, RegistryToolSummary)> = tools
         .into_iter()
         .zip(&docs)
         .filter_map(|(t, doc)| {
@@ -1169,17 +1168,19 @@ fn search_tools_bm25_from(
 /// Keyword search over active Tools (SPEC §7.1). Name hits outrank
 /// description hits; ties go to the more used, more reliable Tool.
 pub fn search_tools(store: &Store, query: &str, limit: usize) -> Result<Vec<ToolInfo>> {
-    search_tools_from(store, agent_tools(store)?, query, limit)
+    Ok(search_tools_from(agent_tools(store)?, query, limit)?
+        .into_iter()
+        .map(registry_summary_as_tool_info)
+        .collect())
 }
 
 fn search_tools_from(
-    _store: &Store,
-    tools: Vec<ToolInfo>,
+    tools: Vec<RegistryToolSummary>,
     query: &str,
     limit: usize,
-) -> Result<Vec<ToolInfo>> {
+) -> Result<Vec<RegistryToolSummary>> {
     let q = tokens(query);
-    let mut scored: Vec<(f64, ToolInfo)> = tools
+    let mut scored: Vec<(f64, RegistryToolSummary)> = tools
         .into_iter()
         .filter_map(|t| {
             let name = tokens(&t.name);
@@ -1207,15 +1208,19 @@ fn search_tools_from(
 
 /// The function definition a registry Tool is listed to the model with.
 pub fn registry_definition(info: &ToolInfo, v: &formless_protocol::ToolVersionInfo) -> Value {
-    registry_definition_with_input_schema(info, &v.input_schema)
+    registry_definition_with_input_schema(&info.name, &info.description, &v.input_schema)
 }
 
-fn registry_definition_with_input_schema(info: &ToolInfo, input_schema: &str) -> Value {
+fn registry_definition_with_input_schema(
+    name: &str,
+    description: &str,
+    input_schema: &str,
+) -> Value {
     let params: Value =
         serde_json::from_str(input_schema).unwrap_or_else(|_| json!({"type": "object"}));
     json!({
         "type": "function",
-        "function": {"name": info.name, "description": crate::descriptions::model_text(&info.description), "parameters": params}
+        "function": {"name": name, "description": crate::descriptions::model_text(description), "parameters": params}
     })
 }
 
@@ -1496,7 +1501,6 @@ fn definitions(
     persist: bool,
 ) -> Result<Vec<Value>> {
     let all_tools = agent_tools(store)?;
-    let input_schemas = current_input_schemas(store, &all_tools)?;
     let loaded_tool_ids = match session_id {
         Some(session) => store.session_tool_ids(session)?,
         None => Default::default(),
@@ -1528,10 +1532,7 @@ fn definitions(
             .map(|definition| validate_definition_input_schema(&definition));
         let validation = match pinned_check {
             Some(validation) => validation,
-            None => match input_schemas.get(&info.id) {
-                Some((_, input_schema)) => validate_stored_input_schema(input_schema),
-                None => continue,
-            },
+            None => validate_stored_input_schema(&info.input_schema),
         };
         if let Err(error) = validation {
             warn_omitted_tool_schema(&info.id, &info.name, &error);
@@ -1544,7 +1545,7 @@ fn definitions(
     // prompt prefix, so a Tool created or used in another Session must not
     // change this one's. A Session's own creations and `find_tools` results
     // are added to it; everything else is reached through `find_tools`.
-    let shown: Vec<ToolInfo> = {
+    let shown: Vec<RegistryToolSummary> = {
         let mut loaded = loaded_tool_ids.clone();
         let active_ids: std::collections::HashSet<&str> =
             tools.iter().map(|tool| tool.id.as_str()).collect();
@@ -1565,7 +1566,7 @@ fn definitions(
                 store.load_session_tools(s, &pinned, "pinned")?;
             }
             loaded.extend(pinned);
-            let mut rest: Vec<&ToolInfo> =
+            let mut rest: Vec<&RegistryToolSummary> =
                 tools.iter().filter(|t| !loaded.contains(&t.id)).collect();
             rest.sort_by_key(|t| std::cmp::Reverse(t.invocations));
             let filler: Vec<String> = rest
@@ -1579,7 +1580,7 @@ fn definitions(
             loaded.extend(filler);
         }
         // Pinned Tools first, then the rest; each group by name.
-        let mut shown: Vec<ToolInfo> = tools
+        let mut shown: Vec<RegistryToolSummary> = tools
             .iter()
             .filter(|t| loaded.contains(&t.id))
             .cloned()
@@ -1647,21 +1648,19 @@ fn definitions(
                 }
             }
         }
-        if let Some((version, input_schema)) = input_schemas.get(&info.id) {
-            if let Err(error) = validate_stored_input_schema(input_schema) {
-                warn_omitted_tool_schema(&info.id, &info.name, &error);
-                continue;
-            }
-            let def = registry_definition_with_input_schema(&info, input_schema);
-            if let Some(s) = session_id.filter(|_| persist) {
-                store.pin_definition(s, &info.id, *version, &def.to_string())?;
-                // Preserve legacy read/write ordering, including triggers or
-                // refreshes caused by a missing/invalid pin's fallback write.
-                // Fully pinned listings keep the bounded batch fast path.
-                pins = None;
-            }
-            defs.push(def);
+        let def = registry_definition_with_input_schema(
+            &info.name,
+            &info.description,
+            &info.input_schema,
+        );
+        if let Some(s) = session_id.filter(|_| persist) {
+            store.pin_definition(s, &info.id, info.current_version, &def.to_string())?;
+            // Preserve legacy read/write ordering, including triggers or
+            // refreshes caused by a missing/invalid pin's fallback write.
+            // Fully pinned listings keep the bounded batch fast path.
+            pins = None;
         }
+        defs.push(def);
     }
     // A Tool retired since the Session listed it (an MCP server dropped
     // it, or a user retired it) stays listed, as pinned, until the next
@@ -1887,7 +1886,7 @@ mod tests {
     }
 
     #[test]
-    fn batched_current_input_schema_drives_search_documents() {
+    fn joined_current_input_schema_drives_search_documents() {
         let store = Store::open_in_memory().unwrap();
         let initial_schema = r#"{"type":"object","properties":{"oldneedle":{"type":"string"}}}"#;
         let current_schema =
@@ -1920,11 +1919,13 @@ mod tests {
             )
             .unwrap();
 
-        let schemas = store
-            .current_input_schemas_for(&[tool.id.as_str()])
+        let summaries = store.registry_tool_summaries(false).unwrap();
+        let current_entry = summaries
+            .iter()
+            .find(|summary| summary.id == tool.id)
             .unwrap();
-        let current_entry = (current_version, current_schema.to_string());
-        assert_eq!(schemas.get(&tool.id), Some(&current_entry));
+        assert_eq!(current_entry.current_version, current_version);
+        assert_eq!(current_entry.input_schema, current_schema);
         assert!(search_tools_bm25(&store, "currentneedle", 10)
             .unwrap()
             .iter()
@@ -1933,6 +1934,172 @@ mod tests {
             .unwrap()
             .iter()
             .any(|result| result.id == tool.id));
+    }
+
+    #[test]
+    fn listing_and_definition_query_counts_do_not_scale_with_registry_size() {
+        let store = Store::open_in_memory().unwrap();
+        let caps = formless_runtime::Capabilities::default();
+        let add_tool = |index: usize| {
+            store
+                .create_tool_version(
+                    &format!("query_count_{index:03}"),
+                    "query count fixture",
+                    r#"{"type":"object"}"#,
+                    "{}",
+                    "function run(){}",
+                    &caps,
+                    64,
+                    "test",
+                )
+                .unwrap();
+        };
+        add_tool(0);
+
+        let (_, one_list_query) =
+            store.count_forecast_statements(|| store.list_tool_summaries(false).unwrap());
+        let (_, one_definition_query) =
+            store.count_forecast_statements(|| tool_definitions(&store, None, 40).unwrap());
+
+        for index in 1..50 {
+            add_tool(index);
+        }
+
+        let (_, many_list_queries) =
+            store.count_forecast_statements(|| store.list_tool_summaries(false).unwrap());
+        let (_, many_definition_queries) =
+            store.count_forecast_statements(|| tool_definitions(&store, None, 40).unwrap());
+
+        assert_eq!(one_list_query, 1);
+        assert_eq!(many_list_queries, one_list_query);
+        assert_eq!(one_definition_query, 1);
+        assert_eq!(many_definition_queries, one_definition_query);
+    }
+
+    #[test]
+    fn warm_session_definition_query_count_does_not_scale_with_registry_size() {
+        let warm_query_count = |tool_count: usize| {
+            let store = Store::open_in_memory().unwrap();
+            let caps = formless_runtime::Capabilities::default();
+            for index in 0..tool_count {
+                store
+                    .create_tool_version(
+                        &format!("warm_query_count_{index:03}"),
+                        "warm query count fixture",
+                        r#"{"type":"object"}"#,
+                        "{}",
+                        "function run(){}",
+                        &caps,
+                        64,
+                        "test",
+                    )
+                    .unwrap();
+            }
+            let session = store
+                .create_session(Some("warm query count".into()))
+                .unwrap()
+                .id;
+            // The cold call loads membership and writes one pin per shown Tool; preserve that behavior.
+            tool_definitions(&store, Some(&session), 40).unwrap();
+            let (_, statements) = store.count_forecast_statements(|| {
+                tool_definitions(&store, Some(&session), 40).unwrap()
+            });
+            statements
+        };
+
+        assert_eq!(warm_query_count(1), warm_query_count(50));
+    }
+
+    #[test]
+    fn invocation_rollups_track_lifecycle_and_distinct_sessions() {
+        let store = Store::open_in_memory().unwrap();
+        let first_session = store.create_session(Some("first".into())).unwrap().id;
+        let second_session = store.create_session(Some("second".into())).unwrap().id;
+        let (tool, version) = store
+            .create_tool_version(
+                "invocation_rollup_fixture",
+                "invocation rollup fixture",
+                r#"{"type":"object"}"#,
+                "{}",
+                "function run(){}",
+                &formless_runtime::Capabilities::default(),
+                64,
+                "agent",
+            )
+            .unwrap();
+        for (session, status, tag) in [
+            (first_session.as_str(), "success", ""),
+            (first_session.as_str(), "failure", "validation"),
+            (second_session.as_str(), "denied", ""),
+        ] {
+            store
+                .record_invocation(
+                    &tool.id,
+                    version,
+                    Some(session),
+                    None,
+                    None,
+                    status,
+                    tag,
+                    "{}",
+                    "",
+                    "",
+                    1,
+                    100,
+                )
+                .unwrap();
+        }
+
+        let summary = |store: &Store| {
+            store
+                .registry_tool_summaries(false)
+                .unwrap()
+                .into_iter()
+                .find(|summary| summary.id == tool.id)
+                .unwrap()
+        };
+        let recorded = summary(&store);
+        assert_eq!(recorded.invocations, 3);
+        assert_eq!(recorded.success, 1);
+        assert_eq!(recorded.failure, 1);
+        assert_eq!(recorded.validation_failures, 1);
+        assert_eq!(recorded.denied, 1);
+        assert_eq!(recorded.sessions, 2);
+
+        let running_id = store
+            .start_invocation(&tool.id, version, Some(&first_session), None, None, "{}")
+            .unwrap();
+        assert_eq!(summary(&store).invocations, 4);
+        store
+            .finish_invocation(&running_id, &tool.id, "success", "", "", "", 1, 100)
+            .unwrap();
+        assert_eq!(summary(&store).success, 2);
+        store.set_invocation_tag(&running_id, "validation").unwrap();
+        assert_eq!(summary(&store).validation_failures, 2);
+
+        store
+            .record_invocation(
+                &tool.id,
+                version,
+                Some(&second_session),
+                None,
+                None,
+                "failure",
+                "",
+                "{}",
+                "",
+                "",
+                1,
+                1,
+            )
+            .unwrap();
+        let retained = summary(&store);
+        assert_eq!(retained.invocations, 1);
+        assert_eq!(retained.success, 0);
+        assert_eq!(retained.failure, 1);
+        assert_eq!(retained.validation_failures, 0);
+        assert_eq!(retained.denied, 0);
+        assert_eq!(retained.sessions, 1);
     }
 
     #[test]

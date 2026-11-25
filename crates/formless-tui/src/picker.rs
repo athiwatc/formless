@@ -54,6 +54,11 @@ fn model_context_label(value: u64) -> String {
 /// `ListModels` metadata and remembered test (SPEC §4.2, §4.3).
 pub fn model_detail(meta: &serde_json::Value, test: &serde_json::Value) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
+    let inferred = |field: &str| {
+        meta["inferred"]
+            .as_array()
+            .is_some_and(|fields| fields.iter().any(|value| value == field))
+    };
     if let Some(c) = meta["context"].as_u64() {
         parts.push(model_context_label(c));
     }
@@ -70,13 +75,37 @@ pub fn model_detail(meta: &serde_json::Value, test: &serde_json::Value) -> Optio
         };
         parts.push(format!("${}/${} per M", fmt(i), fmt(o)));
     }
-    if meta["vision"] == true {
-        parts.push("vision".into());
+    match meta["vision"].as_bool() {
+        Some(true) => parts.push(format!(
+            "{}vision",
+            if inferred("vision") { "~" } else { "" }
+        )),
+        Some(false) => parts.push(format!(
+            "{}no vision",
+            if inferred("vision") { "~" } else { "" }
+        )),
+        None => {}
     }
     match meta["tools"].as_bool() {
-        Some(true) => parts.push("tools".into()),
-        Some(false) => parts.push("no tools".into()),
+        Some(true) => parts.push(format!("{}tools", if inferred("tools") { "~" } else { "" })),
+        Some(false) => parts.push(format!(
+            "{}no tools",
+            if inferred("tools") { "~" } else { "" }
+        )),
         None => {}
+    }
+    if inferred("efforts") {
+        parts.push(
+            if meta["efforts"]
+                .as_array()
+                .is_some_and(|efforts| efforts.is_empty())
+            {
+                "~no effort effect"
+            } else {
+                "~effort choices"
+            }
+            .into(),
+        );
     }
     if test.is_object() {
         parts.push(if test["ok"] == true {
@@ -309,6 +338,36 @@ mod tests {
         .is_none());
         assert!(model_detail(&serde_json::Value::Null, &serde_json::Value::Null).is_none());
         assert_eq!(model_detail(&serde_json::json!({"input_price":0.001,"output_price":0.075,"vision":true,"tools":true}), &serde_json::json!({"ok":true})).as_deref(), Some("$0.001/$0.075 per M · vision · tools · ✓ tested"));
+    }
+
+    #[test]
+    fn inferred_capabilities_are_marked_and_reported_facts_are_not() {
+        let inferred = model_detail(
+            &serde_json::json!({
+                "vision":true,
+                "tools":false,
+                "efforts":["low","medium"],
+                "inferred":["vision","tools","efforts"],
+                "source":"builtin"
+            }),
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        assert_eq!(inferred, "~vision · ~no tools · ~effort choices");
+        assert_eq!(
+            model_detail(
+                &serde_json::json!({"efforts":[],"inferred":["efforts"]}),
+                &serde_json::Value::Null
+            )
+            .as_deref(),
+            Some("~no effort effect")
+        );
+        let reported = model_detail(
+            &serde_json::json!({"vision":false,"tools":true,"source":"endpoint"}),
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        assert_eq!(reported, "no vision · tools");
     }
     #[test]
     fn transient_model_failures_explain_the_manual_retry() {

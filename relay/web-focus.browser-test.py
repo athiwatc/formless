@@ -527,16 +527,27 @@ def run():
             check(page.evaluate('document.activeElement!==document.body && !!document.activeElement.getClientRects().length'),'removed menu trigger gets visible fallback focus')
             check(page.locator('[aria-haspopup="menu"][aria-expanded="true"]').count()==0,'all context-menu expanded states cleaned up')
             check(not page.locator('#app').evaluate('(e)=>e.inert'),'final background is interactive')
-            # Mobile root scaling retains the drawer while pointer-activating
-            # a harmless copy action, then returns to its visible menu trigger.
+            # Clipboard completion is asynchronous; dismiss its result before
+            # later pointer actions so it cannot arrive after test cleanup.
             page.set_viewport_size({'width':390,'height':844})
             page.evaluate('__focus817.S.readScale=2;document.documentElement.style.setProperty("--read-scale","2");__focus817.renderSessions();document.querySelector("#sidebar").classList.add("open")')
             page.wait_for_timeout(50)
+            page.evaluate('''() => Object.defineProperty(navigator, 'clipboard', {
+                configurable:true,
+                value:{writeText:() => new Promise(resolve => {window.__resolveFocusCopy=resolve;})}
+            })''')
             page.locator(session_trigger).click()
             page.get_by_role('menuitem',name='Copy link',exact=False).click()
             check(page.locator('#sidebar').evaluate('(e)=>e.classList.contains("open")'),'mobile copy action leaves sidebar open')
             check(page.locator(session_trigger).evaluate('(e)=>e===document.activeElement'),'mobile copy action restores visible menu trigger')
-            page.evaluate("document.querySelector('#toasts').replaceChildren()")
+            page.wait_for_function("typeof window.__resolveFocusCopy === 'function'")
+            check(page.locator('#toasts .toast').count()==0,'copy notification waits for clipboard completion')
+            page.evaluate('window.__resolveFocusCopy()')
+            copy_toast=page.get_by_role('status').filter(has_text='Copied: opens')
+            copy_toast.wait_for(state='visible')
+            copy_toast.get_by_role('button',name='Dismiss notification').click()
+            copy_toast.wait_for(state='detached')
+            check(page.locator('#sidebar').evaluate('(e)=>e.classList.contains("open")'),'mobile toast dismissal preserves the Session drawer')
             # Pointer dismissal of an overlay is not an outside click on the
             # drawer behind it, including when a close button removes the modal.
             page.locator(session_trigger).click()

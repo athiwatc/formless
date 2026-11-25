@@ -84,7 +84,41 @@
   function normalizeTextareaValue(value) {
     return typeof value === "string" ? value.replace(/\r\n?/g, "\n") : value;
   }
+  function sharedSlashDraftKey(scope, sessionId) {
+    return scope && sessionId ? "shared-slash-draft:" + encodeURIComponent(scope) + ":" + encodeURIComponent(sessionId) : null;
+  }
+  function sharedSlashDraftValue(scope, sessionId) {
+    const key = sharedSlashDraftKey(scope, sessionId);
+    if (!key) return null;
+    if (S.sharedSlashDrafts?.has(key)) return S.sharedSlashDrafts.get(key);
+    const value = prefs.get(key, null);
+    return typeof value === "string" ? value : null;
+  }
+  function rememberSharedSlashDraft(scope, sessionId, value) {
+    const key = sharedSlashDraftKey(scope, sessionId);
+    if (!key) return false;
+    const normalized = normalizeTextareaValue(value);
+    (S.sharedSlashDrafts || (S.sharedSlashDrafts = new Map())).set(key, normalized);
+    return prefs.set(key, normalized);
+  }
+  function clearSharedSlashDraft(scope, sessionId) {
+    const key = sharedSlashDraftKey(scope, sessionId);
+    if (!key) return false;
+    if (S.sharedSlashDrafts) S.sharedSlashDrafts.delete(key);
+    return prefs.remove(key);
+  }
+  function clearEditedSharedSlashDraft(scope, sessionId, value) {
+    const marked = sharedSlashDraftValue(scope, sessionId);
+    if (marked !== null && normalizeTextareaValue(marked) !== normalizeTextareaValue(value)) {
+      clearSharedSlashDraft(scope, sessionId);
+    }
+  }
+  function isSharedSlashDraft(scope, sessionId, value) {
+    const marked = sharedSlashDraftValue(scope, sessionId);
+    return marked !== null && normalizeTextareaValue(marked) === normalizeTextareaValue(value);
+  }
   function clearSubmittedDraft(scope, sessionId, snapshot) {
+    clearSharedSlashDraft(scope, sessionId);
     const fallbackKey = sessionCacheKey(scope, sessionId);
     const fallbacks = S.unpersistedDrafts || (S.unpersistedDrafts = new Map());
     const sharedValues = S.unpersistedDraftSharedValues || (S.unpersistedDraftSharedValues = new Map());
@@ -169,6 +203,7 @@
     relayModule: null,
     relayMemory: null, // shared across reconnects; old async consumers stay charged
     relayLink: null,
+    relayActivityAt: null,
     relayLocalProof: false,
     relayRoomReady: false,
     relayReady: false,
@@ -223,6 +258,7 @@
     storageScope: null,
     nextId: Math.floor(Math.random() * 1e9) + 1,
     submitting: new Set(),
+    shareApplyPending: false,
     pending: new Map(),
     subagents: [], // last /agents listing
   };
@@ -678,7 +714,7 @@
 
   // ------------------------------------------------------------ transport
   /** Request with a response (rejects on daemon error or timeout). */
-  function request(req, timeoutMs) {
+  function request(req, timeoutMs, extendOnRelayActivity = false) {
     return new Promise((resolve, reject) => {
       if (!S.ws || S.ws.readyState !== 1) return reject(new Error("not connected to the relay"));
       if (!S.channel || (!S.local && !S.relayReady)) return reject(new Error("still connecting to the daemon"));
@@ -694,10 +730,21 @@
           lease = S.relayMemory.reserve(12 * bytes + 1024 * 1024 + 4 * S.relayModule.LIMITS.windowFrames * S.relayModule.LIMITS.wire + 4096);
         }
       } catch (error) { return reject(error); }
-      const timer = setTimeout(() => {
+      const timeout = timeoutMs || 30000;
+      const now = () => typeof performance !== "undefined" ? performance.now() : Date.now();
+      const startedAt = now();
+      let timer;
+      const onTimeout = () => {
+        const lastActivityAt = S.relayActivityAt ?? startedAt;
+        const remaining = timeout - (now() - lastActivityAt);
+        if (extendOnRelayActivity && remaining > 0) {
+          timer = setTimeout(onTimeout, Math.max(1, Math.ceil(remaining)));
+          return;
+        }
         S.pending.delete(id);
         reject(new Error("the daemon did not answer (is it online?)"));
-      }, timeoutMs || 30000);
+      };
+      timer = setTimeout(onTimeout, timeout);
       S.pending.set(id, {
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject: (e) => { clearTimeout(timer); reject(e); },
@@ -1053,7 +1100,8 @@
     return caps.map((c) => h("span", { class: "tag" + (isBroad(c) ? " broad" : ""), title: isBroad(c) ? "broad access: " + broadWhy(c) : null }, c));
   }
   function download(name, value) {
-    downloadBlob(name, new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
+    const serialized = JSON.stringify(value, null, 2);
+    downloadBlob(name, new Blob([serialized], { type: "application/json" }));
   }
   function downloadBlob(name, blob) {
     const a = h("a", { href: URL.createObjectURL(blob), download: name });
@@ -1439,16 +1487,19 @@
   }
 
   // Installable app shell (SPEC §12): the page opens offline and says so.
+  function handleServiceWorkerMessage(event) {
+    if (event.data?.type === "formless-open-notification-session") {
+      openNotificationSession(event.data.session).catch(() => {});
+    } else if (event.data?.type === "formless-focus-pending") {
+      focusPending();
+    }
+  }
   if ("serviceWorker" in navigator && window.isSecureContext) {
     navigator.serviceWorker.register("sw.js").catch(() => {});
-    navigator.serviceWorker.addEventListener("message", (event) => {
-      if (event.data?.type === "formless-open-notification-session") {
-        openNotificationSession(event.data.session).catch(() => {});
-      }
-    });
+    navigator.serviceWorker.addEventListener("message", handleServiceWorkerMessage);
   }
   window.addEventListener("offline", () => renderAll());
-  window.addEventListener("online", () => { renderAll(); if (S.reconnect) retryNow(); });
+  window.addEventListener("online", () => { renderAll(); if (S.reconnect) retryNow(); else void resumeRelayAfterReturn(); });
 
   function renderView() {
     if (S.view === "tools") renderTools();
@@ -1465,6 +1516,7 @@
       cancelEventRender();
     }
     S.view = view;
+    renderWakeLock();
     prefs.set("view", view);
     if (view === "tools") { refreshTools(); refreshModules(); }
     if (view === "metrics") { refreshTools(); refreshModelStats(); refreshForecastMetrics(); }
@@ -4039,7 +4091,9 @@
       h("summary", null,
         h("span", { class: "tname" },
           h("span", { "aria-hidden": "true" }, "↳ "), label),
+        content ? h("span", { class: "sr-only" }, ", output: ") : null,
         h("span", { class: "targs" }, truncate(content, 160)),
+        lines > 1 ? h("span", { class: "sr-only" }, ", ") : null,
         lines > 1 ? h("span", { class: "tstat" }, lines + " lines") : null),
       payload(content));
     if (!refs.length) return chip;
@@ -4360,12 +4414,13 @@
   function modelDetail(m, t) {
     const parts = [];
     m = m || {};
+    const inferred = (field) => Array.isArray(m.inferred) && m.inferred.includes(field);
     const context = modelContextLabel(m.context);
     if (context !== null) parts.push(context);
     if (m.input_price != null && m.output_price != null) parts.push(uiMoney(m.input_price, null) + "/" + uiMoney(m.output_price, null) + " per M");
-    if (m.vision) parts.push("vision");
-    if (m.tools === true) parts.push("tools");
-    if (m.tools === false) parts.push("no tools");
+    if (typeof m.vision === "boolean") parts.push((inferred("vision") ? "~" : "") + (m.vision ? "vision" : "no vision"));
+    if (typeof m.tools === "boolean") parts.push((inferred("tools") ? "~" : "") + (m.tools ? "tools" : "no tools"));
+    if (inferred("efforts")) parts.push(Array.isArray(m.efforts) && m.efforts.length === 0 ? "~no effort effect" : "~effort choices");
     if (t) parts.push(t.ok ? "✓ tested" : t.transient === true ? "✗ temporary test failure (use Test to retry)" : "✗ test failed");
     return parts.join(" · ");
   }
@@ -4393,13 +4448,16 @@
       role: "combobox", "aria-autocomplete": "list", "aria-controls": list.id, "aria-expanded": "false" });
     const effort = h("select", { "aria-label": "Reasoning effort" },
       efforts.map((e) => h("option", { value: e }, e || "default (provider)")));
-    effort.value = (session && session.reasoning_effort) || "";
+    let preferredEffort = (session && session.reasoning_effort) || "";
+    effort.value = preferredEffort;
+    effort.onchange = () => { preferredEffort = effort.value; };
     const status = h("span", { class: "muted" }, "loading models…");
     const cancel = h("button", { class: "btn small", type: "button" }, "Cancel");
     const asDefault = h("button", { class: "btn small", type: "button", title: "Ctrl/⌘+Enter" }, "Set as default");
     const apply = h("button", { class: "btn small primary", type: "button", title: "Enter" }, selectionOnly ? "Retry" : "Use in this Session");
     const test = h("button", { class: "btn small", type: "button", title: "Latency, streaming, reasoning and tool calls" }, "Test");
     let meta = {}, tests = {};
+    let preferredEffortModel = model;
     const title = selectionOnly ? "Retry with a model" : "Model";
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": title },
       h("div", { class: "modal picker" },
@@ -4446,11 +4504,22 @@
         input.removeAttribute("aria-activedescendant");
       }
       // Only the efforts the highlighted model accepts (SPEC §4.2).
-      const accepted = (meta[choice()] || {}).efforts;
-      const offer = Array.isArray(accepted) ? [""].concat(["minimal", "low", "medium", "high"].filter((e) => accepted.includes(e))) : efforts;
-      const was = effort.value;
+      const selectedModel = choice();
+      if (selectedModel && selectedModel !== preferredEffortModel) {
+        preferredEffort = "";
+        preferredEffortModel = selectedModel;
+        effort.value = "";
+      }
+      const accepted = (meta[selectedModel] || {}).efforts;
+      const offer = Array.isArray(accepted)
+        ? [""].concat([...new Set(accepted.filter((e) => typeof e === "string" && e !== ""))])
+        : efforts.slice();
+      const was = effort.value || preferredEffort;
+      if (!Array.isArray(accepted) && selectedModel === model && was && !offer.includes(was)) offer.push(was);
       effort.replaceChildren(...offer.map((e) => h("option", { value: e }, e || "default (provider)")));
       effort.value = offer.includes(was) ? was : "";
+      if (Array.isArray(accepted) && !offer.includes(was)) preferredEffort = "";
+      else if (effort.value) preferredEffort = effort.value;
       effort.disabled = offer.length <= 1;
       effort.title = offer.length <= 1 ? "Effort has no effect for this model" : "";
       if (!items.length) return;
@@ -4534,6 +4603,13 @@
   const rendered = new Map();
   const historyRender = { session: undefined, turns: new Map(), live: null, welcome: null, banner: null };
   function reconcileChildren(parent, wanted) {
+    const wantedSet = new Set(wanted);
+    let child = parent.firstChild;
+    while (child) {
+      const next = child.nextSibling;
+      if (!wantedSet.has(child)) child.remove();
+      child = next;
+    }
     let cursor = parent.firstChild;
     for (const node of wanted) {
       if (node === cursor) cursor = cursor.nextSibling;
@@ -4935,7 +5011,15 @@
   /** The live calls to draw (the TUI's rule), each with how many
    * descendants it folds away: a node shows while it or an ancestor runs,
    * and under a node that finished successfully its descendants fold. */
-  function liveTree(calls) {
+  function liveTree(calls, retained = new Set()) {
+    const retainedAncestors = new Set();
+    const ancestors = [];
+    for (const call of calls) {
+      const depth = call.depth || 0;
+      while (ancestors.length && ancestors[ancestors.length - 1][0] >= depth) ancestors.pop();
+      if (retained.has(call)) for (const [, ancestor] of ancestors) retainedAncestors.add(ancestor);
+      ancestors.push([depth, call]);
+    }
     const out = [];
     const stack = []; // [depth, running, open] of the current ancestors
     for (const c of calls) {
@@ -4944,8 +5028,8 @@
       const parentOpen = !stack.length || stack[stack.length - 1][2];
       const ancestorRunning = stack.some((s) => s[1]);
       const running = c.status === "running";
-      const visible = parentOpen && (running || ancestorRunning);
-      const open = visible && c.status !== "ok";
+      const visible = parentOpen && (running || ancestorRunning || retained.has(c));
+      const open = visible && (c.status !== "ok" || retainedAncestors.has(c));
       if (visible) out.push([c, 0]);
       else if (ancestorRunning && !parentOpen) {
         for (let i = out.length - 1; i >= 0; i--) {
@@ -4955,6 +5039,27 @@
       stack.push([d, running, open]);
     }
     return out;
+  }
+  function focusedLiveTools(tools) {
+    if (typeof document === "undefined" || typeof liveRender === "undefined" || !liveRender.rows) return new Set();
+    const active = document.activeElement;
+    const focused = new Set(tools.filter((tool) => {
+      if (tool.status === "running") return false;
+      const row = liveRender.rows.get(tool) || [...liveRender.rows.values()].find((candidate) =>
+        (tool.invocationId != null && candidate.tool.invocationId === tool.invocationId)
+        || (tool.handle && candidate.tool.handle === tool.handle)
+        || (tool.subagent && candidate.tool.subagent === tool.subagent));
+      return row?.node.contains?.(active) === true;
+    }));
+    const retained = new Set(focused);
+    const ancestors = [];
+    for (const tool of tools) {
+      const depth = tool.depth || 0;
+      while (ancestors.length && ancestors[ancestors.length - 1][0] >= depth) ancestors.pop();
+      if (focused.has(tool)) for (const [, ancestor] of ancestors) retained.add(ancestor);
+      ancestors.push([depth, tool]);
+    }
+    return retained;
   }
   /** A sub-agent's transcript (GetSubagent) in a dialog. */
   async function showSubagent(id) {
@@ -5060,7 +5165,7 @@
   }
   // Completed Markdown chunks and the unfinished tail keep their DOM identity.
   const liveDone = { session: undefined, text: "", src: "", node: null, done: null, tail: null, tailText: null, plainText: null, afterSeq: -1, messages: null, messageCount: -1 };
-  const liveRender = { session: undefined, root: null, who: null, thinking: null, thinkingText: null, rows: new Map(), activity: null, activityText: null };
+  const liveRender = { session: undefined, root: null, who: null, thinking: null, thinkingText: null, rows: new Map(), activity: null, activityText: null, focusoutRoot: null };
   const statusRender = { root: null, spinner: null, text: null };
   function streamingNode(text) {
     if (!liveDone.node || liveDone.session !== S.current) {
@@ -5128,6 +5233,9 @@
     const args = document.createTextNode("");
     const statusText = document.createTextNode("");
     const status = h("span", { class: "sr-only", "data-live-status": "" }, statusText);
+    const detailLabelText = document.createTextNode(", arguments: ");
+    const detailLabel = h("span", { class: "sr-only" }, detailLabelText);
+    detailLabel.hidden = true;
     const folded = h("span", { class: "tag" });
     const progress = h("progress", { max: "1", "aria-label": "Progress" });
     const progressText = document.createTextNode("");
@@ -5137,9 +5245,9 @@
     const transcript = h("button", { type: "button", class: "btn ghost small", onclick: (e) => { e.preventDefault(); showSubagent(row.tool.subagent); } }, "Transcript");
     const timer = document.createTextNode("");
     const summary = h("summary", null, h("span", { class: "muted", role: "img", "data-live-depth": "" }, "└"), mark, status,
-      h("span", { class: "tname" }, name), h("span", { class: "targs" }, args), folded, progressBox, stalled, cancel, transcript,
+      h("span", { class: "sr-only" }, ", tool: "), h("span", { class: "tname" }, name), detailLabel, h("span", { class: "targs" }, args), folded, progressBox, stalled, cancel, transcript,
       h("span", { class: "tstat", "data-live-timer": "", "aria-hidden": "true" }, timer));
-    row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, status: statusText, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
+    row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, status: statusText, detailLabel, detailLabelText, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
     liveRender.rows.set(tool, row);
     return row;
   }
@@ -5170,7 +5278,10 @@
     const status = running ? "Running" : t.status === "ok" ? "Done" : "Failed";
     const duration = t.elapsedMs != null ? recordedDuration(t.elapsedMs) : elapsed(t.started);
     updateText(row.status, status + " · " + duration);
-    updateText(row.args, t.subagent ? t.step || "" : summarizeArgs(t.arguments || ""));
+    const args = t.subagent ? t.step || "" : summarizeArgs(t.arguments || "");
+    updateText(row.args, args);
+    updateText(row.detailLabelText, t.subagent ? ", progress: " : ", arguments: ");
+    if (row.detailLabel.hidden !== !args) row.detailLabel.hidden = !args;
     if (row.folded.hidden !== !folded) row.folded.hidden = !folded;
     if (row.folded.textContent !== "+" + folded + " nested") row.folded.textContent = "+" + folded + " nested";
     const hideProgress = !running || !t.progress;
@@ -5195,6 +5306,18 @@
   function renderLive({ newContent = false } = {}) {
     const live = $("live");
     if (!live) return;
+    if (liveRender.focusoutRoot !== live) {
+      liveRender.focusoutRoot = live;
+      live.addEventListener("focusout", (event) => {
+        const row = [...liveRender.rows.values()].find((candidate) => candidate.node.contains(event.target));
+        if (!row || row.tool.status === "running") return;
+        requestAnimationFrame(() => {
+          if (liveRender.root !== live || liveRender.session !== S.current || !S.liveTools.includes(row.tool)
+            || row.tool.status === "running" || row.node.contains(document.activeElement)) return;
+          renderLive();
+        });
+      });
+    }
     withTranscriptLayout(() => {
       const textState = currentLiveText();
       if (liveRender.session !== S.current || liveRender.root !== live) {
@@ -5215,7 +5338,8 @@
         liveRender.rows.clear();
       }
       const running = isRunning();
-      const tools = S.liveTools.filter((t) => t.status === "running");
+      const focused = focusedLiveTools(S.liveTools);
+      const tools = S.liveTools.filter((t) => t.status === "running" || focused.has(t));
       const children = [];
       if (running || S.streaming || tools.length) {
         children.push(liveRender.who);
@@ -5235,7 +5359,7 @@
           liveRender.thinking.scrollTop = expanded ? top : 0;
           children.push(liveRender.thinkingBox);
         }
-        for (const [tool, folded] of liveTree(S.liveTools)) {
+        for (const [tool, folded] of liveTree(S.liveTools, focused)) {
           const row = liveToolRow(tool);
           updateLiveTool(row, folded);
           children.push(row.node);
@@ -5747,6 +5871,7 @@
     note(result.abandoned ? "This run has ended; it cannot be resumed." : "There is no paused run to abandon.");
   }
   function renderRunBanner() {
+    renderWakeLock();
     const box = $("run-banner");
     const u = S.unfinished;
     const resumable = u && ["paused", "interrupted"].includes(u.status);
@@ -5768,6 +5893,59 @@
       h("button", { class: "btn small", type: "button", onclick: () => abandonRun() }, tr("Abandon")));
   }
 
+  let wakeLockEnabled = false;
+  let wakeLockPending = null;
+  let screenWakeLock = null;
+  function releaseScreenWakeLock() {
+    wakeLockPending = null;
+    const lock = screenWakeLock;
+    screenWakeLock = null;
+    if (lock) {
+      try { Promise.resolve(lock.release()).catch(() => {}); } catch (_) {}
+    }
+  }
+  async function acquireScreenWakeLock() {
+    if (screenWakeLock || wakeLockPending) return;
+    const pending = wakeLockPending = {};
+    try {
+      const lock = await navigator.wakeLock.request("screen");
+      if (wakeLockPending !== pending || !wakeLockEnabled || document.hidden || S.view !== "chat" || !isRunning()) {
+        await lock.release();
+        return;
+      }
+      screenWakeLock = lock;
+      lock.addEventListener("release", () => {
+        if (screenWakeLock !== lock) return;
+        screenWakeLock = null;
+        if (wakeLockEnabled && !document.hidden && S.view === "chat" && isRunning()) void acquireScreenWakeLock();
+      }, { once: true });
+    } catch (error) {
+      if (wakeLockPending === pending) {
+        wakeLockEnabled = false;
+        note("Could not keep the screen awake: " + error.message, true);
+        renderWakeLock();
+      }
+    } finally {
+      if (wakeLockPending === pending) wakeLockPending = null;
+    }
+  }
+  function renderWakeLock() {
+    const button = $("keep-awake");
+    const supported = typeof navigator.wakeLock?.request === "function";
+    const watching = S.view === "chat" && !!S.current && isRunning();
+    button.hidden = !supported || !watching;
+    if (!watching) wakeLockEnabled = false;
+    button.setAttribute("aria-pressed", String(wakeLockEnabled));
+    button.textContent = wakeLockEnabled ? "Screen awake" : "Keep awake";
+    if (!supported || !wakeLockEnabled || !watching || document.hidden) releaseScreenWakeLock();
+    else void acquireScreenWakeLock();
+  }
+  $("keep-awake").onclick = () => {
+    if (S.view !== "chat" || !S.current || !isRunning()) return;
+    wakeLockEnabled = !wakeLockEnabled;
+    renderWakeLock();
+  };
+
   /** Step mode (SPEC §5.9): the call waiting for a decision. */
   function renderStep() {
     const box = $("step");
@@ -5775,18 +5953,26 @@
     box.classList.toggle("hidden", !st);
     if (!st) return box.replaceChildren();
     const decide = (action, args) => act({ type: "step_decision", step_id: st.step_id, action, arguments: args || null });
+    const canEdit = st.argumentsComplete !== false;
+    const editReason = tr("Full arguments are unavailable; this preview cannot be edited.");
     let pretty = st.arguments;
     try { pretty = JSON.stringify(JSON.parse(st.arguments), null, 2); } catch (_) {}
-    box.replaceChildren(
+    const content = [
       h("span", { class: "banner-text" }, "⏸ Step mode · about to call ", h("strong", null, st.tool_name), " (" + (st.index + 1) + " of " + st.count + ")",
         h("details", null, h("summary", null, "arguments"), h("pre", { class: "diff" }, pretty))),
       h("button", { class: "btn small primary", type: "button", onclick: () => decide("continue") }, tr("Run")),
-      h("button", { class: "btn small", type: "button", onclick: async () => {
+    ];
+    const edit = { class: "btn small", type: "button", onclick: async () => {
         const v = await ask({ title: "Edit the arguments for " + st.tool_name, inputKind: "machine", text: "JSON object", input: true, value: pretty });
         if (v != null) decide("edit", v);
-      } }, tr("Edit")),
+      } };
+    if (!canEdit) Object.assign(edit, { disabled: true, title: editReason });
+    content.push(h("button", edit, tr("Edit")));
+    if (!canEdit) content.push(h("span", { class: "muted step-edit-reason", role: "note" }, editReason));
+    content.push(
       h("button", { class: "btn small", type: "button", onclick: () => decide("skip") }, tr("Skip")),
       h("button", { class: "btn small", type: "button", onclick: () => { S.stepMode = false; decide("all"); } }, tr("Run the rest")));
+    box.replaceChildren(...content);
   }
 
   /** The agent's checklist (`update_plan`, SPEC §5.8), above the composer. */
@@ -5941,6 +6127,36 @@
     } catch (_) { /* Metrics are read-only and optional on older daemons. */ }
   }
 
+  function shareSendBlocked() {
+    return !!S.shareApplyPending || !!(S.current && S.storageScope
+      && S.shareAttachmentFailures?.has(sessionCacheKey(S.storageScope, S.current)));
+  }
+  function clearShareAttachmentFailure(token, scope, sessionId) {
+    const key = sessionCacheKey(scope, sessionId);
+    const failure = S.shareAttachmentFailures?.get(key);
+    if (failure?.token === token) S.shareAttachmentFailures.delete(key);
+  }
+  async function resolveFailedSharedFiles(token, record, destination, failedFiles, reason) {
+    const failures = S.shareAttachmentFailures || (S.shareAttachmentFailures = new Map());
+    failures.set(sessionCacheKey(destination.scope, destination.sessionId), { token, files: failedFiles });
+    const names = failedFiles.map(file => file?.name || "unnamed file").join(", ");
+    const discard = await ask({
+      title: "Shared files couldn't be attached",
+      text: reason + ": " + names + ". Keep them to retry, or discard them? The caption remains a draft and will not be sent.",
+      ok: "Discard failed files",
+      cancelLabel: "Keep files",
+      danger: true,
+    });
+    if (!discard) {
+      note("Failed shared files are retained; Send stays disabled until you retry or discard them.", true);
+      return false;
+    }
+    record.files = [];
+    await storeIncomingShare(record);
+    clearShareAttachmentFailure(token, destination.scope, destination.sessionId);
+    note("Discarded failed shared files. The caption remains a draft; nothing was sent.");
+    return true;
+  }
   function renderComposer() {
     scheduleForecast();
     const running = isRunning();
@@ -5972,7 +6188,7 @@
     $("session-title").textContent = attempt ? (attempt.step_title || "Step") + " · " + harnessLabel(attempt.harness)
       : topic ? topic.name : S.current === S.mainChat?.id ? "Main Chat" : s ? s.name : "No session";
     $("input").disabled = !!attempt;
-    $("send-btn").disabled = !!attempt;
+    $("send-btn").disabled = !!attempt || shareSendBlocked();
     $("attach-btn").disabled = !!attempt;
     $("fork-btn").disabled = !!attempt;
     $("status-model").disabled = !!attempt;
@@ -6184,7 +6400,18 @@
       S.approvalHelpSeen = true;
     }
   }
+  function syncAppBadge() {
+    if (typeof navigator === "undefined") return;
+    const count = (S.approvals || []).length;
+    let result;
+    try {
+      if (count && typeof navigator.setAppBadge === "function") result = navigator.setAppBadge(count);
+      else if (!count && typeof navigator.clearAppBadge === "function") result = navigator.clearAppBadge();
+    } catch (_) { return; }
+    if (result && typeof result.catch === "function") result.catch(() => {});
+  }
   function renderApproval() {
+    syncAppBadge();
     const req = S.approvals[0];
     if (!req) S.approvalLater = false;
     const alert = $("modal-confirm");
@@ -6670,7 +6897,7 @@
       h("td", null, toolStatusDot(t), toolLabel(t), t.retired ? h("span", { class: "muted" }, " (retired)") : null),
       h("td", null, "v" + t.current_version),
       h("td", { class: "num" }, t.invocations),
-      h("td", { class: "num" }, rateCell(t.success_rate), toolRecent(t.recent)),
+      h("td", { class: "num" }, rateCell(t.success_rate)),
       h("td", { class: "muted" }, t.last_used_at ? relTime(t.last_used_at) : "—"),
       opts.bars ? h("td", null, bar(t.success_rate)) : h("td", { class: "caps" }, (t.capabilities || []).join(", ") || "—")));
     }
@@ -7417,7 +7644,11 @@
       const d = key && docs[key];
       if (!d) return null;
       const def = typeof d.default === "string" ? d.default : JSON.stringify(d.default);
-      return h("div", { class: "setting-desc muted" }, d.description + (def ? " · default " + def : ""));
+      const naming = (S.settings && S.settings.naming) || {};
+      const notice = key === "naming.auto_download"
+        ? " " + namingDownloadInfo(naming).help
+        : "";
+      return h("div", { class: "setting-desc muted" }, d.description + notice + (def ? " · default " + def : ""));
     };
     const section = (title, rows) => h("section", null, h("h3", null, title), h("dl", { class: "kv" },
       rows.map(([k, v, key, kind, choices]) => [h("dt", { title: key || "", "data-setting-key": key || "" }, k), h("dd", null,
@@ -7427,7 +7658,7 @@
           // A pointer click need not focus a native button on macOS. Give the
           // prompt a stable invoker to restore when it closes.
           event.currentTarget.focus({ preventScroll: true });
-          editSetting(key, v, kind, choices);
+          editSetting(key, v, kind, choices, S.settings);
         } }, "Edit") : key ? h("span", { class: "muted setting-readonly" }, " · read-only: edit config.toml / use its CLI") : null,
         help(key))])));
     const grid = h("div", { class: "settings-grid" });
@@ -7577,7 +7808,8 @@
         h("dt", null, "density"), h("dd", null, h("span", { class: "read-controls" },
           ["comfortable", "compact"].map((d) => h("button", { class: "btn small" + (S.density === d ? " primary" : ""), type: "button", "aria-pressed": String(S.density === d), onclick: () => setReading(null, d) }, d)))),
         h("dt", null, "encryption"), h("dd", null, "AES-256-GCM, key held only in this tab"),
-        S.local ? null : [h("dt", null, "notifications"), h("dd", null, pushControl())]),
+        h("dt", null, "notifications"), h("dd", null, browserNotificationControl(),
+          S.local ? null : pushControl())),
       h("div", { class: "detail-actions" },
         h("button", { class: "btn danger small", type: "button", onclick: forget }, "Disconnect and forget this device"))));
     box.append(grid, h("p", { class: "muted" }, "Edits are validated and applied by the daemon; rows marked for TUI startup need a TUI restart. Credentials, endpoint and relay configuration use config.toml or their CLI. Manage MCP servers above."));
@@ -7690,6 +7922,19 @@
     filterSettings();
   });
 
+  function browserNotificationControl() {
+    const controlKey = "browser-notifications";
+    const status = (message) => h("span", { class: "muted", "data-setting-control": controlKey, tabindex: -1 }, message);
+    if (!("Notification" in window)) return status("not supported in this browser");
+    if (Notification.permission === "granted") return status("allowed by this browser");
+    if (Notification.permission === "denied") return status("blocked; change this site's browser permissions");
+    return h("button", { class: "btn small", type: "button", "data-setting-control": controlKey, onclick: async (event) => {
+      event.currentTarget.focus({ preventScroll: true });
+      try { await Notification.requestPermission(); }
+      catch (_) { note("Couldn't request browser notification permission.", true); }
+      renderView();
+    } }, "Allow browser notifications");
+  }
   /** Web Push (SPEC §12): opt in per device. The relay keeps this
    * browser's subscription and, when an approval or question waits, sends
    * a push with no content; nothing about the Session leaves the daemon. */
@@ -7720,10 +7965,10 @@
         registerRelayPush(S.ws, existing, true);
         return;
       }
+      if ((await Notification.requestPermission()) !== "granted") return toast("Notifications are blocked for this site.", true);
       const r = await fetch("push/key");
       if (!r.ok) return toast("This relay hasn't set up notifications.", true);
       const { key } = await r.json();
-      if ((await Notification.requestPermission()) !== "granted") return toast("Notifications are blocked for this site.", true);
       const reg = await navigator.serviceWorker.ready;
       if (S.forgetting || S.pushRemoval) return;
       S.pushSubscribe = reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
@@ -7903,7 +8148,24 @@
     if (!r) return;
     await ask({ title: r.skill.name + " v" + r.skill.version, text: r.body + "\n\nFiles: " + r.files.join(", "), body: descriptionReviewCard(r.skill.description_review, r.skill.description_reviews), ok: "Close" });
   }
-  async function editSetting(key, current, kind, choices = []) {
+  function namingDownloadInfo(naming) {
+    const model = typeof naming?.model === "string" ? naming.model.trim() : "";
+    const size = typeof naming?.model_size === "string" ? naming.model_size.trim() : "";
+    const supported = Boolean(model && size && size !== "—");
+    if (!supported) {
+      const notice = model
+        ? "Configured naming model " + model + " is not supported; titles use a heuristic. Automatic model downloads are unavailable."
+        : "No supported naming model is configured; titles use a heuristic. Automatic model downloads are unavailable.";
+      return { supported, help: notice, consent: notice };
+    }
+    return {
+      supported,
+      help: "First-use download: " + model + " (about " + size + "). Without it, titles use a heuristic.",
+      consent: "On first use, formless will download " + model + " (about " + size + "). Without it, Session titles use a heuristic.",
+    };
+  }
+
+  async function editSetting(key, current, kind, choices = [], settings = null) {
     let value;
     if (kind === "bool") value = !(current === "on" || current === true);
     else if (kind === "choice") {
@@ -7924,6 +8186,24 @@
         try { value = parseSettingInput(text, kind); break; }
         catch (cause) { draft = text; error = cause.message || "Invalid value"; }
       }
+    }
+    if (key === "naming.auto_download" && value === true) {
+      const naming = (settings && settings.naming) || {};
+      const download = namingDownloadInfo(naming);
+      if (!download.supported) {
+        await ask({
+          title: "No supported session-naming model",
+          text: download.consent,
+          ok: "Close",
+        });
+        return;
+      }
+      const accepted = await ask({
+        title: "Allow session-naming model download?",
+        text: download.consent,
+        ok: "Allow download",
+      });
+      if (!accepted) return;
     }
     const r = await act({ type: "set_setting", key, value });
     if (!r) return;
@@ -8565,6 +8845,7 @@
     S.activity = null;
     clearLiveText();
     S.liveTools = []; S.liveRun = null;
+    renderWakeLock();
     renderApproval();
   }
   function restoreSessionRunState(id, result, events) {
@@ -8647,6 +8928,8 @@
     if (S.view === "chat") renderHistory();
   }
   async function openSession(id, stay) {
+    const sameSession = S.current === id;
+    const editingMessageId = sameSession ? S.editMessageId : null;
     if (S.current && !S.editMessageId) saveDraft(S.current, $("input").value);
     S.topicFocus = null;
     if (S.current !== id) invalidateBranchSummary();
@@ -8658,8 +8941,10 @@
     S.sessionLoad = { id, status: "pending" };
     const snapshot = S.sessionSnapshot = { events: [] };
     S.messages = [];
-    clearLiveText();
-    S.liveTools = []; S.liveRun = null;
+    if (!sameSession) {
+      clearLiveText();
+      S.liveTools = []; S.liveRun = null;
+    }
     if (!stay && S.view !== "chat") setView("chat");
     renderSessions();
     renderHistory();
@@ -8680,7 +8965,7 @@
     const draft = Object.prototype.hasOwnProperty.call(attachmentDrafts, draftKey) ? attachmentDrafts[draftKey] : loadDraft(S.storageScope, id);
     S.drafts[id] = draft;
     delete attachmentDrafts[draftKey];
-    $("input").value = draft;
+    if (!editingMessageId) $("input").value = draft;
     saveDraft(id, draft);
     autosize();
     void refreshAttachmentInventory(id);
@@ -8695,10 +8980,10 @@
         renderStatus();
       }).catch(() => {});
     prefs.set(sessionStorageKey(S.storageScope), id);
-    S.editMessageId = null;
+    S.editMessageId = editingMessageId || null;
     S.queued = []; renderQueue();
     S.plan = []; S.planState = null; renderPlan();
-    S.step = null; renderStep();
+    if (!sameSession) { S.step = null; renderStep(); }
     S.recap = null; S.recapRunId = null;
     const r = await act({ type: "get_session", id });
     if (seq !== sessionSeq || S.current !== id) return;
@@ -8721,6 +9006,26 @@
       }
       renderPlan();
       S.stepMode = !!r.step_mode;
+      if (r.pending_steps && Array.isArray(r.pending_steps.prompts)) {
+        const prompt = r.pending_steps.prompts[0];
+        const preview = prompt && typeof prompt.arguments_preview === "string" ? prompt.arguments_preview : "";
+        const sameStep = prompt && S.step && S.step.session_id === prompt.session_id && S.step.run_id === prompt.run_id &&
+          S.step.step_id === prompt.step_id && typeof S.step.arguments === "string" && S.step.argumentsComplete !== false;
+        const previewComplete = prompt && Number.isSafeInteger(prompt.arguments_bytes) &&
+          new TextEncoder().encode(preview).length === prompt.arguments_bytes;
+        let step = prompt ? {
+          ...prompt,
+          arguments: sameStep ? S.step.arguments : preview,
+          argumentsComplete: !!sameStep || !!previewComplete,
+        } : null;
+        for (const ev of snapshot.events) {
+          if (ev.session_id !== id) continue;
+          if (ev.type === "step_pending") step = ev;
+          else if (ev.type === "step_resolved" && step && step.step_id === ev.step_id) step = null;
+        }
+        S.step = step;
+        renderStep();
+      }
       const i = S.sessions.findIndex((s) => s.id === id);
       if (i >= 0 && r.session) S.sessions[i] = r.session;
     }
@@ -8734,6 +9039,15 @@
     S.sessions = [s, ...S.sessions.filter((x) => x.id !== s.id)];
     await openSession(s.id);
     $("input").focus();
+  }
+  async function openMainChat(expectedSelection) {
+    if (!S.mainChat?.id) await refreshTopics(true);
+    if (expectedSelection && (S.current !== expectedSelection.sessionId || S.storageScope !== expectedSelection.scope)) return false;
+    const main = S.mainChat;
+    if (!main?.id) return false;
+    await openSession(main.id);
+    return S.current === main.id && (!expectedSelection || S.storageScope === expectedSelection.scope)
+      && !(S.sessionLoad?.id === main.id && S.sessionLoad.status === "failed");
   }
   /** What this client is called to others on the same Session (§10.4). */
   const CLIENT_LABEL = document.querySelector('meta[name="formless-local"]') ? "web" : "web (relay)";
@@ -9364,11 +9678,15 @@
   const attachmentDrafts = {};
   async function submit(queued) {
     if (currentTopicAttempt()) return;
+    if (shareSendBlocked()) {
+      note("Wait for shared files to finish attaching or resolve the failed files before sending.", true);
+      return;
+    }
     const input = $("input");
     const draftSnapshot = normalizeTextareaValue(input.value);
     const text = input.value.trim();
     if (!text) return;
-    if (text.startsWith("/") && !S.editMessageId) {
+    if (text.startsWith("/") && !S.editMessageId && !isSharedSlashDraft(S.storageScope, S.current, input.value)) {
       input.value = "";
       saveDraft(S.current, "");
       autosize();
@@ -9408,7 +9726,6 @@
         await act({ type: "edit_message", session_id: sid, message_id: editMessageId, content: text });
         return;
       }
-      askNotifyPermission();
       closeMentions();
       const toolNames = new Set((S.tools || []).map((tool) => tool.name));
       const sessionKey = sessionCacheKey(scope, sid);
@@ -9691,14 +10008,12 @@
   }
   document.addEventListener("visibilitychange", () => {
     syncRunningExposure();
-    if (!document.hidden) { unseen = 0; document.title = baseTitle; }
-  });
-  /** Ask once, from a user gesture (sending a message). */
-  function askNotifyPermission() {
-    if (notifyMode() === "desktop" && "Notification" in window && Notification.permission === "default") {
-      Notification.requestPermission().catch(() => {});
+    renderWakeLock();
+    if (!document.hidden) {
+      unseen = 0; document.title = baseTitle;
+      void resumeRelayAfterReturn();
     }
-  }
+  });
   function sessionName(id) {
     const s = S.sessions.find((x) => x.id === id);
     return (s && s.name) || "Session";
@@ -9757,7 +10072,7 @@
       forecastRevision++;
       scheduleForecast();
     }
-    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "run_recap", "plan_updated", "approval_requested", "approval_answered", "approval_closed", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed", "harness_permission_requested", "harness_permission_closed"].includes(ev.type)) {
+    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "run_recap", "plan_updated", "step_pending", "step_resolved", "approval_requested", "approval_answered", "approval_closed", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed", "harness_permission_requested", "harness_permission_closed"].includes(ev.type)) {
       S.sessionSnapshot.events.push(ev);
     }
     notifyFor(ev);
@@ -9874,7 +10189,8 @@
           }
           if (announcedRun?.session === ev.session_id && announcedRun.id === ev.run_id) announcedRun = null;
           clearLiveText();
-          S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: true };
+          const focused = focusedLiveTools(S.liveTools || []);
+          S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle || focused.has(t)); S.liveRun = { id: ev.run_id, ended: true };
           setActivity(null);
           if (ev.type === "run_paused") note("run paused: " + ((ev.explained && ev.explained.message) || ev.error), true);
           else if (ev.status === "abandoned") note("This run has ended; it cannot be resumed.");
@@ -10155,6 +10471,286 @@
   }
 
   // =========================================================== connection
+  const launchParams = new URLSearchParams(location.search);
+  const launchShareToken = launchParams.get("share");
+  const launchShareError = launchParams.has("share-error");
+  const launchAction = launchParams.get("action");
+  const launchView = launchParams.get("view");
+  let launchRouteHandled = false;
+  function readPendingShareLaunch() {
+    try {
+      const pending = JSON.parse(sessionStorage.getItem("formless_pending_share_launch") || "null");
+      return pending && typeof pending.token === "string" && pending.token
+        && (pending.scope == null || typeof pending.scope === "string") ? pending : null;
+    } catch (_) { return null; }
+  }
+  function rememberPendingShareLaunch(token, scope = S.storageScope) {
+    if (typeof token !== "string" || !token) return false;
+    const previous = readPendingShareLaunch();
+    const boundScope = previous?.token === token && previous.scope ? previous.scope : scope || null;
+    try {
+      sessionStorage.setItem("formless_pending_share_launch", JSON.stringify({ token, scope: boundScope }));
+      return true;
+    } catch (_) { return false; }
+  }
+  function pendingShareLaunchForScope(scope) {
+    const pending = readPendingShareLaunch();
+    return pending ? { ...pending, scopeMismatch: !!pending.scope && pending.scope !== scope } : null;
+  }
+  function clearPendingShareLaunch(token) {
+    const pending = readPendingShareLaunch();
+    if (!pending || pending.token !== token) return false;
+    try { sessionStorage.removeItem("formless_pending_share_launch"); return true; } catch (_) { return false; }
+  }
+  if (launchShareToken) rememberPendingShareLaunch(launchShareToken, S.storageScope);
+
+  function openShareInbox() {
+    return new Promise((resolve, reject) => {
+      const open = indexedDB.open("formless-share-inbox", 1);
+      open.onupgradeneeded = () => {
+        if (!open.result.objectStoreNames.contains("shares")) open.result.createObjectStore("shares", { keyPath: "token" });
+      };
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => resolve(open.result);
+    });
+  }
+  async function readIncomingShare(token) {
+    const db = await openShareInbox();
+    try {
+      return await new Promise((resolve, reject) => {
+        const request = db.transaction("shares", "readonly").objectStore("shares").get(token);
+        request.onsuccess = () => resolve(request.result || null);
+        request.onerror = () => reject(request.error);
+      });
+    } finally { db.close(); }
+  }
+  async function storeIncomingShare(share) {
+    const db = await openShareInbox();
+    try {
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction("shares", "readwrite");
+        tx.objectStore("shares").put(share);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error("share storage aborted"));
+      });
+    } finally { db.close(); }
+  }
+  async function deleteIncomingShare(token) {
+    const db = await openShareInbox();
+    try {
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction("shares", "readwrite");
+        tx.objectStore("shares").delete(token);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error("share cleanup aborted"));
+      });
+    } finally { db.close(); }
+  }
+  function incomingShareText(share) {
+    const text = typeof share.text === "string" ? share.text : "";
+    const title = typeof share.title === "string" ? share.title : "";
+    const url = typeof share.url === "string" ? share.url : "";
+    const parts = [title, text].filter((part, index, values) => part && values.indexOf(part) === index);
+    if (url && !parts.includes(url) && !text.includes(url)) parts.push(url);
+    return parts.join("\n");
+  }
+  function incomingShareFile(value) {
+    if (typeof File !== "undefined" && value instanceof File) return value;
+    if (typeof File !== "undefined" && typeof Blob !== "undefined" && value instanceof Blob && typeof value.name === "string") {
+      return new File([value], value.name, { type: value.type });
+    }
+    return null;
+  }
+  async function applyIncomingShare(token, share, selected = { sessionId: S.current, scope: S.storageScope }) {
+    const hasFiles = Array.isArray(share.files) && share.files.length > 0;
+    const alreadyPending = S.shareApplyPending;
+    if (hasFiles) {
+      S.shareApplyPending = true;
+      renderComposer();
+    }
+    try { return await applyIncomingShareRecord(token, share, selected); }
+    finally {
+      if (hasFiles) {
+        S.shareApplyPending = alreadyPending;
+        renderComposer();
+      }
+    }
+  }
+  async function applyIncomingShareRecord(token, share, selected = { sessionId: S.current, scope: S.storageScope }) {
+    const record = { ...share, token, files: Array.isArray(share.files) ? share.files : [] };
+    const selectionIsCurrent = () => S.current === selected.sessionId && S.storageScope === selected.scope;
+    if (record.draftApplied && !record.draftSessionId) {
+      if (record.files.length) {
+        note("This shared item needs to be shared again because its original draft cannot be identified.", true);
+        return false;
+      }
+      return true;
+    }
+    if (record.draftSessionId) {
+      if (record.draftScope !== S.storageScope) {
+        note("This shared item belongs to a different Formless space; reopen that space to continue.", true);
+        return false;
+      }
+      if (S.current !== record.draftSessionId) {
+        if (!selectionIsCurrent()) {
+          note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+          return false;
+        }
+        if (!S.sessions.some((session) => session.id === record.draftSessionId)) await refreshSessions();
+        if (!selectionIsCurrent()) {
+          note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+          return false;
+        }
+        if (!S.sessions.some((session) => session.id === record.draftSessionId)) {
+          note("The Session for this shared draft is no longer available.", true);
+          return false;
+        }
+        await openSession(record.draftSessionId);
+      }
+    } else {
+      if (!selectionIsCurrent()) {
+        note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+        return false;
+      }
+      if (currentTopicAttempt()) {
+        const parent = topicForSession()?.topic_session_id;
+        if (parent) {
+          await openSession(parent);
+          if (S.current !== parent || S.storageScope !== selected.scope) {
+            note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+            return false;
+          }
+          if (S.sessionLoad?.id === parent && S.sessionLoad.status === "failed"
+            && !await openMainChat({ sessionId: parent, scope: selected.scope })) {
+            note("Main Chat couldn't be opened for this share; the share is still waiting.", true);
+            return false;
+          }
+        }
+      }
+      if (!S.current || currentTopicAttempt() || S.sessionLoad?.status === "failed") {
+        if (!await openMainChat({ sessionId: S.current, scope: S.storageScope })) {
+          note("Main Chat couldn't be opened for this share; the share is still waiting.", true);
+          return false;
+        }
+      }
+      if (!S.current || !S.storageScope || currentTopicAttempt() || S.sessionLoad?.status === "failed") return false;
+      record.draftSessionId = S.current;
+      record.draftScope = S.storageScope;
+      await storeIncomingShare(record);
+      if (S.current !== record.draftSessionId || S.storageScope !== record.draftScope) {
+        note("The selected Session changed while the share was being saved; reload to apply it safely.", true);
+        return false;
+      }
+    }
+    const destination = { sessionId: record.draftSessionId, scope: record.draftScope };
+    const destinationIsCurrent = () => S.current === destination.sessionId && S.storageScope === destination.scope;
+    if (!destinationIsCurrent()
+      || S.sessionLoad?.id === record.draftSessionId && S.sessionLoad.status === "failed") {
+      note("The destination Session for this share couldn't be opened; the share is still waiting.", true);
+      return false;
+    }
+    if (!record.draftApplied) {
+      const sharedText = incomingShareText(record);
+      if (sharedText) {
+        const input = $("input");
+        const wasLiteralSlashDraft = isSharedSlashDraft(destination.scope, destination.sessionId, input.value);
+        input.value = input.value ? input.value + (input.value.endsWith("\n") ? "" : "\n\n") + sharedText : sharedText;
+        if (!saveDraft(destination.sessionId, input.value, destination.scope)) {
+          note("Shared text couldn't be saved to this draft; reload to retry.", true);
+          return false;
+        }
+        if (wasLiteralSlashDraft || sharedText.trimStart().startsWith("/") && input.value.trimStart().startsWith("/")) {
+          rememberSharedSlashDraft(destination.scope, destination.sessionId, input.value);
+        }
+        autosize();
+        scheduleForecast();
+      }
+      record.draftApplied = true;
+      await storeIncomingShare(record);
+      if (!destinationIsCurrent()) {
+        note("The selected Session changed while the share was being saved; reload to finish safely.", true);
+        return false;
+      }
+    }
+    const files = record.files.map(incomingShareFile);
+    if (files.some((file) => !file)) {
+      return resolveFailedSharedFiles(token, record, destination, record.files, "Some shared files couldn't be restored");
+    }
+    record.files = await attachFiles(files, destination.sessionId, destination.scope);
+    await storeIncomingShare(record);
+    if (record.files.length) {
+      return resolveFailedSharedFiles(token, record, destination, record.files, "Some shared files couldn't be attached");
+    }
+    clearShareAttachmentFailure(token, destination.scope, destination.sessionId);
+    return true;
+  }
+  function stripLaunchParams(keys) {
+    const url = new URL(location.href);
+    for (const key of keys) url.searchParams.delete(key);
+    history.replaceState(history.state, "", url.pathname + url.search + url.hash);
+  }
+  async function handleLaunchRoute() {
+    if (launchRouteHandled) return;
+    launchRouteHandled = true;
+    if (launchAction === "main-chat" && await openMainChat()) stripLaunchParams(["action"]);
+    if (launchShareError) {
+      note("Shared content couldn't be saved. Please share it again.", true);
+      stripLaunchParams(["share-error"]);
+    }
+    const pendingShare = pendingShareLaunchForScope(S.storageScope);
+    const shareToken = launchShareToken || (pendingShare && !pendingShare.scopeMismatch ? pendingShare.token : null);
+    const shareBlockedByScope = !!(pendingShare?.scopeMismatch && (!launchShareToken || pendingShare.token === launchShareToken));
+    const shareLaunchActive = !!shareToken && !shareBlockedByScope;
+    if (shareBlockedByScope) {
+      note("This pending share belongs to a different Formless space; reopen that space to continue.", true);
+    } else if (shareToken) {
+      rememberPendingShareLaunch(shareToken, S.storageScope);
+      const selected = { sessionId: S.current, scope: S.storageScope };
+      try {
+        const share = await readIncomingShare(shareToken);
+        if (!share) {
+          note("This shared content is no longer available. Share it again.", true);
+          clearPendingShareLaunch(shareToken);
+          stripLaunchParams(["share"]);
+        }
+        else if (S.current !== selected.sessionId || S.storageScope !== selected.scope) {
+          note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+        }
+        else {
+          const confirmed = share.requiresConfirmation === false || await ask({
+            title: "Confirm shared content",
+            text: "The browser did not provide enough request metadata to verify this share. Add its text and files to the Chat draft? Discarding removes it. Nothing is sent automatically.",
+            ok: "Add to draft",
+            cancelLabel: "Discard share",
+          });
+          if (!confirmed) {
+            await deleteIncomingShare(shareToken);
+            clearPendingShareLaunch(shareToken);
+            stripLaunchParams(["share"]);
+            note("Shared content was discarded; no draft was changed.");
+          } else if (await applyIncomingShare(shareToken, share, selected)) {
+            await deleteIncomingShare(shareToken);
+            clearPendingShareLaunch(shareToken);
+            stripLaunchParams(["share"]);
+          }
+        }
+      } catch (error) {
+        note("Shared content couldn't be added to this draft: " + (error?.message || "storage is unavailable"), true);
+      }
+    }
+    if (launchView === "approvals") {
+      if (!shareLaunchActive) setView("approvals");
+      stripLaunchParams(["view"]);
+    }
+    if (shareLaunchActive) setView("chat");
+    if (launchAction === "focus-pending") {
+      focusPending();
+      stripLaunchParams(["action"]);
+    }
+  }
+
   async function loadAll() {
     if (runningPanelExposed()) refreshRunning("exposure");
     await refreshSessions();
@@ -10172,6 +10768,7 @@
     refreshProposals();
     refreshModelStats();
     refreshSettings();
+    await handleLaunchRoute();
   }
 
   /** The page can hold the pairing secret only over HTTPS or on this
@@ -10238,12 +10835,33 @@
     void flushOutbox();
     loadAll();
   }
+  function resetRelayConnection(ws, reason, disposeTransport = false) {
+    if (ws && S.ws !== ws) return false;
+    S.daemonOnline = false;
+    S.channel = null;
+    S.relayActivityAt = null;
+    clearTimeout(S.handshakeTimer);
+    if (disposeTransport) {
+      S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
+      if (S.relayLink && (!ws || S.relayLink.ws === ws)) {
+        S.relayLink.endpoint.dispose();
+        S.relayLink = null;
+      }
+    }
+    clearLiveState();
+    for (const p of S.pending.values()) p.reject(new Error(reason));
+    S.pending.clear();
+    return true;
+  }
   function openRelay() {
     S.local = false;
-    if (S.relayLink) S.relayLink.endpoint.dispose();
-    S.relayLink = null;
-    S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
-    S.channel = null;
+    if (S.ws || S.channel || S.relayLink || S.pending.size || S.daemonOnline) {
+      resetRelayConnection(S.ws, "relay connection replaced", true);
+    } else {
+      S.daemonOnline = false;
+      S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
+      S.channel = null;
+    }
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(proto + "//" + location.host + "/relay/" + S.room + "?role=client&transport=1");
     S.ws = ws;
@@ -10291,7 +10909,9 @@
           });
           S.relayLink = { ws, endpoint };
         }
-        S.relayLink.endpoint.receive(frame);
+        const endpoint = S.relayLink.endpoint;
+        endpoint.receive(frame);
+        if (!endpoint.closed) S.relayActivityAt = typeof performance !== "undefined" ? performance.now() : Date.now();
       } catch (_) { try { ws.close(1008, "relay transport failed"); } catch (_) {} }
     };
     async function onFrame(ws, frame) {
@@ -10302,11 +10922,7 @@
         S.daemonOnline = online;
         if (online && !was) startHandshake();
         if (!online && was) {
-          S.channel = null;
-          clearTimeout(S.handshakeTimer);
-          clearLiveState();
-          for (const p of S.pending.values()) p.reject(new Error("daemon went offline"));
-          S.pending.clear();
+          resetRelayConnection(ws, "daemon went offline");
           note("daemon went offline", true);
         }
         renderChrome();
@@ -10367,13 +10983,7 @@
         $("pair-error").textContent = "This browser was disconnected by the daemon. Connect again to rejoin.";
         showPair();
       }
-      S.daemonOnline = false;
-      S.channel = null;
-      S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
-      if (S.relayLink && S.relayLink.ws === ws) S.relayLink.endpoint.dispose();
-      clearLiveState();
-      for (const p of S.pending.values()) p.reject(new Error("relay connection closed"));
-      S.pending.clear();
+      resetRelayConnection(ws, "relay connection closed", true);
       if (!$("app").classList.contains("hidden")) renderAll();
       if (S.userClosed) return;
       // Reconnect with backoff; the relay and daemon are both stateless here.
@@ -10482,9 +11092,50 @@
     renderChrome();
   }
   setInterval(() => { if (S.reconnect) renderChrome(); }, 1000);
-  // A heartbeat, so the daemon can tell a vanished browser from an idle
-  // one and drop it from its device list (#910).
-  setInterval(() => { if (S.channel && !S.local) request({ type: "ping" }, 20000).catch(() => {}); }, 60000);
+  const RELAY_PROBE_INTERVAL_MS = 10000;
+  const RELAY_PROBE_TIMEOUT_MS = 15000;
+  let relayProbe = null;
+  let relayResume = null;
+  function probeRelay() {
+    if (!S.channel || S.local || !S.relayReady || S.userClosed || S.ws?.readyState !== 1 || navigator.onLine === false) return Promise.resolve(false);
+    if (relayProbe) return relayProbe;
+    const ws = S.ws, channel = S.channel;
+    relayProbe = request({ type: "ping" }, RELAY_PROBE_TIMEOUT_MS, true)
+      .then(() => S.ws === ws && S.channel === channel)
+      .catch(() => {
+        if (S.ws !== ws || S.channel !== channel) return false;
+        note("relay probe failed; reconnecting", true);
+        try { openRelay(); }
+        catch (error) {
+          note("Could not replace the relay connection: " + error.message, true);
+          if (S.ws === ws && !S.reconnect) scheduleReconnect(() => {
+            if (!S.userClosed && S.ws === ws) openRelay();
+          });
+        }
+        try { if (ws.readyState === 1) ws.close(4003, "heartbeat timeout"); } catch (_) {}
+        return false;
+      })
+      .finally(() => { relayProbe = null; });
+    return relayProbe;
+  }
+  function resumeRelayAfterReturn() {
+    if (relayResume) return relayResume;
+    relayResume = (async () => {
+      if (document.hidden || S.local || S.userClosed || navigator.onLine === false) return;
+      if (S.reconnect) { retryNow(); return; }
+      if (S.key && (!S.ws || S.ws.readyState === 3)) { openRelay(); return; }
+      const ws = S.ws, channel = S.channel, session = S.current;
+      if (!await probeRelay() || S.ws !== ws || S.channel !== channel || document.hidden || S.current !== session) return;
+      if (session) await openSession(session, true);
+      else await loadAll();
+    })()
+      .catch(error => { note("Could not refresh the Session after returning: " + error.message, true); })
+      .finally(() => { relayResume = null; });
+    return relayResume;
+  }
+  setInterval(() => {
+    if (!document.hidden && S.channel && !S.local && S.relayReady) void probeRelay();
+  }, RELAY_PROBE_INTERVAL_MS);
 
   function showPair() {
     $("app").classList.add("hidden");
@@ -10599,18 +11250,20 @@
       return null;
     }
   }
-  async function attachFiles(files) {
-    if (currentTopicAttempt()) return;
-    const sid = S.current;
-    if (!sid) { note("Open a session first", true); return; }
+  async function attachFiles(files, sessionId = S.current, storageScope = S.storageScope) {
+    if (sessionId === S.current && currentTopicAttempt()) return files;
+    const sid = sessionId;
+    if (!sid) { note("Open a session first", true); return files; }
+    const failed = [];
     for (const file of files) {
       const r = await uploadFile(sid, file);
       if (r) {
         (S.chips[sid] = S.chips[sid] || []).push(r);
         if (S.current === sid) renderChips();
-      }
+      } else failed.push(file);
     }
-    await refreshAttachmentInventory(sid);
+    await refreshAttachmentInventory(sid, storageScope);
+    return failed;
   }
   /** A sent message's attachments by name; one retention removed says
    * so instead of vanishing (#858). */
@@ -10675,7 +11328,7 @@
     if (files.length) { e.preventDefault(); attachFiles(files); }
   });
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); submit(false); });
-  $("input").addEventListener("input", () => { if (!S.editMessageId) saveDraft(S.current, $("input").value); palette.sel = 0; autosize(); updatePalette(); updateMentions(); scheduleForecast(); });
+  $("input").addEventListener("input", () => { if (!S.editMessageId) { clearEditedSharedSlashDraft(S.storageScope, S.current, $("input").value); saveDraft(S.current, $("input").value); } palette.sel = 0; autosize(); updatePalette(); updateMentions(); scheduleForecast(); });
   $("input").addEventListener("blur", () => setTimeout(() => { closeMentions(); closePalette(); }, 100));
   $("input").addEventListener("keydown", (e) => {
     if (e.isComposing || e.keyCode === 229) return;
@@ -10695,9 +11348,10 @@
   });
   document.addEventListener("click", (e) => {
     if (popover && !popover.contains(e.target)) closePopover();
-    // A modal click belongs to that layer, including a button that removed
-    // its dialog before this event bubbled. Do not dismiss background drawers.
-    if (e.composedPath().some((node) => node instanceof Element && node.classList.contains("backdrop"))) return;
+    // Modal and notification clicks belong to their own layers, including a
+    // button that removes its layer before bubbling. Leave the drawer alone.
+    if (e.composedPath().some((node) => node instanceof Element &&
+        (node.classList.contains("backdrop") || node.id === "toasts"))) return;
     const sb = $("sidebar");
     if (sb.classList.contains("open") && !sb.contains(e.target) && e.target !== $("menu-btn")) closeSidebar();
   });

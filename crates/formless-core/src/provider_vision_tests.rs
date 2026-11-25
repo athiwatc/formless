@@ -24,6 +24,9 @@ fn cases() -> Vec<(&'static str, bool)> {
         ("o3", true),
         ("openai/o4-mini", true),
         ("gpt-4o", true),
+        ("my-gemini-embed", false),
+        ("gemini-embedding-001", false),
+        ("my-claude-3-haiku", false),
         // Preserve broad unknown-family fallback without confusing 20 with 2
         // or minimax with mini. These fixture IDs make no availability claim.
         ("claude-20-fixture", true),
@@ -68,6 +71,33 @@ fn explicit_vision_overrides_and_prompt_tool_policy_are_retained() {
     assert!(Provider::new(cfg, "fixture-key".into())
         .unwrap()
         .sends_images("claude-3-haiku"));
+}
+
+#[test]
+fn per_model_vision_corrections_precede_global_and_family_defaults() {
+    let cfg = ProviderCfg {
+        vision: Some(true),
+        model_meta: Box::new(HashMap::from([
+            (
+                "gpt-5".into(),
+                crate::config::ModelMetaCfg {
+                    vision: Some(false),
+                    ..Default::default()
+                },
+            ),
+            (
+                "custom".into(),
+                crate::config::ModelMetaCfg {
+                    vision: Some(true),
+                    ..Default::default()
+                },
+            ),
+        ])),
+        ..Default::default()
+    };
+    let provider = Provider::new(cfg, "fixture-key".into()).unwrap();
+    assert!(!provider.sends_images("gpt-5"));
+    assert!(provider.sends_images("custom"));
 }
 
 fn image_count(value: &Value) -> usize {

@@ -3,6 +3,7 @@ use formless_protocol::*;
 use formless_runtime::LockExt as _;
 use formless_runtime::{Capabilities, ExecErrorKind, ExecRequest, HostMode, HostOps};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -51,6 +52,14 @@ const CLIENT_QUEUE: usize = 4096;
 /// reading.
 const MAX_FRAME: usize = formless_protocol::MAX_FRAME_BYTES;
 const MODEL_DOWNLOAD_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+fn model_download_notice(spec: &ModelSpec) -> String {
+    format!(
+        "Downloading optional session-naming model {} ({}). Session titles use a heuristic until it is installed.",
+        spec.id,
+        namer::display_size(spec.gguf_bytes)
+    )
+}
 
 /// Session-update recency, independent of list pin/archive grouping. This is
 /// not measured model-use history; equal stored timestamps use Session IDs.
@@ -838,6 +847,8 @@ pub struct Daemon {
     run_publication_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     run_final_decision_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    model_download_test_spec: StdMutex<Option<ModelSpec>>,
     /// Fires when an approval or question starts waiting on the user (the
     /// relay turns it into a Web Push, SPEC §12).
     pub(crate) attention: tokio::sync::broadcast::Sender<()>,
@@ -1079,6 +1090,12 @@ impl Daemon {
         // tell every client that connects this lifetime.
         let mut startup_warnings = Vec::new();
         if !offline && paths.config_file().exists() {
+            if let Ok(unknown) = crate::config::unknown_keys_from_file(&paths.config_file()) {
+                for key in unknown {
+                    tracing::warn!("{}: {}", paths.config_file().display(), key);
+                }
+            }
+            let _ = Config::persist_naming_download_migration(&paths);
             if let Ok(mut cfg) = Config::load_file_only(&paths) {
                 if let Some(w) = cfg.migrate_global_auto() {
                     if cfg.save(&paths).is_ok() {
@@ -1136,6 +1153,8 @@ impl Daemon {
             run_publication_test: StdMutex::new(None),
             #[cfg(test)]
             run_final_decision_test: StdMutex::new(None),
+            #[cfg(test)]
+            model_download_test_spec: StdMutex::new(None),
             attention: tokio::sync::broadcast::channel(16).0,
             relay_clients: StdMutex::new(Default::default()),
             uploads: StdMutex::new(HashMap::new()),
@@ -3981,10 +4000,6 @@ impl Daemon {
                     .into_iter()
                     .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|m| (m.to_string(), v)))
                     .collect();
-                for m in &models {
-                    meta.entry(m.clone())
-                        .or_insert_with(|| crate::provider::known_model_meta(m));
-                }
                 let roles: Vec<_> = cfg
                     .roles
                     .iter()
@@ -3996,6 +4011,23 @@ impl Daemon {
                     .collect();
                 let sessions = self.with_reader(|st| st.list_sessions())?;
                 let recent = recent_session_models(&sessions);
+                for model in models
+                    .iter()
+                    .chain(&recent)
+                    .chain(cfg.provider.aliases.keys())
+                    .chain(cfg.provider.model_meta.keys())
+                {
+                    let resolved = cfg.provider.resolve_alias(model);
+                    let mut model_meta = meta
+                        .get(&resolved)
+                        .or_else(|| meta.get(model))
+                        .cloned()
+                        .unwrap_or_else(|| crate::provider::known_model_meta(&resolved));
+                    if let Some(override_cfg) = cfg.provider.model_meta.get(&resolved) {
+                        crate::provider::apply_model_meta_override(&mut model_meta, override_cfg);
+                    }
+                    meta.insert(model.clone(), model_meta);
+                }
                 Ok(json!({
                     "models": models,
                     "meta": meta,
@@ -4457,10 +4489,7 @@ impl Daemon {
                 Ok(serde_json::to_value(imported)?)
             }
             Request::StorageUsage => {
-                let mut u = self.with_reader(|st| crate::housekeeping::usage(&self.paths, st))?;
-                u["last_backup"] = json!(crate::housekeeping::last_backup(&self.paths)
-                    .map(|(f, _)| f.display().to_string()));
-                Ok(u)
+                self.with_reader(|st| crate::housekeeping::storage_usage(&self.paths, st))
             }
             Request::Gc { dry_run } => {
                 let cfg = self.config()?;
@@ -4910,7 +4939,7 @@ impl Daemon {
                 }
             }
             Request::ListTools => Ok(serde_json::to_value(
-                self.with_reader(|s| s.list_tools(true))?,
+                self.with_reader(|s| s.list_tool_summaries(true))?,
             )?),
             Request::ListModules => Ok(serde_json::to_value(
                 self.with_reader(|s| s.list_modules())?,
@@ -5392,7 +5421,7 @@ impl Daemon {
                 let _ = tx.decision.send((action.clone(), arguments));
                 Ok(json!({"step_id": step_id, "action": action}))
             }
-            Request::ImportAll { bundle } => self.import_all(&bundle).await,
+            Request::ImportAll { bundle } => Box::pin(self.import_all(&bundle)).await,
             Request::RunOptimiser { tool_id } => {
                 let this = self.clone();
                 tokio::spawn(async move {
@@ -7166,12 +7195,20 @@ impl Daemon {
             return;
         };
         let spec = cfg.naming.spec();
+        #[cfg(test)]
+        let spec = {
+            let test_spec = *self
+                .model_download_test_spec
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            test_spec.or(spec)
+        };
         if let Some(spec) = spec {
             if cfg.naming.auto_download
                 && namer::embedded_available()
                 && !spec.installed(&self.paths)
             {
-                self.spawn_model_download(spec);
+                self.spawn_model_download(spec, session_id);
             }
         }
         let this = self.clone();
@@ -7390,7 +7427,7 @@ impl Daemon {
         Ok(())
     }
 
-    fn spawn_model_download(self: &Arc<Self>, spec: ModelSpec) {
+    fn spawn_model_download(self: &Arc<Self>, spec: ModelSpec, session_id: &str) {
         let Ok(mut retry_at) = self.model_download.clone().try_lock_owned() else {
             return;
         };
@@ -7398,12 +7435,17 @@ impl Daemon {
             return;
         }
         let this = self.clone();
+        let session_id = session_id.to_string();
         tokio::spawn(async move {
             tracing::info!(
-                "downloading session-naming model {} ({} MB)",
+                "downloading session-naming model {} ({})",
                 spec.id,
-                spec.gguf_bytes / 1_000_000
+                namer::display_size(spec.gguf_bytes)
             );
+            this.broadcast(Event::Note {
+                session_id: Some(session_id.clone()),
+                text: model_download_notice(&spec),
+            });
             let result = tokio::select! {
                 _ = this.shutdown.cancelled() => return,
                 result = namer::download(&this.paths, &spec) => result,
@@ -7411,11 +7453,23 @@ impl Daemon {
             if let Err(e) = result {
                 *retry_at = Some(tokio::time::Instant::now() + MODEL_DOWNLOAD_COOLDOWN);
                 tracing::warn!("session-naming model download failed: {e:#}");
+                this.broadcast(Event::Note {
+                    session_id: Some(session_id),
+                    text: "Session-naming model download failed; titles will continue using a heuristic.".into(),
+                });
                 return;
             }
             *retry_at = None;
             drop(retry_at);
             tracing::info!("session-naming model {} installed", spec.id);
+            this.broadcast(Event::Note {
+                session_id: Some(session_id),
+                text: format!(
+                    "Session-naming model {} is installed ({})",
+                    spec.id,
+                    namer::display_size(spec.gguf_bytes)
+                ),
+            });
             // Sessions titled by the heuristic while it downloaded
             // get a real title now (#871).
             let ids = this
@@ -10363,6 +10417,15 @@ impl Daemon {
 
     /// Load a `formless.session/1` bundle as a new Session.
     fn import_session_bundle(&self, bundle: &Value) -> Result<SessionInfo> {
+        self.import_session_bundle_with_fingerprint(bundle, None)
+            .map(|(session, _)| session)
+    }
+
+    fn import_session_bundle_with_fingerprint(
+        &self,
+        bundle: &Value,
+        fingerprint: Option<&str>,
+    ) -> Result<(SessionInfo, bool)> {
         if bundle["format"].as_str() != Some("formless.session/1") {
             return Err(anyhow!("unsupported session bundle format"));
         }
@@ -10398,20 +10461,141 @@ impl Daemon {
             .enumerate()
             .map(|(index, message)| message["seq"].as_i64().unwrap_or(index as i64 + 1))
             .collect();
-        let s = self.with_store(|st| {
+        self.with_store(|st| {
             st.transaction(|st| {
-                let s = st.import_session(
+                if let Some(fingerprint) = fingerprint {
+                    if let Some(session_id) = st.imported_session_for_fingerprint(fingerprint)? {
+                        let session = st
+                            .get_session(&session_id)?
+                            .context("recorded imported session disappeared")?;
+                        return Ok((session, false));
+                    }
+                }
+                let session = st.import_session(
                     bundle["name"].as_str().unwrap_or("Imported"),
                     bundle["model"].as_str().map(str::to_string),
                     bundle["reasoning_effort"].as_str().map(str::to_string),
                     &messages,
                     &checkpoints,
                 )?;
-                st.import_session_plan_bundle(&s.id, bundle, &source_seqs)?;
-                Ok(s)
+                st.import_session_plan_bundle(&session.id, bundle, &source_seqs)?;
+                if let Some(fingerprint) = fingerprint {
+                    st.remember_imported_session_fingerprint(fingerprint, &session.id)?;
+                }
+                Ok((session, true))
             })
-        })?;
-        Ok(s)
+        })
+    }
+
+    fn import_session_identity(bundle: &Value) -> Result<Value> {
+        let raw_messages = bundle["messages"].as_array().cloned().unwrap_or_default();
+        let mut source_positions = BTreeMap::new();
+        let mut previous_seq = 0;
+        for (index, message) in raw_messages.iter().enumerate() {
+            let source_seq = message["seq"].as_i64().unwrap_or(index as i64 + 1);
+            if source_seq <= previous_seq
+                || source_positions
+                    .insert(source_seq, index as i64 + 1)
+                    .is_some()
+            {
+                bail!("Imported message sequence mapping is ambiguous or out of order");
+            }
+            previous_seq = source_seq;
+        }
+        let messages = raw_messages
+            .iter()
+            .map(|message| {
+                json!({
+                    "role": message["role"].as_str().unwrap_or("user"),
+                    "content": message["content"].as_str().unwrap_or_default(),
+                    "meta": crate::storage::sanitize_imported_message_meta(message["meta"].as_str()),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut checkpoints = bundle["checkpoints"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, checkpoint)| {
+                let up_to_seq = checkpoint["up_to_seq"].as_i64().unwrap_or(0);
+                (
+                    up_to_seq,
+                    index,
+                    json!({
+                        "summary": checkpoint["summary"].as_str().unwrap_or_default(),
+                        "up_to_seq": up_to_seq,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        checkpoints.sort_by_key(|(up_to_seq, index, _)| (*up_to_seq, *index));
+        let checkpoints = checkpoints
+            .into_iter()
+            .map(|(_, _, checkpoint)| checkpoint)
+            .collect::<Vec<_>>();
+        let current_plan = bundle
+            .get("plan")
+            .map(crate::storage::portable_plan)
+            .transpose()?
+            .unwrap_or_default();
+        let has_current_plan = bundle.get("plan").is_some() || bundle.get("plan_state").is_some();
+        if bundle.get("plan_history").is_some() && !has_current_plan {
+            bail!("Plan history requires an explicit current plan or plan_state; history-only imports are ambiguous");
+        }
+        let mut plan_history = BTreeMap::<i64, Vec<PlanItem>>::new();
+        if let Some(history) = bundle.get("plan_history") {
+            let history = history
+                .as_array()
+                .context("plan_history must be an array")?;
+            if history.len() > raw_messages.len() + 1 {
+                bail!("Plan history exceeds retained message boundaries");
+            }
+            let mut seen = BTreeSet::new();
+            for revision in history {
+                let source_seq = revision["anchor_seq"]
+                    .as_i64()
+                    .context("Plan revision boundary required")?;
+                if !seen.insert(source_seq) {
+                    bail!("Duplicate plan revision boundary");
+                }
+                let anchor = if source_seq == 0 {
+                    0
+                } else {
+                    *source_positions
+                        .get(&source_seq)
+                        .context("Plan revision points outside imported messages")?
+                };
+                let items = crate::storage::portable_plan(&revision["items"])?;
+                plan_history.insert(anchor, items);
+            }
+        }
+        if has_current_plan {
+            plan_history.insert(raw_messages.len() as i64, current_plan.clone());
+        }
+        if plan_history.values().all(|items| items.is_empty()) {
+            plan_history.clear();
+        }
+        let plan_history = plan_history
+            .into_iter()
+            .map(|(anchor, items)| json!({"anchor": anchor, "items": items}))
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "name": bundle["name"].as_str().unwrap_or("Imported"),
+            "model": bundle.get("model").and_then(Value::as_str),
+            "reasoning_effort": bundle.get("reasoning_effort").and_then(Value::as_str),
+            "messages": messages,
+            "checkpoints": checkpoints,
+            "plan": current_plan,
+            "plan_history": plan_history,
+        }))
+    }
+
+    fn import_session_fingerprint(identity: &Value) -> Result<String> {
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(identity)?)
+        ))
     }
 
     /// `ExportAll` (SPEC §15): one bundle for a new machine.
@@ -10449,7 +10633,7 @@ impl Daemon {
             .with_reader(|st| st.list_jobs())?
             .into_iter()
             .filter(|j| j.cron.is_some())
-            .map(|j| json!({"prompt": j.prompt, "cron": j.cron, "overlap": j.overlap, "deliver": j.deliver, "enabled": j.enabled}))
+            .map(|j| json!({"prompt": j.prompt, "session_id": j.source_session_id.as_ref().or(j.session_id.as_ref()), "cron": j.cron, "overlap": j.overlap, "deliver": j.deliver, "enabled": j.enabled}))
             .collect();
         let (config, blanked) = self.config()?.portable();
         let mut out = json!({
@@ -10487,22 +10671,44 @@ impl Daemon {
         }
         let list = |k: &str| bundle[k].as_array().cloned().unwrap_or_default();
         let mut failed: Vec<String> = Vec::new();
+        let kinds = [
+            "providers",
+            "roles",
+            "mcp_servers",
+            "modules",
+            "tools",
+            "skills",
+            "memories",
+            "jobs",
+            "sessions",
+        ];
+        let mut added = kinds
+            .iter()
+            .map(|kind| ((*kind).to_string(), 0usize))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut skipped_existing = added.clone();
+        let count = |counts: &mut std::collections::BTreeMap<String, usize>, kind: &str| {
+            *counts.entry(kind.to_string()).or_default() += 1;
+        };
         // Config first (providers and Roles the Tools may name), then
         // modules (Tools load them), then the rest.
         let incoming: Config = serde_json::from_value(bundle["config"].clone()).unwrap_or_default();
-        let (mut providers, mut roles, mut servers) = (0, 0, 0);
         let mut server_review = Vec::new();
         self.with_config_edit(|cfg| {
             for (k, v) in incoming.providers {
                 if !cfg.providers.contains_key(&k) {
                     cfg.providers.insert(k, v);
-                    providers += 1;
+                    count(&mut added, "providers");
+                } else {
+                    count(&mut skipped_existing, "providers");
                 }
             }
             for (k, v) in incoming.roles {
                 if !cfg.roles.contains_key(&k) {
                     cfg.roles.insert(k, v);
-                    roles += 1;
+                    count(&mut added, "roles");
+                } else {
+                    count(&mut skipped_existing, "roles");
                 }
             }
             for (k, mut v) in incoming.mcp.servers {
@@ -10511,15 +10717,16 @@ impl Daemon {
                     v.trusted = false;
                     server_review.push(json!({"name":k, "target":crate::mcp_catalog::safe_target(&v), "disabled":true, "trusted":false}));
                     cfg.mcp.servers.insert(k, v);
-                    servers += 1;
+                    count(&mut added, "mcp_servers");
+                } else {
+                    count(&mut skipped_existing, "mcp_servers");
                 }
             }
-            Ok(providers + roles + servers > 0)
+            Ok(added["providers"] + added["roles"] + added["mcp_servers"] > 0)
         })?;
-        if providers + roles + servers > 0 {
+        if added["providers"] + added["roles"] + added["mcp_servers"] > 0 {
             self.broadcast(Event::McpServersChanged);
         }
-        let mut modules = 0;
         for m in list("modules") {
             let (Some(name), Some(code)) = (m["name"].as_str(), m["code"].as_str()) else {
                 continue;
@@ -10528,6 +10735,7 @@ impl Daemon {
                 .with_reader(|st| st.get_module_by_name(name))?
                 .is_some()
             {
+                count(&mut skipped_existing, "modules");
                 continue;
             }
             match self.with_store(|st| {
@@ -10538,17 +10746,22 @@ impl Daemon {
                     "import",
                 )
             }) {
-                Ok(_) => modules += 1,
+                Ok(_) => count(&mut added, "modules"),
                 Err(e) => failed.push(format!("module {name}: {e}")),
             }
         }
         let cfg = self.config()?;
-        let mut tools = 0;
         let mut capability_families = std::collections::BTreeMap::<String, usize>::new();
         for t in list("tools") {
+            if let Some(name) = t["name"].as_str() {
+                if self.with_reader(|st| st.get_tool_by_name(name))?.is_some() {
+                    count(&mut skipped_existing, "tools");
+                    continue;
+                }
+            }
             match self.import_one_tool(&t, &cfg).await {
                 Ok(_) => {
-                    tools += 1;
+                    count(&mut added, "tools");
                     for cap in t["capabilities"]
                         .as_array()
                         .into_iter()
@@ -10563,31 +10776,120 @@ impl Daemon {
                 Err(e) => failed.push(format!("tool {}: {e}", t["name"].as_str().unwrap_or("?"))),
             }
         }
-        let mut skills = 0;
         for b in list("skills") {
-            let res = crate::skills::prepare_bundle(&self.paths, &b).and_then(|staged| {
-                self.with_store(|st| crate::skills::commit(&self.paths, st, &staged, "import"))
-            });
-            match res {
-                Ok(_) => skills += 1,
-                Err(e) => failed.push(format!("skill {}: {e}", b["name"].as_str().unwrap_or("?"))),
+            let bundle_name = b["name"].as_str().unwrap_or("?").to_string();
+            match crate::skills::prepare_bundle(&self.paths, &b) {
+                Ok(staged) => {
+                    let name = staged.meta.name.clone();
+                    match self.with_store(|st| {
+                        if st.get_skill(&name)?.is_some() {
+                            Ok(false)
+                        } else {
+                            crate::skills::commit(&self.paths, st, &staged, "import")?;
+                            Ok(true)
+                        }
+                    }) {
+                        Ok(true) => count(&mut added, "skills"),
+                        Ok(false) => count(&mut skipped_existing, "skills"),
+                        Err(e) => failed.push(format!("skill {name}: {e}")),
+                    }
+                }
+                Err(e) => failed.push(format!("skill {bundle_name}: {e}")),
             }
         }
-        let mut memories = 0;
+        let mut memory_keys = self.with_reader(|st| {
+            Ok(st
+                .list_memories()?
+                .into_iter()
+                .map(|memory| (memory.scope, crate::memory::dedup_key(&memory.text)))
+                .collect::<std::collections::BTreeSet<_>>())
+        })?;
         for m in list("memories") {
             let text = m["text"].as_str().unwrap_or_default();
             let scope = m["scope"].as_str().unwrap_or("global");
+            let key = (scope.to_string(), crate::memory::dedup_key(text));
+            if !memory_keys.insert(key.clone()) {
+                count(&mut skipped_existing, "memories");
+                continue;
+            }
             match self.with_store(|st| st.add_memory(text, scope, "import", None)) {
-                Ok((_, true)) => memories += 1,
-                Ok(_) => {}
-                Err(e) => failed.push(format!("memory: {e}")),
+                Ok((_, true)) => count(&mut added, "memories"),
+                Ok(_) => count(&mut skipped_existing, "memories"),
+                Err(e) => {
+                    memory_keys.remove(&key);
+                    failed.push(format!("memory: {e}"));
+                }
             }
         }
-        let mut jobs = 0;
-        for j in list("jobs") {
+        let delivery_identity = |deliver: Option<&Value>| {
+            deliver
+                .filter(|value| {
+                    !value.is_null() && !value.as_object().is_some_and(|object| object.is_empty())
+                })
+                .map(Value::to_string)
+                .unwrap_or_default()
+        };
+        let incoming_jobs = list("jobs");
+        let has_importable_job = incoming_jobs
+            .iter()
+            .any(|job| job["prompt"].as_str().is_some() && job["cron"].as_str().is_some());
+        let mut job_identities = if has_importable_job {
+            self.with_reader(|st| {
+                let jobs = st.list_jobs()?;
+                let target_session_ids = jobs
+                    .iter()
+                    .filter(|job| job.cron.is_some())
+                    .filter_map(|job| job.session_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let mut existing_session_ids = std::collections::BTreeSet::new();
+                for id in target_session_ids {
+                    if st.get_session(&id)?.is_some() {
+                        existing_session_ids.insert(id);
+                    }
+                }
+                let mut identities = std::collections::BTreeSet::new();
+                for job in jobs {
+                    let Some(cron) = job.cron else {
+                        continue;
+                    };
+                    if job
+                        .session_id
+                        .as_ref()
+                        .is_some_and(|target| !existing_session_ids.contains(target))
+                    {
+                        continue;
+                    }
+                    identities.insert((
+                        job.source_session_id.or(job.session_id),
+                        job.prompt,
+                        cron,
+                        job.overlap,
+                        delivery_identity(job.deliver.as_ref()),
+                    ));
+                }
+                Ok(identities)
+            })?
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        for j in incoming_jobs {
             let (Some(prompt), Some(cron)) = (j["prompt"].as_str(), j["cron"].as_str()) else {
                 continue;
             };
+            let session_id = j["session_id"].as_str().map(str::to_string);
+            let overlap = j["overlap"].as_str().unwrap_or("skip").to_string();
+            let delivery = delivery_identity(j.get("deliver"));
+            let identity = (
+                session_id.clone(),
+                prompt.to_string(),
+                cron.to_string(),
+                overlap.clone(),
+                delivery.clone(),
+            );
+            if job_identities.contains(&identity) {
+                count(&mut skipped_existing, "jobs");
+                continue;
+            }
             let next = crate::jobs::first_run(Some(cron), None, chrono::Local::now())
                 .ok()
                 .map(|t| t.to_rfc3339());
@@ -10596,25 +10898,98 @@ impl Daemon {
                 continue;
             };
             let made = self.with_store(|st| {
-                let job = st.create_job(prompt, None, Some(cron), &next, true, "import")?;
-                st.set_job_options(
-                    &job.id,
-                    j["overlap"].as_str(),
-                    (!j["deliver"].is_null()).then_some(&j["deliver"]),
-                )?;
-                // Paused: review, then enable on this machine.
-                st.set_job_enabled(&job.id, false)?;
-                Ok(())
+                st.transaction(|st| {
+                    let job = st.create_job(prompt, None, Some(cron), &next, true, "import")?;
+                    if let Some(source_session_id) = session_id.as_deref() {
+                        st.set_job_source_session_id(&job.id, source_session_id)?;
+                    }
+                    st.set_job_options(
+                        &job.id,
+                        j["overlap"].as_str(),
+                        (!j["deliver"].is_null()).then_some(&j["deliver"]),
+                    )?;
+                    // Paused: review, then enable on this machine.
+                    st.set_job_enabled(&job.id, false)?;
+                    Ok(())
+                })
             });
             match made {
-                Ok(()) => jobs += 1,
+                Ok(()) => {
+                    count(&mut added, "jobs");
+                    job_identities.insert(identity);
+                }
                 Err(e) => failed.push(format!("job {cron}: {e}")),
             }
         }
-        let mut sessions = 0;
-        for b in list("sessions") {
-            match self.import_session_bundle(&b) {
-                Ok(_) => sessions += 1,
+        let sessions = list("sessions");
+        let mut session_identities = BTreeMap::new();
+        if !sessions.is_empty() {
+            for session in self.with_reader(|st| st.list_sessions())? {
+                let Ok(exported) = self.session_bundle(&session.id) else {
+                    continue;
+                };
+                let Ok(identity) = Self::import_session_identity(&exported) else {
+                    continue;
+                };
+                session_identities
+                    .entry(serde_json::to_string(&identity)?)
+                    .or_insert(session.id);
+            }
+        }
+        let mut seen_session_fingerprints = BTreeSet::new();
+        for b in sessions {
+            if b["format"].as_str() != Some("formless.session/1") {
+                failed.push(format!(
+                    "session {}: unsupported session bundle format",
+                    b["name"].as_str().unwrap_or("?")
+                ));
+                continue;
+            }
+            let identity = match Self::import_session_identity(&b) {
+                Ok(identity) => identity,
+                Err(e) => {
+                    failed.push(format!(
+                        "session {}: {e}",
+                        b["name"].as_str().unwrap_or("?")
+                    ));
+                    continue;
+                }
+            };
+            let fingerprint = Self::import_session_fingerprint(&identity)?;
+            if seen_session_fingerprints.contains(&fingerprint) {
+                count(&mut skipped_existing, "sessions");
+                continue;
+            }
+            if self
+                .with_reader(|st| st.imported_session_for_fingerprint(&fingerprint))?
+                .is_some()
+            {
+                seen_session_fingerprints.insert(fingerprint);
+                count(&mut skipped_existing, "sessions");
+                continue;
+            }
+            let identity_key = serde_json::to_string(&identity)?;
+            if let Some(session_id) = session_identities.get(&identity_key) {
+                let session_id = session_id.clone();
+                self.with_store(|st| {
+                    st.transaction(|st| {
+                        st.remember_imported_session_fingerprint(&fingerprint, &session_id)
+                    })
+                })?;
+                seen_session_fingerprints.insert(fingerprint);
+                count(&mut skipped_existing, "sessions");
+                continue;
+            }
+            match self.import_session_bundle_with_fingerprint(&b, Some(&fingerprint)) {
+                Ok((session, true)) => {
+                    seen_session_fingerprints.insert(fingerprint);
+                    count(&mut added, "sessions");
+                    session_identities.insert(identity_key, session.id);
+                }
+                Ok((_, false)) => {
+                    seen_session_fingerprints.insert(fingerprint);
+                    count(&mut skipped_existing, "sessions");
+                }
                 Err(e) => failed.push(format!(
                     "session {}: {e}",
                     b["name"].as_str().unwrap_or("?")
@@ -10625,16 +11000,17 @@ impl Daemon {
             st.audit(
                 "user",
                 "import_all",
-                &format!("{tools} tools, {skills} skills"),
+                &format!("{} tools, {} skills", added["tools"], added["skills"]),
             )
         });
         self.broadcast(Event::SkillsChanged);
         self.broadcast(Event::MemoryUpdated);
         self.broadcast(Event::JobsChanged);
         Ok(json!({
-            "tools": tools, "modules": modules, "skills": skills, "memories": memories,
-            "jobs": jobs, "sessions": sessions, "providers": providers, "roles": roles,
-            "mcp_servers": servers, "blanked": bundle["blanked"], "failed": failed,
+            "tools": added["tools"], "modules": added["modules"], "skills": added["skills"], "memories": added["memories"],
+            "jobs": added["jobs"], "sessions": added["sessions"], "providers": added["providers"], "roles": added["roles"],
+            "mcp_servers": added["mcp_servers"], "added": added, "skipped_existing": skipped_existing,
+            "blanked": bundle["blanked"], "failed": failed,
             "mcp_review": server_review, "tool_capability_families": capability_families,
             "review_notice": "MCP servers are disabled and untrusted; inspect each command before enabling. Jobs are paused and Skills disabled.",
         }))
@@ -20155,6 +20531,192 @@ mod model_download_tests {
     use tokio::sync::Notify;
     use tokio::time::{timeout, Instant};
 
+    fn subscribe(daemon: &Daemon) -> mpsc::Receiver<ServerMessage> {
+        let (tx, rx) = mpsc::channel(8);
+        daemon.subs.locked().push(Subscriber {
+            conn: 1,
+            tx: tx.into(),
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: CancellationToken::new(),
+            gaps: Default::default(),
+        });
+        rx
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn finish_first_run(daemon: &Arc<Daemon>) -> String {
+        let (session_id, run_id) = daemon
+            .with_store(|st| {
+                let session = st.create_session(None)?;
+                st.append_message(
+                    &session.id,
+                    "user",
+                    "Create a local-only fixture for first-run naming consent checks.",
+                )?;
+                let run_id = st.create_run(&session.id)?;
+                Ok((session.id, run_id))
+            })
+            .unwrap();
+        daemon
+            .finish_run(session_id.clone(), run_id, "completed")
+            .await;
+        session_id
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn wait_for_session_update(events: &mut mpsc::Receiver<ServerMessage>) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    events.recv().await.unwrap(),
+                    ServerMessage::Event(Event::SessionUpdated { .. })
+                ) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("first-run heuristic title was not published");
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn wait_for_note(
+        events: &mut mpsc::Receiver<ServerMessage>,
+        session_id: &str,
+        expected_text: &str,
+    ) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    ServerMessage::Event(Event::Note {
+                        session_id: Some(id),
+                        text,
+                    }) if id == session_id && text == expected_text => return,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("expected first-run model download status note");
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn assert_no_model_fetch(requests: &AtomicU64, requested: &Notify, paths: &Paths) {
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        assert!(timeout(Duration::from_millis(100), requested.notified())
+            .await
+            .is_err());
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        assert!(!namer::models_dir(paths).exists());
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    #[tokio::test]
+    async fn first_run_consent_gates_local_model_fetch_and_reports_status() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base =
+            std::env::temp_dir().join(format!("fl-first-run-download-{}", uuid::Uuid::new_v4()));
+        let requests = Arc::new(AtomicU64::new(0));
+        let requested = Arc::new(Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/tokenizer",
+            axum::routing::get({
+                let requests = requests.clone();
+                let requested = requested.clone();
+                move || {
+                    let (requests, requested) = (requests.clone(), requested.clone());
+                    async move {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        requested.notify_one();
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base_url = format!("http://{addr}");
+        let spec = ModelSpec {
+            id: "consent-fixture",
+            tokenizer_url: Box::leak(format!("{base_url}/tokenizer").into_boxed_str()),
+            tokenizer_sha256: Box::leak(
+                format!("{:x}", Sha256::digest(b"fixture tokenizer")).into_boxed_str(),
+            ),
+            gguf_url: Box::leak(format!("{base_url}/weights").into_boxed_str()),
+            gguf_sha256: Box::leak(
+                format!("{:x}", Sha256::digest(b"not a model")).into_boxed_str(),
+            ),
+            gguf_bytes: 42,
+            ..namer::QWEN2_5_0_5B
+        };
+        let paths = Paths::from_dirs(base.join("data"), base.join("config")).unwrap();
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let default_cfg = daemon.config().unwrap();
+        assert!(default_cfg.naming.enabled);
+        assert!(!default_cfg.naming.auto_download);
+        assert!(default_cfg.naming.spec().is_some());
+        assert!(!paths.config_file().exists());
+        *daemon.model_download_test_spec.lock().unwrap() = Some(spec);
+        let mut events = subscribe(&daemon);
+        finish_first_run(&daemon).await;
+        wait_for_session_update(&mut events).await;
+        assert_no_model_fetch(&requests, &requested, &paths).await;
+
+        let mut declined_cfg = Config::default();
+        declined_cfg.naming.auto_download = false;
+        declined_cfg.naming.auto_download_migration_done = true;
+        declined_cfg.save(&paths).unwrap();
+        assert!(
+            !daemon
+                .config_with_refresh(true)
+                .unwrap()
+                .naming
+                .auto_download
+        );
+        finish_first_run(&daemon).await;
+        wait_for_session_update(&mut events).await;
+        assert_no_model_fetch(&requests, &requested, &paths).await;
+
+        let mut enabled_cfg = Config::load(&paths).unwrap();
+        enabled_cfg.naming.auto_download = true;
+        enabled_cfg.naming.auto_download_migration_done = true;
+        enabled_cfg.save(&paths).unwrap();
+        assert!(
+            daemon
+                .config_with_refresh(true)
+                .unwrap()
+                .naming
+                .auto_download
+        );
+        let session_id = finish_first_run(&daemon).await;
+        wait_for_note(&mut events, &session_id, &model_download_notice(&spec)).await;
+        timeout(Duration::from_secs(5), requested.notified())
+            .await
+            .expect("enabled first run did not contact the local fetch fixture");
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        wait_for_note(
+            &mut events,
+            &session_id,
+            "Session-naming model download failed; titles will continue using a heuristic.",
+        )
+        .await;
+        assert!(!spec.installed(&paths));
+        assert!(!spec.tokenizer_path(&paths).exists());
+        assert!(!spec.gguf_path(&paths).exists());
+        drop(daemon);
+        server.abort();
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn download_notice_names_model_size_and_heuristic_fallback() {
+        let notice = model_download_notice(&namer::QWEN2_5_0_5B);
+        assert!(notice.contains("qwen2.5-0.5b"), "{notice}");
+        assert!(notice.contains("409 MiB"), "{notice}");
+        assert!(notice.contains("heuristic"), "{notice}");
+    }
+
     #[tokio::test]
     async fn a_failed_naming_model_download_retries_after_cooldown() {
         let _env = crate::credential_env::EnvGuard::isolated();
@@ -20162,6 +20724,7 @@ mod model_download_tests {
         let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
         Config::default().save(&paths).unwrap();
         let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let mut events = subscribe(&daemon);
         let calls = Arc::new(AtomicU64::new(0));
         let requested = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -20201,26 +20764,64 @@ mod model_download_tests {
             ..namer::QWEN2_5_0_5B
         };
         let wait = Duration::from_secs(5);
-        daemon.spawn_model_download(spec);
+        daemon.spawn_model_download(spec, "fixture-session");
         timeout(wait, requested.notified()).await.unwrap();
-        daemon.spawn_model_download(spec);
+        let ServerMessage::Event(Event::Note { session_id, text }) =
+            timeout(wait, events.recv()).await.unwrap().unwrap()
+        else {
+            panic!("expected download status note");
+        };
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(text, model_download_notice(&spec));
+        daemon.spawn_model_download(spec, "fixture-session");
         let earliest_retry = Instant::now() + MODEL_DOWNLOAD_COOLDOWN;
         release.notify_one();
         let retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
         assert!(retry_at.unwrap() >= earliest_retry);
         assert!(!spec.installed(&paths));
+        let ServerMessage::Event(Event::Note { session_id, text }) =
+            timeout(wait, events.recv()).await.unwrap().unwrap()
+        else {
+            panic!("expected failed-download status note");
+        };
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(
+            text,
+            "Session-naming model download failed; titles will continue using a heuristic."
+        );
         drop(retry_at);
-        daemon.spawn_model_download(spec);
+        daemon.spawn_model_download(spec, "fixture-session");
         let mut retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         // Move the retry deadline to the present without a real five-minute wait.
         *retry_at = Some(Instant::now());
         drop(retry_at);
-        daemon.spawn_model_download(spec);
+        daemon.spawn_model_download(spec, "fixture-session");
         let retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
         assert!(retry_at.is_none());
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert!(spec.installed(&paths));
+        let ServerMessage::Event(Event::Note { session_id, text }) =
+            timeout(wait, events.recv()).await.unwrap().unwrap()
+        else {
+            panic!("expected retry-start status note");
+        };
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(text, model_download_notice(&spec));
+        let ServerMessage::Event(Event::Note { session_id, text }) =
+            timeout(wait, events.recv()).await.unwrap().unwrap()
+        else {
+            panic!("expected completed-download status note");
+        };
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(
+            text,
+            format!(
+                "Session-naming model {} is installed ({})",
+                spec.id,
+                namer::display_size(spec.gguf_bytes)
+            )
+        );
         drop(retry_at);
         server.abort();
         drop(daemon);

@@ -269,6 +269,7 @@ pub fn documented_shape() -> Config {
     let s = |v: &str| v.to_string();
     let mut cfg = Config::default();
     let p = &mut cfg.provider;
+    p.preset = Some(s("openai"));
     p.reasoning_effort = Some(s("low"));
     p.api_key_header = Some(s("api-key"));
     p.vision = Some(true);
@@ -281,6 +282,14 @@ pub fn documented_shape() -> Config {
     p.aliases.insert(s("*"), s("m"));
     p.query_params.insert(s("*"), s("1"));
     p.model_context_tokens.insert(s("*"), 8192);
+    p.model_meta.insert(
+        s("*"),
+        ModelMetaCfg {
+            vision: Some(true),
+            tools: Some(true),
+            efforts: Some(vec![s("low")]),
+        },
+    );
     p.fallback_models.push(s("m"));
     p.routing_models.push(s("m"));
     p.routing_fast_models.push(s("m"));
@@ -297,6 +306,7 @@ pub fn documented_shape() -> Config {
     );
     p.auth.extra_authorize_params.insert(s("*"), s("b"));
     p.auth.extra_token_params.insert(s("*"), s("b"));
+    p.auth.revocation_url = s("https://oauth.example.com/revoke");
     cfg.compaction.model = Some(s("m"));
     cfg.compaction.trigger_fraction = Some(0.8);
     cfg.limits.daily_usd = Some(1.0);
@@ -355,6 +365,159 @@ pub fn documented_shape() -> Config {
     let provider = cfg.provider.clone();
     cfg.providers.insert(s("*"), provider);
     cfg
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownConfigKey {
+    pub key: String,
+    pub suggestion: Option<String>,
+}
+
+impl std::fmt::Display for UnknownConfigKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.suggestion {
+            Some(suggestion) => write!(
+                f,
+                "unknown configuration key '{}'; did you mean '{}'?",
+                self.key, suggestion
+            ),
+            None => write!(f, "unknown configuration key '{}'", self.key),
+        }
+    }
+}
+
+pub fn unknown_keys_from_file(file: &Path) -> Result<Vec<UnknownConfigKey>> {
+    let text = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+    unknown_keys_from_text(&text).with_context(|| format!("inspect {}", file.display()))
+}
+
+pub fn unknown_keys_from_text(text: &str) -> Result<Vec<UnknownConfigKey>> {
+    let config: toml::Value = toml::from_str(text).context("parse config.toml")?;
+    let mut shape =
+        toml::Value::try_from(documented_shape()).context("serialize configuration key schema")?;
+    if let Some(naming) = shape.get_mut("naming").and_then(toml::Value::as_table_mut) {
+        naming.insert(
+            "auto_download_migration_done".into(),
+            toml::Value::Boolean(true),
+        );
+    }
+    let mut unknown = Vec::new();
+    collect_unknown_keys(&config, &shape, "", &mut unknown);
+    unknown.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(unknown)
+}
+
+fn collect_unknown_keys(
+    value: &toml::Value,
+    schema: &toml::Value,
+    prefix: &str,
+    unknown: &mut Vec<UnknownConfigKey>,
+) {
+    match (value, schema) {
+        (toml::Value::Table(values), toml::Value::Table(fields)) => {
+            for (key, value) in values {
+                let (field, is_map_entry) = match fields.get(key) {
+                    Some(field) => (Some(field), false),
+                    None => (fields.get("*"), true),
+                };
+                let path = config_key_path(prefix, key);
+                let Some(field) = field else {
+                    unknown.push(UnknownConfigKey {
+                        key: path,
+                        suggestion: nearest_config_key(key, fields)
+                            .map(|suggestion| config_key_path(prefix, &suggestion)),
+                    });
+                    continue;
+                };
+                if is_map_entry && !matches!(field, toml::Value::Table(_)) {
+                    continue;
+                }
+                collect_unknown_keys(value, field, &path, unknown);
+            }
+        }
+        (toml::Value::Array(values), toml::Value::Array(fields)) => {
+            if let Some(field) = fields.first() {
+                for value in values {
+                    collect_unknown_keys(value, field, &format!("{prefix}[]"), unknown);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn config_key_path(prefix: &str, segment: &str) -> String {
+    let segment = if !segment.is_empty()
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        segment.to_string()
+    } else {
+        toml_basic_string_key(segment)
+    };
+    if prefix.is_empty() {
+        segment
+    } else {
+        format!("{prefix}.{segment}")
+    }
+}
+
+fn toml_basic_string_key(segment: &str) -> String {
+    let mut key = String::with_capacity(segment.len() + 2);
+    key.push('"');
+    for character in segment.chars() {
+        match character {
+            '"' => key.push_str("\\\""),
+            '\\' => key.push_str("\\\\"),
+            '\u{8}' => key.push_str("\\b"),
+            '\t' => key.push_str("\\t"),
+            '\n' => key.push_str("\\n"),
+            '\u{c}' => key.push_str("\\f"),
+            '\r' => key.push_str("\\r"),
+            character
+                if matches!(
+                    character as u32,
+                    0x0000..=0x0008 | 0x000B..=0x001F | 0x007F..=0x009F
+                ) =>
+            {
+                key.push_str(&format!("\\u{:04X}", character as u32));
+            }
+            character => key.push(character),
+        }
+    }
+    key.push('"');
+    key
+}
+
+fn nearest_config_key(key: &str, fields: &toml::map::Map<String, toml::Value>) -> Option<String> {
+    let mut nearest: Option<(usize, &str)> = None;
+    for candidate in fields.keys().filter(|candidate| candidate.as_str() != "*") {
+        let distance = config_key_edit_distance(key, candidate);
+        if nearest.is_none_or(|(best, best_key)| {
+            distance < best || (distance == best && candidate.as_str() < best_key)
+        }) {
+            nearest = Some((distance, candidate));
+        }
+    }
+    let (distance, candidate) = nearest?;
+    let limit = (key.chars().count() / 4).clamp(2, 3);
+    (distance <= limit).then(|| candidate.to_string())
+}
+
+fn config_key_edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (i, left) in left.chars().enumerate() {
+        let mut current = vec![i + 1; right.len() + 1];
+        for (j, right) in right.iter().enumerate() {
+            current[j + 1] = (previous[j + 1] + 1)
+                .min(current[j] + 1)
+                .min(previous[j] + (left != *right) as usize);
+        }
+        previous = current;
+    }
+    previous[right.len()]
 }
 
 /// The role an old global `provider.model = "auto"` migrates to.
@@ -547,6 +710,15 @@ pub struct ModelPrice {
     pub retrieved_at: Option<String>,
 }
 
+/// Explicit per-model corrections for capability metadata.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ModelMetaCfg {
+    pub vision: Option<bool>,
+    pub tools: Option<bool>,
+    pub efforts: Option<Vec<String>>,
+}
+
 impl ModelPrice {
     /// USD for one request. `cached` and `cache_write` are parts of
     /// `prompt` (the provider layer normalises both reporting styles), so
@@ -636,6 +808,7 @@ pub const HARNESS_MODEL_KEYS: &[&str] = &[
     "provider.reasoning_effort",
     "provider.context_tokens",
     "provider.model_context_tokens",
+    "provider.model_meta",
     "provider.fallback_models",
     "provider.routing_models",
     "provider.routing_fast_models",
@@ -647,6 +820,7 @@ pub const HARNESS_MODEL_KEYS: &[&str] = &[
 pub const SETTING_MAPS: &[&str] = &[
     "provider.prices",
     "provider.model_context_tokens",
+    "provider.model_meta",
     "provider.model_audio_input",
     "provider.model_pdf_input",
     "tui.colors",
@@ -783,6 +957,7 @@ pub const SETTABLE: &[&str] = &[
     "provider.reasoning_effort",
     "provider.context_tokens",
     "provider.model_context_tokens",
+    "provider.model_meta",
     "provider.auto_test_models",
     "provider.max_retries",
     "provider.fallback_models",
@@ -819,7 +994,10 @@ pub const SETTABLE: &[&str] = &[
     "metrics.",
     "optimiser.",
     "compaction.",
-    "naming.",
+    "naming.enabled",
+    "naming.model",
+    "naming.auto_download",
+    "naming.timeout_secs",
     "skills.",
     "artifacts.",
     "run_files.",
@@ -1124,6 +1302,9 @@ pub struct ProviderCfg {
     pub reasoning_effort: Option<String>,
     pub context_tokens: u32,
     pub model_context_tokens: HashMap<String, u32>,
+    /// Per-model corrections to endpoint- and family-derived metadata.
+    #[serde(default)]
+    pub model_meta: Box<HashMap<String, ModelMetaCfg>>,
     pub max_retries: usize,
     /// "chat" (Chat Completions, default) or "responses" (Responses API).
     #[serde(default = "default_api_style")]
@@ -1278,6 +1459,7 @@ impl Default for ProviderCfg {
             reasoning_effort: None,
             context_tokens: 128_000,
             model_context_tokens: HashMap::new(),
+            model_meta: Box::new(HashMap::new()),
             max_retries: 5,
             api_style: default_api_style(),
             tool_mode: default_tool_mode(),
@@ -1861,6 +2043,10 @@ impl Default for TuiCfg {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Automatic Session naming by a small embedded model (see `namer`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1870,10 +2056,13 @@ pub struct NamingCfg {
     /// Embedded model id ("qwen2.5-0.5b" or "lfm2.5-350m"); empty uses
     /// the heuristic title only.
     pub model: String,
-    /// Fetch the model in the background when naming needs it. After a
-    /// failure, a later naming attempt may retry after cooldown.
+    /// Allow fetching the model in the background on first use. This is
+    /// opt-in; after a failure, a later naming attempt may retry after cooldown.
     /// Off: install with `formless naming pull`.
     pub auto_download: bool,
+    /// Internal marker for the pre-consent config migration.
+    #[serde(skip_serializing_if = "is_false")]
+    pub auto_download_migration_done: bool,
     /// Give up on a single inference after this long and use the
     /// heuristic title instead.
     pub timeout_secs: u64,
@@ -1883,12 +2072,22 @@ impl Default for NamingCfg {
         Self {
             enabled: true,
             model: crate::namer::QWEN2_5_0_5B.id.into(),
-            auto_download: true,
+            auto_download: false,
+            auto_download_migration_done: false,
             timeout_secs: 30,
         }
     }
 }
 impl NamingCfg {
+    fn migrate_auto_download(&mut self) -> bool {
+        if self.auto_download_migration_done {
+            return false;
+        }
+        self.auto_download = false;
+        self.auto_download_migration_done = true;
+        true
+    }
+
     pub fn spec(&self) -> Option<crate::namer::ModelSpec> {
         crate::namer::spec(&self.model)
     }
@@ -2021,6 +2220,35 @@ impl Config {
             .filter(|(key, _)| values.contains_key(*key))
             .map(|(key, choices)| ((*key).into(), serde_json::json!(choices)))
             .collect();
+        let naming_spec = self.naming.spec();
+        let naming_installed = naming_spec.is_some_and(|spec| spec.installed(paths));
+        let naming_cache_bytes = naming_spec.and_then(|spec| {
+            let models = crate::namer::cached_models(paths).ok()?;
+            Some(
+                models
+                    .into_iter()
+                    .find(|model| model.id == spec.id)
+                    .map_or(0, |model| model.bytes),
+            )
+        });
+        let naming_cache_size = naming_cache_bytes
+            .map(crate::namer::display_size)
+            .unwrap_or_else(|| "unknown".into());
+        let naming_model_size = naming_spec
+            .map(|spec| crate::namer::display_size(spec.gguf_bytes))
+            .unwrap_or_else(|| "—".into());
+        let naming_status = match naming_spec {
+            Some(_) if naming_installed => format!("installed ({naming_cache_size} cached)"),
+            Some(_) if naming_cache_bytes.is_some_and(|bytes| bytes > 0) => {
+                format!("not installed ({naming_cache_size} cached)")
+            }
+            Some(_) => "not installed".into(),
+            None if self.naming.model.trim().is_empty() => "heuristic only".into(),
+            None => format!(
+                "unknown model {}; titles use a heuristic",
+                self.naming.model
+            ),
+        };
         let mut read_only = serde_json::json!({
             "provider.base_url": self.provider.base_url,
             "provider.auth": self.provider.auth.mode,
@@ -2033,7 +2261,10 @@ impl Config {
                 self.security.roots().len(), self.security.trusted_hosts.len(), self.security.secret_patterns.len()),
             "hooks": format!("{} configured", self.hooks.len()),
             "mcp.servers": format!("{} configured", self.mcp.servers.len()),
-            "naming.installed": self.naming.spec().is_some_and(|m| m.installed(paths)),
+            "naming.model_size": naming_model_size,
+            "naming.cache_size": naming_cache_size,
+            "naming.status": naming_status,
+            "naming.installed": naming_installed,
             "config": paths.config_file().display().to_string(),
             "data": paths.data_dir.display().to_string(),
         });
@@ -2091,7 +2322,11 @@ impl Config {
             "naming": {
                 "enabled": self.naming.enabled,
                 "model": self.naming.model,
-                "installed": self.naming.spec().is_some_and(|m| m.installed(paths)),
+                "auto_download": self.naming.auto_download,
+                "installed": naming_installed,
+                "model_size": naming_model_size,
+                "cache_size": naming_cache_size,
+                "status": naming_status,
             },
             "paths": {
                 "config": paths.config_file().display().to_string(),
@@ -2101,7 +2336,9 @@ impl Config {
     }
 
     pub fn load(paths: &Paths) -> Result<Self> {
-        Self::load_from(&paths.config_file())
+        let mut cfg = Self::load_file_only(paths)?;
+        cfg.apply_env()?;
+        Ok(cfg)
     }
     pub fn load_from(file: &Path) -> Result<Self> {
         if file.exists() {
@@ -2116,21 +2353,50 @@ impl Config {
 
     /// Validate an in-memory copy so callers can commit the exact text read.
     pub fn load_from_text(text: &str, file: &Path) -> Result<Self> {
+        Self::load_from_text_with_unmarked_download(text, file).map(|(cfg, _)| cfg)
+    }
+
+    /// Validate text and report whether auto-download was enabled without its consent marker.
+    pub fn load_from_text_with_unmarked_download(text: &str, file: &Path) -> Result<(Self, bool)> {
         let mut cfg: Self =
             toml::from_str(text).with_context(|| format!("parse {}", file.display()))?;
+        let unmarked_auto_download =
+            cfg.naming.auto_download && !cfg.naming.auto_download_migration_done;
+        cfg.naming.migrate_auto_download();
         cfg.apply_env()?;
-        Ok(cfg)
+        Ok((cfg, unmarked_auto_download))
     }
-    /// The config file alone, without `FORMLESS_*` environment overrides
-    /// (what an edit should write back).
+    /// The config file alone, without `FORMLESS_*` environment overrides.
+    /// This read-only load never persists the in-memory naming migration.
     pub fn load_file_only(paths: &Paths) -> Result<Self> {
+        Self::load_file_only_with_migration(paths).map(|(cfg, _)| cfg)
+    }
+
+    /// Persist the naming consent migration for an active-profile startup or
+    /// explicit config edit. Diagnostics and profile scans should use the
+    /// read-only `load` methods instead.
+    pub fn persist_naming_download_migration(paths: &Paths) -> Result<bool> {
+        let (cfg, migrated) = Self::load_file_only_with_migration(paths)?;
+        if migrated {
+            if let Err(error) = cfg.save_inner(paths, false) {
+                tracing::warn!("could not persist naming download-consent migration: {error:#}");
+                return Ok(false);
+            }
+        }
+        Ok(migrated)
+    }
+
+    fn load_file_only_with_migration(paths: &Paths) -> Result<(Self, bool)> {
         let file = paths.config_file();
         if !file.exists() {
-            return Ok(Self::default());
+            return Ok((Self::default(), false));
         }
         let text =
             std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
-        toml::from_str(&text).with_context(|| format!("parse {}", file.display()))
+        let mut cfg: Self =
+            toml::from_str(&text).with_context(|| format!("parse {}", file.display()))?;
+        let migrated = cfg.naming.migrate_auto_download();
+        Ok((cfg, migrated))
     }
 
     /// Set one dotted key (`tools.inline_limit`) from JSON, validated by
@@ -2174,9 +2440,12 @@ impl Config {
             let v = toml::Value::try_from(&value).context("unsupported value")?;
             table.insert(leaf.to_string(), v.clone());
         }
-        let next: Config = doc
+        let mut next: Config = doc
             .try_into()
             .with_context(|| format!("invalid value for '{key}'"))?;
+        if key == "naming.auto_download" {
+            next.naming.auto_download_migration_done = true;
+        }
         // A typo'd key would be dropped silently: make sure it took.
         if !value.is_null() {
             let mut check = toml::Value::try_from(&next)?;
@@ -2241,11 +2510,17 @@ impl Config {
         if self.daemon.log_keep > crate::logs::MAX_LOG_KEEP {
             anyhow::bail!("daemon.log_keep must be between 0 and 64");
         }
+        self.save_inner(paths, true)
+    }
+
+    fn save_inner(&self, paths: &Paths, discard_setup_draft: bool) -> Result<()> {
         let file = paths.config_file();
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let fresh = toml::to_string_pretty(self)?;
+        let mut persisted = self.clone();
+        persisted.naming.auto_download_migration_done = true;
+        let fresh = toml::to_string_pretty(&persisted)?;
         let text = match std::fs::read_to_string(&file) {
             Ok(old) => match merge_toml(&old, &fresh) {
                 Some(merged) => merged,
@@ -2269,8 +2544,10 @@ impl Config {
             .with_context(|| format!("write {}", file.display()))?;
         // A saved config supersedes any unfinished TUI setup, including when
         // setup completed through the CLI or a daemon setting update.
-        if let Err(e) = crate::setup_draft::discard(paths) {
-            tracing::warn!("could not remove superseded setup draft: {e}");
+        if discard_setup_draft {
+            if let Err(e) = crate::setup_draft::discard(paths) {
+                tracing::warn!("could not remove superseded setup draft: {e}");
+            }
         }
         Ok(())
     }
