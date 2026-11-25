@@ -21,6 +21,15 @@ fn record(agent: &Value) -> String {
             crate::comparison_terminal_text(agent[key].as_str().unwrap_or("(not reported)"))
         ));
     }
+    if let Some(served) = agent.get("served_model").filter(|value| value.is_object()) {
+        let name = served["name"].as_str().unwrap_or("(not reported)");
+        let via = served["via"].as_str().unwrap_or("(not reported)");
+        text.push_str(&format!(
+            "Served model: {} (via {})\n",
+            crate::comparison_terminal_text(name),
+            crate::comparison_terminal_text(via)
+        ));
+    }
     for (label, key) in [("Depth", "depth"), ("Steps", "steps")] {
         text.push_str(&format!(
             "{label}: {}\n",
@@ -141,7 +150,12 @@ mod tests {
     #[test]
     fn human_reports_escape_controls_in_multiline_results_and_transcripts() {
         let result = "first\nsecond \u{1b} \u{9b} \u{202e}";
-        let subagent = agent("fixture", json!(result));
+        let mut subagent = agent("fixture", json!(result));
+        subagent["served_model"] = json!({
+            "name":"fallback-model",
+            "via":"fallback",
+            "requested":"requested-model"
+        });
         let messages = json!([{"role":"assistant", "content":result, "key\u{202e}":true}]);
         let report = json!({"subagent":subagent,"messages":messages});
         let mut inventory = Vec::new();
@@ -165,6 +179,10 @@ mod tests {
         for text in [&inventory, &detail_text] {
             assert!(
                 text.contains("Result:\n  first\n  second \\u{1b} \\u{9b} \\u{202e}"),
+                "{text}"
+            );
+            assert!(
+                text.contains("Served model: fallback-model (via fallback)"),
                 "{text}"
             );
             assert!(!text.contains(['\u{1b}', '\u{9b}', '\u{202e}']), "{text}");

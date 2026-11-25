@@ -60,7 +60,7 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use formless_core::auth::has_provider_credential;
-use formless_core::config::{save_api_key, Config};
+use formless_core::config::Config;
 use formless_core::daemon::ensure_daemon;
 use formless_core::onboarding::{load as load_seen, Seen};
 use formless_core::provider::{list_models_blocking, probe_blocking, ProbeResult};
@@ -557,7 +557,7 @@ struct ModelOverlay {
     picker: picker::ModelPicker,
     /// `ListModels` metadata per id (efforts, context, prices).
     meta: serde_json::Value,
-    effort_idx: usize,
+    selected_effort: Option<String>,
     /// Opened from Settings: Enter sets the global default.
     default_only: bool,
 }
@@ -565,38 +565,50 @@ struct ModelOverlay {
 impl ModelOverlay {
     /// The efforts the highlighted model accepts (SPEC §4.2): its listed
     /// ones, none when effort has no effect, else all of them.
-    fn efforts(&self) -> Vec<Option<&'static str>> {
+    fn efforts(&self) -> Vec<Option<String>> {
         let id = self.picker.choice().unwrap_or_default();
         let listed = &self.meta[&id]["efforts"];
         match listed.as_array() {
             Some(a) if a.is_empty() => vec![None],
-            Some(a) => {
-                let names: Vec<&str> = a.iter().filter_map(|v| v.as_str()).collect();
-                std::iter::once(None)
-                    .chain(
-                        ALL_EFFORTS
-                            .iter()
-                            .copied()
-                            .filter(|e| names.contains(e))
-                            .map(Some),
-                    )
-                    .collect()
-            }
-            None => EFFORTS.to_vec(),
+            Some(a) => std::iter::once(None)
+                .chain(
+                    a.iter()
+                        .filter_map(|value| value.as_str())
+                        .filter(|effort| !effort.is_empty())
+                        .map(|effort| Some(effort.to_string())),
+                )
+                .collect(),
+            None => EFFORTS
+                .iter()
+                .map(|effort| effort.map(str::to_string))
+                .collect(),
         }
     }
 
     /// The chosen effort, if the highlighted model accepts it.
-    fn effort(&self) -> Option<&'static str> {
+    fn effort(&self) -> Option<String> {
         let all = self.efforts();
-        all.get(self.effort_idx % all.len().max(1))
-            .copied()
-            .flatten()
+        let idx = all
+            .iter()
+            .position(|effort| effort == &self.selected_effort)
+            .unwrap_or(0);
+        all[idx].clone()
+    }
+
+    fn cycle_effort(&mut self, backwards: bool) {
+        let all = self.efforts();
+        let current = all
+            .iter()
+            .position(|effort| effort == &self.selected_effort)
+            .unwrap_or(0);
+        let next = if backwards {
+            (current + all.len() - 1) % all.len()
+        } else {
+            (current + 1) % all.len()
+        };
+        self.selected_effort = all[next].clone();
     }
 }
-
-/// Every effort level a model may accept, lowest first.
-const ALL_EFFORTS: [&str; 4] = ["minimal", "low", "medium", "high"];
 
 /// A Session's unsent input and attachments.
 #[derive(Default)]
@@ -1324,6 +1336,8 @@ struct PendingStep {
     step_id: String,
     tool_name: String,
     arguments: String,
+    /// The last edit sent, kept so a rejected edit can be fixed and resent.
+    draft: Option<String>,
     index: usize,
     count: usize,
 }
@@ -1646,7 +1660,12 @@ fn subagent_line(m: &serde_json::Value) -> String {
         ),
         None => m["content"].as_str().unwrap_or_default().replace('\n', " "),
     };
-    format!("  [{role}] {}", truncate_chars(&text, 120))
+    let served = m["meta"]["model"]["name"]
+        .as_str()
+        .zip(m["meta"]["model"]["via"].as_str())
+        .map(|(name, via)| format!(" · via {name} ({via})"))
+        .unwrap_or_default();
+    format!("  [{role}] {}{served}", truncate_chars(&text, 120))
 }
 
 /// Identifies a rendered streaming prefix without hashing all of it: the
@@ -2510,13 +2529,18 @@ impl App {
 
     /// Answer the call waiting in step mode.
     fn step_decide(&mut self, action: &str, arguments: Option<String>) {
-        let Some(step) = self.step.clone() else {
+        let Some(step_id) = self.step.as_mut().map(|step| {
+            if action == "edit" {
+                step.draft = arguments.clone();
+            }
+            step.step_id.clone()
+        }) else {
             return;
         };
         self.request(
             Pending::StepDecision,
             Request::StepDecision {
-                step_id: step.step_id,
+                step_id,
                 action: action.into(),
                 arguments,
             },
@@ -6236,6 +6260,7 @@ impl App {
                         step_id,
                         tool_name,
                         arguments,
+                        draft: None,
                         index,
                         count,
                     });
@@ -7012,6 +7037,19 @@ impl App {
                         .iter_mut()
                         .find(|c| c.subagent.as_deref() == Some(&subagent.id))
                     {
+                        if !subagent.model.is_empty() || subagent.served_model.is_some() {
+                            let served = subagent
+                                .served_model
+                                .as_ref()
+                                .map_or_else(String::new, |served| {
+                                    format!(" · via {} ({})", served.name, served.via)
+                                });
+                            node.name = format!(
+                                "sub-agent ({}{served}): {}",
+                                subagent.model,
+                                truncate_chars(&subagent.task, 60)
+                            );
+                        }
                         node.status = if subagent.status == "completed" {
                             "ok".into()
                         } else {
@@ -7433,9 +7471,8 @@ impl App {
             return;
         }
         if self.editing_step {
-            let text = self.input.take();
             self.editing_step = false;
-            self.step_decide("edit", Some(text.trim().to_string()));
+            self.step_decide("edit", Some(text));
             return;
         }
         if let Some(message_id) = self.editing_id.take() {
@@ -7575,8 +7612,8 @@ impl App {
         }
     }
 
-    /// Whether the current model takes images (`provider.vision`, else a
-    /// guess from its name).
+    /// Whether the current model takes images (per-model setting, provider
+    /// default, else a guess from its name).
     fn vision_model(&self) -> bool {
         let Ok(cfg) = Config::load(&self.paths) else {
             return true;
@@ -7586,10 +7623,8 @@ impl App {
             .as_ref()
             .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
             .and_then(|s| s.model.clone())
-            .unwrap_or(cfg.provider.model);
-        cfg.provider
-            .vision
-            .unwrap_or_else(|| formless_core::provider::is_vision_model(&model))
+            .unwrap_or_else(|| cfg.provider.model.clone());
+        formless_core::provider::model_sends_images(&cfg.provider, &model)
     }
 
     /// `/compact [focus]`: summarise the Session now (SPEC §11).
@@ -9043,14 +9078,10 @@ impl App {
                 .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
                 .and_then(|s| s.reasoning_effort.clone())
         };
-        let effort_idx = EFFORTS
-            .iter()
-            .position(|e| e.map(str::to_string) == effort)
-            .unwrap_or(0);
         self.model_overlay = Some(ModelOverlay {
             picker: picker::ModelPicker::loading(),
             meta: serde_json::Value::Null,
-            effort_idx,
+            selected_effort: effort,
             default_only: self.view == View::Settings,
         });
         self.request(Pending::ListModels, Request::ListModels);
@@ -9085,7 +9116,7 @@ impl App {
             let Some(model) = o.picker.choice() else {
                 return;
             };
-            let effort = o.effort().map(str::to_string);
+            let effort = o.effort();
             self.model_overlay = None;
             if global {
                 // Settings go through the daemon (principle 6).
@@ -9108,11 +9139,8 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => self.model_overlay = None,
-            KeyCode::Tab => o.effort_idx = (o.effort_idx + 1) % o.efforts().len().max(1),
-            KeyCode::BackTab => {
-                let n = o.efforts().len().max(1);
-                o.effort_idx = (o.effort_idx % n + n - 1) % n;
-            }
+            KeyCode::Tab => o.cycle_effort(false),
+            KeyCode::BackTab => o.cycle_effort(true),
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(model) = o.picker.choice() {
                     self.notes.push(format!("testing {model}…"));
@@ -9326,13 +9354,16 @@ impl App {
         w.apply_provider_endpoint(&mut cfg.provider);
         cfg.provider.model = w.model();
         cfg.provider.reasoning_effort = EFFORTS[w.effort_idx].map(str::to_string);
-        if w.prompt_fallback {
-            cfg.provider.tool_mode = "prompt".into();
-        }
-        cfg.save(&self.paths)?;
-        if let WizardKeyUpdate::Save(key) = key_update {
-            save_api_key(&self.paths, &key)?;
-        }
+        let save_key = match key_update {
+            WizardKeyUpdate::Save(key) => Some(key),
+            _ => None,
+        };
+        formless_core::profile_setup::save_verified_provider(
+            &self.paths,
+            &mut cfg,
+            w.prompt_fallback,
+            save_key.as_deref(),
+        )?;
         let w = self.wizard.take().expect("wizard");
         let _ = formless_core::setup_draft::discard(&self.paths);
         // A guided first task, offered once (#393).
@@ -12254,7 +12285,7 @@ impl App {
                     let args = self
                         .step
                         .as_ref()
-                        .map(|s| pretty_json(&s.arguments))
+                        .map(|s| pretty_json(s.draft.as_deref().unwrap_or(&s.arguments)))
                         .unwrap_or_default();
                     self.input.set(&args);
                     self.editing_step = true;
@@ -13382,7 +13413,7 @@ fn draw_model_overlay(f: &mut Frame, o: &ModelOverlay, color: bool) {
     } else {
         Line::from(vec![
             Span::styled("Effort   ", ui::dim(color)),
-            Span::raw(o.effort().unwrap_or("default (provider)")),
+            Span::raw(o.effort().unwrap_or_else(|| "default (provider)".into())),
             Span::styled("  (Tab to change)", ui::dim(color)),
         ])
     };
@@ -15038,10 +15069,17 @@ fn wrap_rows(text: &str, width: usize) -> Vec<String> {
 /// columns side by side (stacked when the screen is narrow).
 fn compare_lines(results: &[formless_protocol::ComparisonResult], width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthStr;
+    let model_label = |r: &formless_protocol::ComparisonResult| {
+        r.served_model
+            .as_ref()
+            .filter(|served| served.name != r.model)
+            .map(|served| format!("{} → {} (via {})", r.model, served.name, served.via))
+            .unwrap_or_else(|| r.model.clone())
+    };
     let head = |r: &formless_protocol::ComparisonResult| {
         format!(
             "{} · {} · {:.1}s · {} tokens · {} steps{}",
-            r.model,
+            model_label(r),
             r.status,
             r.duration_ms as f64 / 1000.0,
             i18n::number(r.tokens),
@@ -15055,7 +15093,7 @@ fn compare_lines(results: &[formless_protocol::ComparisonResult], width: usize) 
     let col = (width.saturating_sub(3 * (n - 1)) / n).max(1);
     if col < 30 {
         for r in results {
-            out.push(format!("── {} ──", r.model));
+            out.push(format!("── {} ──", model_label(r)));
             out.extend(wrap_rows(&r.answer, width));
             out.push(String::new());
         }
@@ -15063,7 +15101,7 @@ fn compare_lines(results: &[formless_protocol::ComparisonResult], width: usize) 
         let cols: Vec<Vec<String>> = results
             .iter()
             .map(|r| {
-                let mut c = vec![format!("── {} ──", r.model)];
+                let mut c = vec![format!("── {} ──", model_label(r))];
                 c.extend(wrap_rows(&r.answer, col));
                 c
             })
@@ -16223,6 +16261,11 @@ impl App {
             lines.push("Output:".into());
             lines.extend(pretty(&c.output).lines().map(str::to_string));
         }
+        lines.extend(
+            c.served_models
+                .iter()
+                .map(|served| format!("Served model: via {} ({})", served.name, served.via)),
+        );
         if !c.error.is_empty() {
             lines.push(String::new());
             lines.push("Error:".into());
@@ -20889,6 +20932,7 @@ mod tests {
             "memory fixture [project:test\\u{202e}, off] note\\r\\n\\u{1b}\\u{9b} · agent\\u{9b}"
         );
     }
+
     #[test]
     fn remembering_a_disabled_memory_reports_that_it_remains_off() {
         let notice = memory_remember_notice(&serde_json::json!({
@@ -20899,6 +20943,42 @@ mod tests {
             "already remembered (disabled): User prefers concise answers. — it remains off until you explicitly enable it"
         );
     }
+
+    #[test]
+    fn rejected_step_edit_preserves_draft_for_retry() {
+        let mut app = test_app();
+        app.step = Some(PendingStep {
+            step_id: "step-1".into(),
+            tool_name: "echo".into(),
+            arguments: r#"{"value":1}"#.into(),
+            draft: None,
+            index: 0,
+            count: 1,
+        });
+
+        let draft = r#"{"value":"invalid"}"#;
+        app.step_decide("edit", Some(draft.into()));
+        assert_eq!(
+            app.step.as_ref().unwrap().arguments,
+            r#"{"value":1}"#,
+            "the preview keeps the arguments Enter runs"
+        );
+
+        app.input.clear();
+        app.key(key(KeyCode::Char('e')));
+        assert_eq!(app.input.expanded(), pretty_json(draft));
+
+        let corrected = r#"{"value":2}"#;
+        app.input.set(corrected);
+        app.key(key(KeyCode::Enter));
+        assert!(!app.editing_step);
+        assert_eq!(
+            app.step.as_ref().unwrap().draft.as_deref(),
+            Some(corrected),
+            "Enter in the step editor sends the typed arguments"
+        );
+    }
+
     include!("hunk_tests.rs");
     include!("run_file_coverage_tests.rs");
     include!("invocation_progress_tests.rs");
@@ -22833,8 +22913,9 @@ mod tests {
     #[test]
     fn compare_answers_sit_side_by_side_or_stack_when_narrow() {
         use formless_protocol::ComparisonResult;
-        let r = |m: &str, a: &str| ComparisonResult {
+        let r = |m: &str, a: &str, served_model| ComparisonResult {
             model: m.into(),
+            served_model,
             session_id: format!("s-{m}"),
             status: "completed".into(),
             answer: a.into(),
@@ -22843,9 +22924,20 @@ mod tests {
             cost: Some(0.0012),
             steps: 1,
         };
-        let results = vec![r("alpha", "short"), r("beta", "a longer answer here")];
+        let results = vec![
+            r(
+                "alpha",
+                "short",
+                Some(formless_protocol::ServedModelInfo {
+                    name: "alpha-fallback".into(),
+                    via: "fallback".into(),
+                    requested: "alpha".into(),
+                }),
+            ),
+            r("beta", "a longer answer here", None),
+        ];
         let wide = compare_lines(&results, 100);
-        assert!(wide[0].contains("alpha · completed · 1.5s · 42 tokens · 1 steps · $0.0012"));
+        assert!(wide[0].contains("alpha → alpha-fallback (via fallback) · completed · 1.5s · 42 tokens · 1 steps · $0.0012"));
         assert!(
             wide.iter()
                 .any(|l| l.contains("short") && l.contains("│ a longer answer here")),
@@ -22853,6 +22945,9 @@ mod tests {
         );
         let narrow = compare_lines(&results, 40);
         assert!(narrow.iter().any(|l| l == "── beta ──"));
+        assert!(narrow
+            .iter()
+            .any(|l| l == "── alpha → alpha-fallback (via fallback) ──"));
         assert!(!narrow.iter().any(|l| l.contains('│')));
     }
 
@@ -26366,6 +26461,57 @@ mod tests {
                 !vision
             );
         }
+        for (model, resolved, per_model_vision, provider_vision, warns) in [
+            ("o3-alias", "o3-mini", true, Some(false), false),
+            ("gpt-5", "gpt-5", false, Some(true), true),
+        ] {
+            let mut cfg = Config::default();
+            cfg.provider.model = model.into();
+            cfg.provider.vision = provider_vision;
+            cfg.provider.model_meta.insert(
+                resolved.into(),
+                formless_core::config::ModelMetaCfg {
+                    vision: Some(per_model_vision),
+                    ..Default::default()
+                },
+            );
+            if model == "o3-alias" {
+                cfg.provider.aliases.insert(model.into(), resolved.into());
+            }
+            cfg.save(&app.paths).unwrap();
+            app.notes.clear();
+            app.add_attachment("fixture.png".into(), vec![1]);
+            assert_eq!(
+                app.notes
+                    .iter()
+                    .any(|note| note.contains("may not read images")),
+                warns,
+                "per-model vision override for {model}"
+            );
+        }
+        for (api_style, warns) in [("chat", true), ("anthropic", false)] {
+            let mut cfg = Config::default();
+            cfg.provider.model = "gpt-5".into();
+            cfg.provider.vision = Some(true);
+            cfg.provider.tool_mode = "prompt".into();
+            cfg.provider.api_style = api_style.into();
+            cfg.save(&app.paths).unwrap();
+            app.notes.clear();
+            app.attachments.clear();
+            app.add_attachment("fixture.png".into(), vec![1]);
+            assert_eq!(
+                formless_core::provider::model_sends_images(&cfg.provider, "gpt-5"),
+                !warns,
+                "provider image gate for {api_style} prompt tools"
+            );
+            assert_eq!(
+                app.notes
+                    .iter()
+                    .any(|note| note.contains("may not read images")),
+                warns,
+                "TUI attachment warning for {api_style} prompt tools"
+            );
+        }
     }
 
     #[test]
@@ -27393,7 +27539,7 @@ mod tests {
         app.model_overlay = Some(ModelOverlay {
             picker: picker::ModelPicker::new(Vec::new()),
             meta: serde_json::Value::Null,
-            effort_idx: 0,
+            selected_effort: None,
             default_only: false,
         });
         app.paste("literal\nmodel");
@@ -27434,7 +27580,7 @@ mod tests {
         app.model_overlay = Some(ModelOverlay {
             picker: picker::ModelPicker::new(Vec::new()),
             meta: serde_json::Value::Null,
-            effort_idx: 0,
+            selected_effort: None,
             default_only: false,
         });
         app.on_event(reconnect_approval("fixture", "s1"));
@@ -32022,6 +32168,7 @@ mod tests {
             error: error.into(),
             duration_ms: 120,
             created_at: at.into(),
+            served_models: vec![],
         };
         app.tool_detail = Some(ToolDetail {
             description_review: Default::default(),
@@ -32038,7 +32185,14 @@ mod tests {
             used_by: vec![],
             example: None,
             recent_calls: vec![
-                call("i2", "failure", "timeout after 30s", "2026-01-01T10:05:00Z"),
+                ToolCallInfo {
+                    served_models: vec![formless_protocol::ServedModelInfo {
+                        name: "actual-model".into(),
+                        via: "fallback".into(),
+                        requested: "auto".into(),
+                    }],
+                    ..call("i2", "failure", "timeout after 30s", "2026-01-01T10:05:00Z")
+                },
                 call("i1", "success", "", "2026-01-01T10:00:00Z"),
             ],
             attention: vec!["the last 3 calls failed: timeout after 30s".into()],
@@ -32054,6 +32208,10 @@ mod tests {
         assert_eq!(app.call_idx, Some(0));
         app.key(key(KeyCode::Enter));
         let pager = app.pager.take().expect("pager");
+        assert!(pager
+            .lines
+            .iter()
+            .any(|line| line == "Served model: via actual-model (fallback)"));
         assert!(pager.lines.iter().any(|l| l == "Error:"));
         assert!(pager
             .lines
@@ -32673,7 +32831,7 @@ mod tests {
         let overlay = ModelOverlay {
             picker,
             meta: serde_json::json!({}),
-            effort_idx: 0,
+            selected_effort: None,
             default_only: false,
         };
         let render_overlay = |width, height| {
@@ -32756,13 +32914,66 @@ mod tests {
             o.picker.choice().as_deref(),
             Some("anthropic/claude-sonnet-4")
         );
-        assert_eq!(EFFORTS[o.effort_idx], Some("low"));
+        assert_eq!(o.selected_effort.as_deref(), Some("low"));
         for (w, h) in [(1, 1), (12, 4), (80, 24)] {
             render(&mut app, w, h);
         }
         assert!(render(&mut app, 80, 24).contains("Effort"));
         app.key(key(KeyCode::Esc));
         assert!(app.model_overlay.is_none());
+    }
+
+    #[test]
+    fn model_overlay_keeps_custom_effort_options() {
+        let mut picker = picker::ModelPicker::loading();
+        picker.set_items(
+            vec![picker::ModelItem {
+                id: "custom-model".into(),
+                source: None,
+                recent: false,
+                detail: None,
+            }],
+            "custom-model",
+        );
+        let overlay = ModelOverlay {
+            picker,
+            meta: serde_json::json!({"custom-model":{"efforts":["ultra"]}}),
+            selected_effort: Some("ultra".into()),
+            default_only: false,
+        };
+
+        assert_eq!(overlay.efforts(), vec![None, Some("ultra".into())]);
+        assert_eq!(overlay.effort().as_deref(), Some("ultra"));
+    }
+
+    #[test]
+    fn model_overlay_preserves_saved_effort_by_value() {
+        for (saved, listed) in [
+            ("xhigh", vec!["low", "xhigh"]),
+            ("low", vec!["high", "low"]),
+        ] {
+            let mut app = test_app();
+            app.view = View::Settings;
+            let mut cfg = Config::default();
+            cfg.provider.reasoning_effort = Some(saved.into());
+            cfg.save(&app.paths).unwrap();
+            let (client, _) = DaemonClient::recording();
+            app.client = Some(client);
+            app.open_model_picker();
+
+            let overlay = app.model_overlay.as_mut().unwrap();
+            overlay.picker.set_items(
+                vec![picker::ModelItem {
+                    id: "custom-model".into(),
+                    source: None,
+                    recent: false,
+                    detail: None,
+                }],
+                "custom-model",
+            );
+            overlay.meta = serde_json::json!({"custom-model":{"efforts":listed}});
+            assert_eq!(overlay.effort().as_deref(), Some(saved));
+        }
     }
 
     #[test]

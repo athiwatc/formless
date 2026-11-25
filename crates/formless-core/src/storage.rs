@@ -66,6 +66,7 @@ pub use runfile_storage::{
 
 #[path = "run_state_storage.rs"]
 mod run_state_storage;
+pub(crate) use run_state_storage::portable_plan;
 
 #[path = "topic_storage.rs"]
 mod topic_storage;
@@ -288,6 +289,106 @@ fn tool_list_reports_the_latest_retained_start_independently_of_metadata() {
         .unwrap();
     assert_eq!(pruned.invocations, 0);
     assert_eq!(pruned.last_used_at, None);
+}
+
+#[cfg(test)]
+#[test]
+fn invocation_served_models_are_exposed_in_tool_detail() {
+    let store = Store::open_in_memory().unwrap();
+    let caps = Capabilities::parse(&[]).unwrap();
+    let (tool, version) = store
+        .create_tool_version(
+            "served_model_fixture",
+            "served model fixture",
+            "{}",
+            "{}",
+            "",
+            &caps,
+            64,
+            "user",
+        )
+        .unwrap();
+    let invocation = store
+        .record_invocation(
+            &tool.id, version, None, None, None, "success", "", "{}", "answer", "", 1, 20,
+        )
+        .unwrap();
+    let served = formless_protocol::ServedModelInfo {
+        name: "actual-model".into(),
+        via: "fallback".into(),
+        requested: "requested-model".into(),
+    };
+    store
+        .add_invocation_served_model(&invocation, &served)
+        .unwrap();
+    let detail = store.tool_detail(&tool.id).unwrap().unwrap();
+    assert_eq!(detail.recent_calls[0].served_models, vec![served]);
+}
+
+#[cfg(test)]
+#[test]
+fn upgrade_paths_from_v80_v81_and_v82_reach_v84_and_preserve_data() {
+    let dir = std::env::temp_dir().join(format!("fl-upgrade-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for start_version in [80i64, 81, 82] {
+        let path = dir.join(format!("v{start_version}.db"));
+        {
+            let conn = Connection::open(&path).unwrap();
+            for (target, step) in MIGRATIONS {
+                if target <= start_version {
+                    step(&conn).unwrap();
+                }
+            }
+            conn.execute_batch(&format!("PRAGMA user_version={start_version};"))
+                .unwrap();
+            if start_version >= 81 {
+                conn.execute(
+                    "INSERT INTO sessions(id,name,created_at,updated_at) VALUES('s1','s1','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO imported_session_bundles(fingerprint,session_id) VALUES('fp-1','s1')",
+                    [],
+                )
+                .unwrap();
+            }
+        }
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION, "from v{start_version}");
+        if start_version >= 81 {
+            let sid: String = store
+                .conn
+                .query_row(
+                    "SELECT session_id FROM imported_session_bundles WHERE fingerprint='fp-1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(sid, "s1");
+        }
+        let has_col = |table: &str, col: &str| -> bool {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let found = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .any(|c| c == col);
+            found
+        };
+        assert!(has_col("imported_session_bundles", "fingerprint"));
+        assert!(has_col("jobs", "source_session_id"));
+        assert!(has_col("invocations", "served_models"));
+        assert!(has_col("subagents", "served_model"));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 const RUN_INSPECT_EXACT: &str = "SELECT id,session_id,status,error,steps,created_at,updated_at,
@@ -964,7 +1065,7 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 80;
+pub const SCHEMA_VERSION: i64 = 84;
 
 #[path = "topic_context.rs"]
 mod topic_context;
@@ -1254,8 +1355,25 @@ fn migrate_v80(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v81(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS imported_session_bundles (
+           fingerprint TEXT PRIMARY KEY,
+           session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_imported_session_bundles_session
+           ON imported_session_bundles(session_id);",
+    )?;
+    Ok(())
+}
+
+fn migrate_v82(conn: &Connection) -> Result<()> {
+    add_column(conn, "jobs", "source_session_id TEXT")?;
+    Ok(())
+}
+
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 78] = [
+const MIGRATIONS: [(i64, MigrationStep); 82] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1622,6 +1740,12 @@ const MIGRATIONS: [(i64, MigrationStep); 78] = [
     }),
     (79, |c| Ok(c.execute_batch(SCHEMA_V79)?)),
     (80, migrate_v80),
+    (81, migrate_v81),
+    (82, migrate_v82),
+    (83, |c| {
+        add_column(c, "invocations", "served_models TEXT NOT NULL DEFAULT '[]'")
+    }),
+    (84, |c| add_column(c, "subagents", "served_model TEXT")),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -2964,6 +3088,32 @@ impl Store {
         self.get_session(&s.id).map(|o| o.unwrap_or(s))
     }
 
+    pub(crate) fn imported_session_for_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT session_id FROM imported_session_bundles WHERE fingerprint=?1",
+                params![fingerprint],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn remember_imported_session_fingerprint(
+        &self,
+        fingerprint: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        self.ex(
+            "INSERT OR IGNORE INTO imported_session_bundles(fingerprint,session_id) VALUES(?1,?2)",
+            params![fingerprint, session_id],
+        )?;
+        Ok(())
+    }
+
     /// Fork a session: copy its messages (optionally only up to `up_to_seq`)
     /// and checkpoints into a new independent session.
     pub fn fork_session(
@@ -3534,6 +3684,35 @@ impl Store {
         Ok(())
     }
 
+    pub fn add_invocation_served_model(
+        &self,
+        inv_id: &str,
+        served_model: &formless_protocol::ServedModelInfo,
+    ) -> Result<()> {
+        use rusqlite::OptionalExtension;
+        let stored = self
+            .conn
+            .query_row(
+                "SELECT served_models FROM invocations WHERE id=?1",
+                params![inv_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(());
+        };
+        let mut models: Vec<formless_protocol::ServedModelInfo> =
+            serde_json::from_str(&stored).unwrap_or_default();
+        if !models.contains(served_model) {
+            models.push(served_model.clone());
+            self.ex(
+                "UPDATE invocations SET served_models=?2 WHERE id=?1",
+                params![inv_id, serde_json::to_string(&models)?],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn add_invocation_tokens(&self, inv_id: &str, tokens: i64) -> Result<()> {
         self.ex(
             "UPDATE invocations SET tokens=tokens+?2 WHERE id=?1",
@@ -3547,6 +3726,7 @@ impl Store {
             id: r.get("id")?,
             prompt: r.get("prompt")?,
             session_id: r.get("session_id")?,
+            source_session_id: r.get("source_session_id")?,
             cron: r.get("cron")?,
             next_run: r.get("next_run")?,
             last_run: r.get("last_run")?,
@@ -3578,6 +3758,14 @@ impl Store {
             let d = (!empty).then(|| d.to_string());
             self.ex("UPDATE jobs SET deliver=?2 WHERE id=?1", params![id, d])?;
         }
+        Ok(())
+    }
+
+    pub fn set_job_source_session_id(&self, id: &str, source_session_id: &str) -> Result<()> {
+        self.ex(
+            "UPDATE jobs SET source_session_id=?2 WHERE id=?1",
+            params![id, source_session_id],
+        )?;
         Ok(())
     }
 
@@ -4223,7 +4411,7 @@ impl Store {
         };
         Ok(serde_json::json!({
             "messages": sum("SELECT SUM(length(content) + COALESCE(length(meta),0)) FROM messages")?,
-            "invocations": sum("SELECT SUM(length(input) + length(output) + length(error)) FROM invocations")?,
+            "invocations": sum("SELECT SUM(length(input) + length(output) + length(error) + length(served_models)) FROM invocations")?,
             "tool_versions": sum("SELECT SUM(length(code) + length(input_schema) + length(output_schema)) FROM tool_versions")?,
             "run_files": sum("SELECT SUM(COALESCE(length(before),0)) FROM run_files")?,
         }))
@@ -4584,6 +4772,9 @@ impl Store {
     fn row_subagent(r: &rusqlite::Row) -> rusqlite::Result<SubagentInfo> {
         Ok(SubagentInfo {
             model: r.get("model")?,
+            served_model: r
+                .get::<_, Option<String>>("served_model")?
+                .and_then(|value| serde_json::from_str(&value).ok()),
             id: r.get("id")?,
             session_id: r.get("session_id")?,
             run_id: r.get("run_id")?,
@@ -4652,10 +4843,18 @@ impl Store {
         Ok(())
     }
 
-    pub fn finish_subagent(&self, id: &str, status: &str, result: &str) -> Result<SubagentInfo> {
+    pub fn finish_subagent(
+        &self,
+        id: &str,
+        status: &str,
+        result: &str,
+        model: &str,
+        served_model: Option<&formless_protocol::ServedModelInfo>,
+    ) -> Result<SubagentInfo> {
+        let served_model = served_model.map(serde_json::to_string).transpose()?;
         self.ex(
-            "UPDATE subagents SET status=?2, result=?3, updated_at=?4 WHERE id=?1",
-            params![id, status, result, now()],
+            "UPDATE subagents SET status=?2, result=?3, updated_at=?4, model=?5, served_model=?6 WHERE id=?1",
+            params![id, status, result, now(), model, served_model],
         )?;
         self.get_subagent(id)?.context("sub-agent vanished")
     }
@@ -6030,7 +6229,7 @@ impl Store {
         };
         let recent_calls = {
             let mut stmt = self.ps(
-                "SELECT id, version, session_id, status, input, output, error, duration_ms, created_at
+                "SELECT id, version, session_id, status, input, output, error, duration_ms, created_at, served_models
                  FROM invocations WHERE tool_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT 20",
             )?;
             let rows = stmt
@@ -6045,6 +6244,8 @@ impl Store {
                         error: cap(r.get(6)?),
                         duration_ms: r.get(7)?,
                         created_at: r.get(8)?,
+                        served_models: serde_json::from_str(&r.get::<_, String>(9)?)
+                            .unwrap_or_default(),
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -8525,6 +8726,48 @@ mod subagent_message_projection_tests {
             Some(&serde_json::json!({"appended":"last"}))
         );
     }
+
+    #[test]
+    fn subagent_served_model_is_stored_separately_from_model_label() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store
+            .create_session(Some("served model fixture".into()))
+            .unwrap();
+        let agent = store
+            .create_subagent(
+                &session.id,
+                "fixture-run",
+                "fixture",
+                0,
+                "reviewer · requested",
+            )
+            .unwrap();
+        let served = formless_protocol::ServedModelInfo {
+            name: "fallback".into(),
+            via: "fallback".into(),
+            requested: "requested".into(),
+        };
+        let finished = store
+            .finish_subagent(
+                &agent.id,
+                "completed",
+                "answer",
+                &agent.model,
+                Some(&served),
+            )
+            .unwrap();
+        assert_eq!(finished.model, "reviewer · requested");
+        assert_eq!(finished.served_model, Some(served));
+        assert_eq!(
+            store.list_subagents(&session.id).unwrap(),
+            vec![finished.clone()]
+        );
+
+        let mut legacy = serde_json::to_value(finished).unwrap();
+        legacy.as_object_mut().unwrap().remove("served_model");
+        let legacy: formless_protocol::SubagentInfo = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.served_model.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -9018,7 +9261,7 @@ impl ContextCache {
 
 /// An imported transcript carries data, never local attachment authority.
 /// Fork copies use a separate trusted path and retain their recorded lineage.
-fn sanitize_imported_message_meta(meta: Option<&str>) -> Option<String> {
+pub(crate) fn sanitize_imported_message_meta(meta: Option<&str>) -> Option<String> {
     let raw = meta?;
     let Ok(mut value) = serde_json::from_str::<Value>(raw) else {
         return Some(raw.into());

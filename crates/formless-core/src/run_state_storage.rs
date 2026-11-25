@@ -64,7 +64,7 @@ fn plan_json(items: &[PlanItem]) -> Result<String> {
     }
     Ok(json)
 }
-fn portable_plan(value: &Value) -> Result<Vec<PlanItem>> {
+pub(crate) fn portable_plan(value: &Value) -> Result<Vec<PlanItem>> {
     let values = value.as_array().context("plan items must be an array")?;
     if values.len() > crate::tools::MAX_PLAN_ITEMS {
         anyhow::bail!("too many portable plan items");

@@ -437,6 +437,13 @@ without redesign.
   `pricing`, `context_length`, `architecture.input_modalities`,
   `supported_parameters`), else a built-in table for well-known families
   (GPT-5, o-series, GPT-4o/4.1, Claude, Gemini, reasoning-only models).
+  Built-in matches are anchored to family patterns and exclude known
+  text-only and embedding variants. Partial `supported_parameters` listings
+  add positive tool/reasoning facts only; absence does not downgrade a known
+  capability. Each model in the provider listing has a `source` (`endpoint`,
+  `builtin` or `mixed`) and an `inferred` list for guessed capability fields;
+  both pickers prefix guessed facts with `~`. `provider.model_meta` keyed by model id can
+  explicitly correct `vision`, `tools` or `efforts` after listing/table data.
   The TUI and web pickers show it on each row (`200k ctx · $3/$15 per M ·
   vision · tools`). TUI model prices retain the metadata's thousandths of
   USD per million tokens (0.075/0.007/0.001), trimming unused trailing zeros;
@@ -465,7 +472,20 @@ without redesign.
 - **Which model answered.** When another model than the requested one
   produced an answer (a fallback, or auto routing's pick), the message is
   stored with `meta.model {name, via, requested}` and clients show "via
-  gpt-4.1-mini (fallback)" under its header.
+  gpt-4.1-mini (fallback)" under its header. `via` is `fallback` when the
+  provider used a fallback attempt, or `routing:<picked-model>` when auto
+  routing selected the intended model. The pick is captured from the
+  resolved route, not inferred from model-name equality. Tool-call and
+  pause-turn assistant messages retain the same metadata.
+  Sub-agent assistant messages retain it in their transcript; completed
+  sub-agent nodes carry optional structured `served_model` attribution
+  separately from the role/model label. `llm.complete` keeps its text/value
+  result contract and records any served-model attribution on the enclosing
+  Tool Invocation; the invocation detail displays it.
+  Session exports preserve assistant message metadata. Headless `run` prints
+  a `via <name> (<via>)` line for a served-different final answer, and its
+  JSON result includes `served_model`. `ComparisonReady` includes the served
+  model for each fork when it differs from the compared model.
 - **Gateways and Azure.** `provider.query_params` are added to every
   request, `provider.api_key_header` sends the key in that header instead
   of `Authorization: Bearer`, and `extra_headers` as before. The provider
@@ -1076,6 +1096,8 @@ automatically.
   asked now and how each earlier one was answered. Each call is still
   answered on its own, so some can be approved and others denied. A call
   that an earlier "always" in the same batch already covers isn't asked.
+  Calls skipped in step mode are omitted from this pre-pass; every call left
+  to execute still goes through its approval checks.
 - **Building Tools instead of refusing** (`provider.tool_use_nudge`, on by
   default). The system prompt tells the agent that it has no abilities
   beyond its Tools and can always build one, and that it should never say
@@ -1219,8 +1241,9 @@ pasting paths.
   files retain credential classification. This convention does not certify their contents;
   credential ancestors, resolved secret targets, protected profile/key sources
   and configured sensitive-path rules still take precedence.
-- **Image capability guess.** With `provider.vision` unset, image-part
-  preparation and the TUI attachment warning share the model-name heuristic.
+- **Image capability guess.** `provider.model_meta[model].vision` overrides
+  `provider.vision`; if both are unset, image-part preparation and the TUI
+  attachment warning share the model-name heuristic.
   Full o1/o1-pro are included; o1-mini/preview, o3-mini, Gemma 3 270M/1B
   (including Ollama size tags), and Claude 1/2/Instant names are text-only
   exceptions before broad family matches. Explicit true/false overrides remain
@@ -1312,8 +1335,8 @@ pasting paths.
     File URLs preserve native drive/UNC paths and percent-encode reserved
     characters; dropping the URL resolves back to the same local file.
   - Attaching an image when the current model doesn't look vision-capable
-    (`provider.vision`, else a guess from the name) warns that it will get
-    a reference instead.
+    (`provider.model_meta[model].vision`, `provider.vision`, else a guess
+    from the name) warns that it will get a reference instead.
   The web composer has a 📎 file picker and accepts pasted images.
 - **`@` mentions:** typing `@` in the input opens a completion popup of
   files under the client's working directory (TUI) or the daemon's (web),
@@ -1492,9 +1515,10 @@ pasting paths.
 - **What the model sees:** each attachment adds a reference line to the
   message, `[attached: name (mime, bytes), artifact ID; read it with
   read_artifact]`. Images also go inline as `image_url` parts (8 MB max)
-  when the model accepts images: `provider.vision`, or a guess from the
-  model name when unset. This works on Chat Completions with native tool
-  calling; elsewhere the reference line alone is sent.
+  when the model accepts images: `provider.model_meta[model].vision`, then
+  `provider.vision`, or a guess from the model name when unset. This works on
+  Chat Completions with native tool calling; elsewhere the reference line
+  alone is sent.
 
 ### 5.7 What a Run changed
 
@@ -1791,14 +1815,19 @@ pasting paths.
   `StepPending {step_id, tool_name, arguments, index, count}` and waits
   for `StepDecision {step_id, action, arguments?}`: `continue` runs it,
   `edit` runs it with new arguments (a JSON object, also stored on the
-  call), `skip` answers the model that the user chose not to run it, and
-  `all` runs it and the rest of the Run without stopping (step mode off).
+  call) after they pass the Tool's input schema. An invalid edit is returned
+  to the deciding client and leaves the step waiting, without persisting or
+  dispatching the edit. `skip` answers the model that the user chose not to
+  run it, and `all` runs it and the rest of the Run without stopping (step
+  mode off).
   `StepResolved` tells every client the step was decided. Esc interrupts
   the Run as usual; with no client connected the Run does not wait.
 - The TUI shows the call and its arguments at the end of the chat: Enter
   runs it, `e` puts the arguments in the input to edit (Enter runs, Esc
   cancels), `s` skips, `a` runs the rest; the keys work while the input is
   empty. The web shows a banner with Run, Edit, Skip and Run the rest.
+  If a restored prompt only has a bounded arguments preview, the web disables
+  Edit with an explanation while keeping Run and Skip available.
 
 ### 5.10 Comparing models
 
@@ -3967,6 +3996,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   stored credential. Enter at an empty key step can reuse the stored
   credential for fetching/probing only when the endpoint matches the
   on-disk provider; it is never reused for a changed endpoint.
+- **Accessible first-time setup.** `formless setup` is a numbered, line-mode
+  alternative: choose a provider preset, enter an API key without echo, pick a
+  listed model or type its ID, and see the endpoint probe verdict. It saves the
+  provider and entered key only after a successful probe. Plain mode, `chat`,
+  and headless `run` name this command when setup is missing; their guidance
+  also names `FORMLESS_BASE_URL`, `FORMLESS_MODEL`, and `FORMLESS_API_KEY` as
+  the environment-based path for headless Runs without setup.
 - **Moving around.** Esc goes back one step at every step (effort →
   model → key → URL → provider), keeping what was typed; the header shows
   "step N of 5". Going back invalidates outstanding model-list/probe
@@ -5109,6 +5145,9 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
 - **Plain mode for screen readers.** `formless --plain` (or
   `tui.screen_reader = true`) runs a line-oriented client instead of the
   full-screen TUI: no alternate screen, redraws, spinners or box drawing.
+  When no provider is configured, it exits non-zero and points to
+  `formless setup` (or the active profile's equivalent) and the documented
+  environment variables for headless Runs.
   - Each event prints once, as a sentence, in order: the streamed answer
     after "Formless:", "Tool started: name.", "Run paused: why. Next: what
     to do.", and notes.
@@ -5452,6 +5491,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless runs` | No action: list; `show`, `cancel`, `running` | List recent Runs, inspect/cancel an exact Run, or read a live Invocation snapshot. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
 | `formless sessions` | `subagents`, `subagent`, `fork`, `compare`, `list`, `show`, `usage`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `pin`, `unpin`, `tag`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
+| `formless setup` | No arguments | Configure a first provider in line mode for screen readers; choose a preset and model, enter a hidden API key, then verify the endpoint. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `diff`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
@@ -5690,9 +5730,9 @@ previous headless Run's Session.
     an unknown key exits 2.
   - `set KEY VALUE` goes through the settings API, so it's validated against
     the allow-list, audited and hot. VALUE is JSON when it parses (`5`,
-    `true`, `["a"]`), else text. The five exposed maps (`provider.prices`,
+    `true`, `["a"]`), else text. The six exposed maps (`provider.prices`,
     `provider.model_context_tokens`, `provider.model_audio_input`,
-    `provider.model_pdf_input`, `tui.colors`) use `MergeSetting` by default:
+    `provider.model_pdf_input`, `provider.model_meta`, `tui.colors`) use `MergeSetting` by default:
     supplied entries replace their whole value, null entries are removed,
     and siblings survive. `--replace` uses `SetSetting` for whole-map
     replacement; `--replace '{}'` clears. Lists remain replace-only.
@@ -5939,6 +5979,24 @@ responses; clearing search invalidates outstanding results. Opening a Session
 clears the previous transcript immediately and merges live messages received
 during its snapshot fetch, deduplicated by message id.
 
+When a Relay browser returns to a visible page or comes back online, it probes
+the authenticated encrypted connection immediately and refreshes the selected
+Session (or all Sessions) from daemon state after success. While visible, it
+sends an encrypted health probe every 10 seconds and replaces an unresponsive
+socket after 15 seconds without a response or valid Relay transport progress
+(a quiet failure is detected within one probe interval plus that deadline),
+without waiting for a close event. The daemon retires a browser channel after
+five minutes without browser transport input; the Relay closes that channel
+with code 4002. Mobile platforms may suspend a hidden page and its probes long
+enough to reach this deadline, so on return the browser rechecks or reopens the
+connection and reloads state rather than assuming the subscription survived.
+An installed PWA uses the Badging API, when available,
+to show the count of pending approvals and clears the badge when none remain.
+While watching a running Session, a user may opt in to Keep awake; the screen
+wake lock is released when the page is hidden or the Run is no longer active
+and reacquired on return if the user opted in. Unsupported or rejected
+platform APIs leave the feature inactive and do not retry automatically.
+
 - `formless relay enable|disable|status` controls the hosted Relay: the
   daemon dials out to `relay.url` (default
   `wss://formless.athiwat.xyz`) and browsers meet it there — no inbound
@@ -6061,10 +6119,11 @@ during its snapshot fetch, deduplicated by message id.
   after a link has stayed up (daemon 60 s, page 30 s after the
   handshake), so a relay that accepts and drops at once is not hammered.
   **Teardown:** the Relay sends `client_close` / `daemon_offline` once
-  per socket whether it closed or errored. Browsers send a `Ping` every
-  minute; the daemon drops a browser it has heard nothing from for 5
-  minutes (code 4002), so a vanished tab never stays an approval
-  subscriber.
+  per socket whether it closed or errored. Mobile platforms may suspend a
+  hidden page before its application probes run; the browser therefore
+  rechecks or reopens its authenticated connection and reloads state when it
+  becomes visible or online, rather than promising that a hidden subscription
+  stays alive.
   **Pairing by QR code:** `formless relay enable` (and `formless relay
   status --qr`) print the browser link as a terminal QR code (error
   correction level M, a 4-module quiet zone drawn light), white on
@@ -6178,16 +6237,18 @@ during its snapshot fetch, deduplicated by message id.
   are added, removed settings are deleted, and keys this build doesn't
   read (a newer build's, your own notes as keys) stay. Writes are atomic:
   a temporary file beside it, flushed to disk, renamed over it, so a crash
-  leaves the old file or the new one.
+  leaves the old file or the new one. The daemon logs unknown configuration
+  keys at startup, `doctor` reports them, and `config edit` warns before
+  saving; close matches include a suggestion from this section's key set.
 - **Changing settings from a client:** clients never write the file.
   `SetSetting {key, value}` replaces one value. `MergeSetting {key, value}`
-  accepts a JSON object for one of the five exposed maps listed above,
+  accepts a JSON object for one of the six exposed maps listed above,
   merging or deleting entries atomically within the serialized edit.
   Merge is a separate request so an older daemon rejects it instead of
   ignoring an unfamiliar mode field and destructively replacing a map.
   Existing full-map editors continue to use replacement. After an exposed
   map root, the complete dotted suffix is one literal entry name (including
-  dots and slashes), e.g. `provider.model_context_tokens.vendor/qwen2.5`.
+  dots and slashes), e.g. `provider.model_meta.vendor/qwen2.5`.
   `SetSetting` with null removes that one entry; get, harness snapshot/undo,
   and setters use this same grammar. `models.set` admits entries only for
   its allow-listed model maps; prices remain `config.set`. The
@@ -6242,12 +6303,14 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `run_files.max_files_per_run` / `max_bytes_per_run` | 128 / 16777216 | Recovery admission caps per Run, counting original bytes plus descriptor metadata; overflow keeps paths with a reason; 0 keeps no new recovery payload (§5.7) |
 | `run_files.keep_runs_per_session` / `max_age_days` / `max_total_mb` | 10 / 30 / 256 | Recovery retention per Session, age and profile MiB; 0 expires eligible payload, active/latest Runs remain protected, expired paths stay listed (§5.7) |
 | `provider.base_url` | — (wizard) | Verbatim endpoint base (§4.1) |
+| `provider.preset` | — (endpoint inferred) | Preset ID selected by setup; an explicit ID takes precedence over matching the endpoint (§4.2) |
 | `relay.enabled` | `false` | Dial out to the hosted Relay on daemon start (§12) |
 | `relay.url` | `wss://formless.athiwat.xyz` | Relay websocket base URL |
 | `provider.extra_headers` | {} | Free-form headers per request (§4.1) |
 | `provider.model` / `reasoning_effort` | — (wizard) | Daemon-wide defaults (§4.2) |
 | `provider.context_tokens` (per model) | 128000 | Compaction trigger basis (§4.2, §11) |
 | `provider.model_context_tokens` | {} | Context size per model id, overriding the endpoint-reported size and `context_tokens` for that model (§4.2, §11) |
+| `provider.model_meta` | {} | Per-model corrections to reported/inferred vision, tools and reasoning efforts (§4.2) |
 | `provider.auto_test_models` | false | Opt into background testing of untested or retry-eligible failed selected models; tests can spend paid tokens. Explicit Test actions remain available when off (§4.3) |
 | `provider.max_retries` | 5 | Bounded backoff attempts (§4.4) |
 | `provider.cache_control` | `auto` | Prompt-cache breakpoints (`cache_control`) on the system prompt and last stable message: `auto` for Claude models, `on`, `off`. Decided per model tried, so a fallback that isn't Claude gets plain content; applied to one-shot completions (compaction, `llm.complete`) too; a 400 naming `cache_control` resends once without them (§4.2) |
@@ -6269,7 +6332,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.routing_complex_chars` | 20000 | Character-equivalent threshold (÷4 tokens) for calibrated prompt complexity |
 | `provider.routing_window_days` | 30 | Recent event window used by call and role auto-routing; positive days (§4.6) |
 | `provider.routing_min_samples` / `provider.routing_quality_bar` | 5 / 0.8 | Main auto-model quality gate before USD-per-success ranking; role thresholds remain separate (§4.6) |
-| `provider.vision` | (by model name) | Send attached images as image parts (§5.6) |
+| `provider.vision` | (by model name) | Default vision setting when no `provider.model_meta[model].vision` override exists (§5.6) |
 | `provider.audio_input` / `provider.pdf_input` | known endpoint/model only | Permit native audio/PDF attachments (§5.6); unknown adapters/models retain references. API-style gates still apply. |
 | `provider.model_audio_input` / `provider.model_pdf_input` | {} | Boolean overrides by resolved model ID, before provider defaults. An explicit audio override asserts Chat WAV/MP3 support; Gemini's inferred default is WAV only. |
 | `provider.image_max_px` | 1568 | Longest side, in pixels, of an attached image sent to a vision model; bigger ones are scaled down once per Session and the encoded image kept for later steps (0: never scale). An image that can't be sent (gone, unreadable, over 8 MB) leaves a marker for the model and a note for the user (§4.2) |
@@ -6491,10 +6554,22 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   `headers`); API keys never leave the keychain. `--sessions` adds every
   Session's transcript. `formless import-all FILE` (`ImportAll`) only
   adds: providers, Roles and MCP servers this machine lacks; modules
-  before Tools; Tools as imports (renamed on collision, §7.8); Skills
-  disabled for review; memories (duplicates skipped); jobs paused; and
-  Sessions as new ones. It reports counts, the values to fill in and
-  anything that failed.
+  before Tools; Tools as imports (renamed on collision for individual
+  imports, §7.8; import-all skips existing names); Skills disabled for
+  review unless their names already exist; memories (duplicates skipped);
+  jobs paused; and Sessions. Re-importing the same setup skips existing
+  entries, including jobs with the same prompt, optional source Session
+  binding, schedule, overlap policy
+  and delivery target, and Sessions with the same normalized name, model,
+  reasoning effort, transcript metadata, checkpoints and portable plan history.
+  An imported Session retains its source identity so re-import remains a skip
+  after the local Session evolves; local Run provenance is not portable identity.
+  A job's source Session ID is carried only for deduplication; imported jobs
+  remain standalone when no matching local Session-bound job exists.
+  Recurring job schedules use the destination machine's local time; bundles do
+  not carry a separate timezone.
+  The result reports added and skipped-existing counts per kind, the values
+  to fill in and anything that failed.
 - **Deletion:** Session delete removes transcripts + Invocation payloads but
   keeps anonymised per-Tool tallies (payloads gone, counts stay). Tool purge
   removes everything incl. tallies. **Full reset** (Settings or
@@ -6840,7 +6915,9 @@ configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 `FORMLESS_TEST_MAINTENANCE_CONFIG`, `FORMLESS_TEST_MAINTENANCE_DATA`,
 `FORMLESS_TEST_MAINTENANCE_ISOLATION`, `FORMLESS_TEST_MAINTENANCE_OPERATION`,
 `FORMLESS_TEST_OWNERSHIP_CONFIG`, `FORMLESS_TEST_OWNERSHIP_DATA`,
-`FORMLESS_TEST_PANIC_MARKER`, and `FORMLESS_TEST_DOCTOR_ARGS` (JSON CLI arguments
+`FORMLESS_TEST_PANIC_MARKER`, `FORMLESS_TEST_CONFIG_EDIT_ARGS` (JSON CLI
+arguments for the test-only config-edit subprocess, which uses a fake editor to
+verify unknown-key warnings), and `FORMLESS_TEST_DOCTOR_ARGS` (JSON CLI arguments
 for the test-only doctor subprocess, which installs an in-memory credential
 backend before read-only dispatch; the shipped binary does not read this variable).
 
@@ -6878,6 +6955,13 @@ unrelated history leave an otherwise identical quote valid.
 No history means prompt size only; missing prices mean no dollar range. Cache
 fractions and compaction probabilities describe comparable history, not guarantees.
 A draft already above the local compaction trigger is flagged immediately.
+
+The optional `RunForecast.routing_pick` wire field names the model selected when
+the effective forecast selector was automatically routed. It is omitted when no
+automatic route occurred, rather than serialized as `null`. This records the
+forecast's selection, not a provider attempt or a guarantee of the response's
+served model; response attribution records the model that actually served the
+response, including fallback.
 
 TUI/web composer hints debounce and discard stale results after draft, Session,
 model, attachment, persisted context, Tool or settings changes. Retry, edit and

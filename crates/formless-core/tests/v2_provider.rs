@@ -263,6 +263,79 @@ async fn model_failover_routes_to_fallback() {
         .unwrap();
     assert_eq!(out.content, "hello from good");
     assert_eq!(out.model_used, "good");
+    assert!(out.used_fallback);
+}
+
+#[tokio::test]
+async fn stream_retry_retains_fallback_provenance_after_request_repair() {
+    let _env = credential_env::EnvGuard::isolated();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let models = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = Router::new().route(
+        "/chat/completions",
+        post({
+            let calls = calls.clone();
+            let models = models.clone();
+            move |Json(body): Json<Value>| {
+                let calls = calls.clone();
+                let models = models.clone();
+                async move {
+                    let index = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    models.lock().unwrap().push(body["model"].as_str().unwrap().to_string());
+                    if body["model"] == "bad" {
+                        return (
+                            axum::http::StatusCode::NOT_FOUND,
+                            Json(json!({"error":{"message":"model not found"}})),
+                        )
+                            .into_response();
+                    }
+                    if index == 1 {
+                        assert!(body.to_string().contains("cache_control"));
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(json!({"error":{"message":"cache_control is not supported"}})),
+                        )
+                            .into_response();
+                    }
+                    let event = if index == 2 {
+                        json!({"error":{"code":"rate_limit_exceeded","message":"retry"}})
+                    } else {
+                        json!({"choices":[{"delta":{"content":"recovered"},"finish_reason":"stop"}]})
+                    };
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(format!("data: {event}\n\ndata: [DONE]\n\n")))
+                        .unwrap()
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut config = cfg(&base);
+    config.model = "bad".into();
+    config.cache_control = "on".into();
+    config.max_retries = 1;
+    config.max_backoff_secs = 0;
+    let provider = Provider::new(config, "key".into()).unwrap();
+    let result = provider
+        .chat_stream(
+            &[json!({"role":"user","content":"hi"})],
+            &[],
+            "bad",
+            None,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.content, "recovered");
+    assert_eq!(result.model_used, "good");
+    assert!(result.used_fallback);
+    assert_eq!(*models.lock().unwrap(), ["bad", "good", "good", "good"]);
+    server.abort();
 }
 
 /// A multibyte character split across network chunks must survive intact
@@ -866,7 +939,15 @@ fn model_metadata_comes_from_the_listing_or_the_table() {
          "architecture": {"input_modalities": ["text", "image"]},
          "supported_parameters": ["tools", "reasoning"]},
         {"id": "plain", "supported_parameters": ["temperature"]},
-        {"id": "gpt-5-mini"}
+        {"id": "gpt-5-mini", "supported_parameters": ["tools"]},
+        {"id": "my-gemini-embed"},
+        {"id": "gemini-embedding-001"},
+        {"id": "vendor/prefix-gpt-5"},
+        {"id": "vendor/prefix-claude-3-haiku"},
+        {"id": "claude-3-7-sonnet", "max_tokens": 64000,
+         "architecture": {"input_modalities": ["text", "image"]},
+         "supported_parameters": ["tools"]},
+        {"id": "anthropic/claude-2.1"}
     ]});
     let meta = parse_model_meta(&body);
     let v = &meta["vendor/visionary"];
@@ -883,16 +964,31 @@ fn model_metadata_comes_from_the_listing_or_the_table() {
         (Some(3.0), Some(15.0))
     );
     assert_eq!(v["efforts"], json!(["low", "medium", "high"]));
-    assert_eq!(
-        meta["plain"]["efforts"],
-        json!([]),
-        "no reasoning parameter: effort has no effect"
-    );
-    assert_eq!(meta["plain"]["tools"], false);
+    assert_eq!(v["source"], "endpoint");
+    assert_eq!(v["inferred"], json!(["efforts"]));
+    assert!(meta["plain"].get("efforts").is_none());
+    assert!(meta["plain"].get("tools").is_none());
+    assert_eq!(meta["plain"]["source"], "endpoint");
     assert_eq!(
         meta["gpt-5-mini"]["efforts"],
         json!(["minimal", "low", "medium", "high"])
     );
+    assert_eq!(meta["gpt-5-mini"]["source"], "mixed");
+    assert_eq!(meta["gpt-5-mini"]["inferred"], json!(["vision", "efforts"]));
+    assert_eq!(meta["my-gemini-embed"]["source"], "endpoint");
+    assert_eq!(meta["gemini-embedding-001"]["source"], "endpoint");
+    assert_eq!(meta["vendor/prefix-gpt-5"]["source"], "endpoint");
+    assert_eq!(meta["vendor/prefix-claude-3-haiku"]["source"], "endpoint");
+    assert!(meta["vendor/prefix-gpt-5"].get("vision").is_none());
+    assert!(meta["vendor/prefix-claude-3-haiku"].get("tools").is_none());
+    assert_eq!(meta["claude-3-7-sonnet"]["source"], "endpoint");
+    assert_eq!(meta["claude-3-7-sonnet"]["vision"], true);
+    assert_eq!(meta["claude-3-7-sonnet"]["tools"], true);
+    assert_eq!(meta["claude-3-7-sonnet"]["max_output"], 64000);
+    assert!(meta["claude-3-7-sonnet"].get("inferred").is_none());
+    assert_eq!(known_model_meta("gpt-5-mini")["source"], "builtin");
+    assert_eq!(known_model_meta("anthropic/claude-2.1")["vision"], false);
+    assert_eq!(known_model_meta("openai/o3-mini")["vision"], false);
     assert!(
         known_model_meta("some-unknown").get("efforts").is_none(),
         "unknown: all offered"

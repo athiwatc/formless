@@ -5473,6 +5473,7 @@ mod tests {
             let cancel = Arc::new(AtomicBool::new(false));
             let flag = cancel.clone();
             let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+            let (return_tx, return_rx) = std::sync::mpsc::channel();
             let caller = std::thread::spawn(move || {
                 cancellable_work(&flag, move || {
                     let result = send_prepared_timeout_request(req, addr, &client).and_then(
@@ -5486,6 +5487,9 @@ mod tests {
                     // A completion signal from inside the abandoned worker, not
                     // merely the caller returning or a sleep that hopes it stopped.
                     completed_tx.send(result.clone()).unwrap();
+                    // Keep the real I/O deadline, but don't race delivering its
+                    // result against scheduling the cancellation observer.
+                    let _ = return_rx.recv_timeout(std::time::Duration::from_secs(5));
                     result
                 })
             });
@@ -5494,6 +5498,7 @@ mod tests {
                 .unwrap();
             cancel.store(true, Ordering::SeqCst);
             assert_eq!(caller.join().unwrap().unwrap_err(), "interrupted");
+            return_tx.send(()).unwrap();
             let error = completed_rx
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .unwrap()

@@ -264,6 +264,7 @@ impl Daemon {
         validation?;
         result.content = repaired.text;
         result.model_used = repaired.model_used;
+        result.used_fallback = repaired.used_fallback;
         result.stop_reason = None;
         result.stop_detail = None;
         result.truncated = false;

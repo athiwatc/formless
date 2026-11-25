@@ -37,6 +37,25 @@ impl Fixture {
         Self::with_send_reply(paused, obsolete, json!({"run_id": "headless-761"}))
     }
     fn with_send_reply(paused: bool, obsolete: bool, send_reply: Value) -> Self {
+        Self::with_send_reply_and_model(paused, obsolete, send_reply, None)
+    }
+    fn with_served_model() -> Self {
+        Self::with_send_reply_and_model(
+            false,
+            false,
+            json!({"run_id": "headless-761"}),
+            Some(
+                json!({"model":{"name":"fallback-model","via":"fallback","requested":"requested-model"}})
+                    .to_string(),
+            ),
+        )
+    }
+    fn with_send_reply_and_model(
+        paused: bool,
+        obsolete: bool,
+        send_reply: Value,
+        served_model_meta: Option<String>,
+    ) -> Self {
         static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
         let root = std::path::PathBuf::from("/tmp").join(format!(
             "fl-ho-{}-{}-{}",
@@ -67,9 +86,10 @@ impl Fixture {
             .set_session_cwd(&session.id, Some("stored-directory"))
             .unwrap()
             .unwrap();
-        let answer = store
+        let mut answer = store
             .append_message(&session.id, "assistant", "ONLY_FINAL_ANSWER_761")
             .unwrap();
+        answer.meta = served_model_meta;
         let sid = &session.id;
         let decode = |value| serde_json::from_value::<Event>(value).unwrap();
         let status = if paused { "paused" } else { "completed" };
@@ -468,6 +488,37 @@ fn interleaved_run_metadata_preserves_every_headless_stdout_mode() {
             }
         }
     }
+}
+
+#[test]
+fn quiet_headless_output_suppresses_served_model_feedback() {
+    let fixture = Fixture::with_served_model();
+    let output = fixture.run("text", true, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ONLY_FINAL_ANSWER_761\n");
+    assert!(
+        output.stderr.is_empty(),
+        "quiet output must suppress served-model feedback: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn redirected_final_headless_output_keeps_served_model_feedback() {
+    let fixture = Fixture::with_served_model();
+    let output = fixture.run("final", false, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ONLY_FINAL_ANSWER_761\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("via fallback-model (fallback)"), "{stderr}");
 }
 
 #[test]

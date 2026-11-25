@@ -116,3 +116,32 @@ async fn branch_rpc_is_local_write_free_and_preserves_typed_failures() {
     );
     assert!(error.to_string().contains("No partial diff was sent"));
 }
+
+#[test]
+fn comparison_attribution_tracks_the_displayed_answer_after_the_fork_prompt() {
+    let message = |seq, role: &str, content: &str, model: &str| formless_protocol::MessageInfo {
+        id: format!("m{seq}"),
+        session_id: "fork".into(),
+        seq,
+        role: role.into(),
+        generated_by: None,
+        content: content.into(),
+        created_at: String::new(),
+        meta: Some(
+            serde_json::json!({"model":{"name":model,"via":"fallback","requested":"auto"}})
+                .to_string(),
+        ),
+    };
+    let messages = vec![
+        message(1, "assistant", "ancestor answer", "ancestor-model"),
+        message(3, "assistant", "displayed answer", "answer-model"),
+        message(4, "assistant", "", "later-tool-call-model"),
+    ];
+    let (answer, served_model) = Daemon::comparison_answer(&messages, 2);
+    assert_eq!(answer, "displayed answer");
+    assert_eq!(served_model.unwrap().name, "answer-model");
+
+    let (answer, served_model) = Daemon::comparison_answer(&messages[..1], 2);
+    assert!(answer.is_empty());
+    assert!(served_model.is_none());
+}
