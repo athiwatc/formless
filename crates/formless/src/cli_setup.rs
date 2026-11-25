@@ -199,33 +199,38 @@ fn read_hidden_line<R: BufRead, W: Write>(
     }
 
     crossterm::terminal::enable_raw_mode().context("hide terminal echo for the API key")?;
-    let secret = (|| -> Result<String> {
-        let mut secret = String::new();
-        loop {
-            if let crossterm::event::Event::Key(event) = crossterm::event::read()? {
-                use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-                if event.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match event.code {
-                    KeyCode::Enter => break,
-                    KeyCode::Backspace => {
-                        secret.pop();
-                    }
-                    KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => {
-                        bail!("setup cancelled")
-                    }
-                    KeyCode::Char(character) => secret.push(character),
-                    _ => {}
-                }
-            }
-        }
-        Ok(secret)
-    })();
+    let secret = read_hidden_events(|| crossterm::event::read().map_err(Into::into));
     let restored = crossterm::terminal::disable_raw_mode();
     writeln!(output)?;
     restored.context("restore terminal after API key entry")?;
     secret
+}
+
+fn read_hidden_events<F>(mut next_event: F) -> Result<String>
+where
+    F: FnMut() -> Result<crossterm::event::Event>,
+{
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+    let mut secret = String::new();
+    loop {
+        if let Event::Key(event) = next_event()? {
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            match event.code {
+                KeyCode::Enter => break,
+                KeyCode::Backspace => {
+                    secret.pop();
+                }
+                KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    bail!("setup cancelled")
+                }
+                KeyCode::Char(character) => secret.push(character),
+                _ => {}
+            }
+        }
+    }
+    Ok(secret)
 }
 
 fn runtime_api_key_override() -> Option<(&'static str, String)> {
@@ -290,10 +295,27 @@ mod tests {
     use formless_core::provider::ProbeResult;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    struct CleanupKey(Paths);
+    impl Drop for CleanupKey {
+        fn drop(&mut self) {
+            config::delete_api_key(&self.0);
+        }
+    }
+
+    fn ephemeral_paths(root: &std::path::Path, suffix: &str) -> (Paths, CleanupKey) {
+        let profile = format!("setup-test-{}-{suffix}", std::process::id());
+        let paths = Paths::from_dirs(root.join("data"), root.join("config"))
+            .unwrap()
+            .named(&profile)
+            .unwrap();
+        let cleanup = CleanupKey(paths.clone());
+        (paths, cleanup)
+    }
+
     #[test]
     fn setup_picks_numbered_preset_and_model_probes_then_saves_without_echoing_key() {
         let root = tempfile::tempdir().unwrap();
-        let paths = Paths::from_dirs(root.path().join("data"), root.path().join("config")).unwrap();
+        let (paths, _cleanup) = ephemeral_paths(root.path(), "save");
         let mut input = io::Cursor::new(b"1\nprivate-setup-test-key\n2\n".to_vec());
         let mut output = Vec::new();
         let listed = AtomicBool::new(false);
@@ -339,13 +361,15 @@ mod tests {
         assert!(output.contains("1. OpenAI"));
         assert!(output.contains("2. custom-model"));
         assert!(output.contains("Probe verdict: passed"));
+        assert!(output.contains(&format!("formless --profile {} chat", paths.profile)));
+        assert!(output.contains(&format!("formless --profile {} run TASK", paths.profile)));
         assert!(!output.contains("private-setup-test-key"));
     }
 
     #[test]
     fn failed_probe_reports_verdict_without_saving_provider_or_key() {
         let root = tempfile::tempdir().unwrap();
-        let paths = Paths::from_dirs(root.path().join("data"), root.path().join("config")).unwrap();
+        let (paths, _cleanup) = ephemeral_paths(root.path(), "fail");
         let mut input = io::Cursor::new(b"1\nprivate-setup-test-key\n1\n".to_vec());
         let mut output = Vec::new();
 
@@ -364,6 +388,47 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Probe verdict: failed (fixture probe failure)"));
         assert!(!output.contains("private-setup-test-key"));
+    }
+
+    #[test]
+    fn hidden_key_events_handle_typing_backspace_enter_and_cancel() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let press = |code, modifiers| {
+            Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            })
+        };
+        let release = |code| {
+            Event::Key(KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Release,
+                state: KeyEventState::NONE,
+            })
+        };
+
+        let mut events = vec![
+            press(KeyCode::Char('s'), KeyModifiers::NONE),
+            release(KeyCode::Char('s')),
+            press(KeyCode::Char('x'), KeyModifiers::NONE),
+            press(KeyCode::Backspace, KeyModifiers::NONE),
+            press(KeyCode::Char('k'), KeyModifiers::NONE),
+            press(KeyCode::Enter, KeyModifiers::NONE),
+        ]
+        .into_iter();
+        let secret = read_hidden_events(|| Ok(events.next().unwrap())).unwrap();
+        assert_eq!(secret, "sk");
+
+        let mut cancel = vec![
+            press(KeyCode::Char('a'), KeyModifiers::NONE),
+            press(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ]
+        .into_iter();
+        let err = read_hidden_events(|| Ok(cancel.next().unwrap())).unwrap_err();
+        assert!(err.to_string().contains("setup cancelled"));
     }
 
     #[test]
