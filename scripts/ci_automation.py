@@ -103,7 +103,7 @@ def successful_workflow(repo, workflow, pr, sha, branch):
     for page in pages:
         for job in page["jobs"]:
             previous = jobs.get(job["name"])
-            if previous is None or job["run_attempt"] > previous["run_attempt"]:
+            if previous is None or job.get("run_attempt", 1) > previous.get("run_attempt", 1):
                 jobs[job["name"]] = job
     return all(jobs.get(name, {}).get("conclusion") == "success" for name in REQUIRED_JOBS[workflow])
 

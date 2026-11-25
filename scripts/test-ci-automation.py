@@ -153,6 +153,21 @@ class AutomationTests(unittest.TestCase):
         automation.merge(REPO, self.run)
         self.gh.assert_not_called()
 
+    def test_missing_job_attempt_defaults_to_first_attempt(self):
+        self.run["run_attempt"] = 2
+        previous = self.jobs[17][0]
+        del previous["run_attempt"]
+        previous["conclusion"] = "failure"
+        rerun = {**previous, "run_attempt": 2, "conclusion": "success"}
+        other_jobs = self.jobs[17][1:]
+
+        for jobs in ([previous, rerun], [rerun, previous]):
+            with self.subTest(jobs=jobs):
+                self.gh.reset_mock()
+                self.jobs[17] = jobs + other_jobs
+                automation.merge(REPO, self.run)
+                self.assert_merge()
+
     def test_ready_for_review_reevaluates_previously_green_draft(self):
         self.pr["draft"] = True
         automation.dispatch("merge", REPO, {"workflow_run": self.run})
