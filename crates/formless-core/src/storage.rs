@@ -5837,39 +5837,51 @@ impl Store {
             "rolled_back" => ("status='applied'", false),
             other => return Err(anyhow::anyhow!("unknown proposal status '{other}'")),
         };
-        let changed = if applied {
-            self.ex(
-                &format!("UPDATE prompt_proposals SET status='applied', applied_at=?2 WHERE id=?1 AND {from}"),
-                params![id, now()],
-            )?
-        } else {
-            self.ex(
-                &format!("UPDATE prompt_proposals SET status=?2 WHERE id=?1 AND {from}"),
-                params![id, status],
-            )?
-        };
-        if changed == 0 {
-            return Ok(None);
-        }
-        let p = self.get_proposal(id)?;
-        // A memory proposal lives in the memory store (SPEC §7.11).
-        if let Some(p) = p.as_ref().filter(|p| p.kind == "memory") {
-            match status {
-                "applied" => {
-                    let (m, _) = self.add_memory(&p.content, "global", "optimiser", None)?;
-                    self.ex(
-                        "UPDATE memories SET proposal_id=?2 WHERE id=?1",
-                        params![m.id, p.id],
-                    )?;
-                }
-                "rolled_back" => {
-                    self.conn
-                        .execute("DELETE FROM memories WHERE proposal_id=?1", params![p.id])?;
-                }
-                _ => {}
+        self.transaction(|st| {
+            let changed = if applied {
+                st.ex(
+                    &format!("UPDATE prompt_proposals SET status='applied', applied_at=?2 WHERE id=?1 AND {from}"),
+                    params![id, now()],
+                )?
+            } else {
+                st.ex(
+                    &format!("UPDATE prompt_proposals SET status=?2 WHERE id=?1 AND {from}"),
+                    params![id, status],
+                )?
+            };
+            if changed == 0 {
+                return Ok(None);
             }
-        }
-        Ok(p)
+            let p = st.get_proposal(id)?;
+            // A memory proposal lives in the memory store (SPEC §7.11).
+            if let Some(p) = p.as_ref().filter(|p| p.kind == "memory") {
+                match status {
+                    "applied" => {
+                        let (m, created) =
+                            st.add_memory(&p.content, "global", "optimiser", None)?;
+                        if !created && !m.enabled {
+                            anyhow::bail!(
+                                "memory proposal matches an existing disabled note; enable or edit that note before applying the proposal"
+                            );
+                        }
+                        if created {
+                            st.ex(
+                                "UPDATE memories SET proposal_id=?2 WHERE id=?1",
+                                params![m.id, p.id],
+                            )?;
+                        }
+                    }
+                    "rolled_back" => {
+                        st.conn.execute(
+                            "DELETE FROM memories WHERE proposal_id=?1",
+                            params![p.id],
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(p)
+        })
     }
 
     /// Effective system prompt: frozen bootstrap + applied guidance

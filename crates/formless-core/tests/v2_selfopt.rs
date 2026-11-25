@@ -92,6 +92,63 @@ fn proposal_lifecycle_is_measured_and_versioned() {
         .is_none());
 }
 
+#[test]
+fn memory_proposal_refuses_disabled_duplicate_without_claiming_it() {
+    let store = temp_store("selfopt-disabled-memory");
+    let (note, _) = store
+        .add_memory("User prefers concise answers.", "global", "user", None)
+        .unwrap();
+    store
+        .update_memory(&note.id, None, None, Some(false))
+        .unwrap();
+    let proposal = store
+        .create_proposal("memory", &note.text, "fixture", 3)
+        .unwrap();
+    store
+        .update_proposal_eval(&proposal.id, 0.5, 0.83, 6)
+        .unwrap();
+
+    let error = store
+        .set_proposal_status(&proposal.id, "applied")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("disabled note"), "{error}");
+    assert_eq!(
+        store.get_proposal(&proposal.id).unwrap().unwrap().status,
+        "measured"
+    );
+    let unchanged = store.get_memory(&note.id).unwrap().unwrap();
+    assert!(!unchanged.enabled);
+    assert_eq!(unchanged.text, note.text);
+}
+
+#[test]
+fn rolling_back_duplicate_memory_proposal_keeps_existing_note() {
+    let store = temp_store("selfopt-existing-memory");
+    let (note, _) = store
+        .add_memory("User prefers direct answers.", "global", "user", None)
+        .unwrap();
+    let proposal = store
+        .create_proposal("memory", &note.text, "fixture", 3)
+        .unwrap();
+    store
+        .update_proposal_eval(&proposal.id, 0.5, 0.83, 6)
+        .unwrap();
+
+    store
+        .set_proposal_status(&proposal.id, "applied")
+        .unwrap()
+        .unwrap();
+    store
+        .set_proposal_status(&proposal.id, "rolled_back")
+        .unwrap()
+        .unwrap();
+
+    let existing = store.get_memory(&note.id).unwrap().unwrap();
+    assert!(existing.enabled);
+    assert_eq!(existing.text, note.text);
+}
+
 fn call(name: &str, args: serde_json::Value) -> ToolCall {
     ToolCall {
         id: "c".into(),
