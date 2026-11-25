@@ -1682,7 +1682,7 @@ mod tests {
                 "kinds": [
                     {"kind": "database", "bytes": expected.database, "detail": "formless.db (with its WAL)"},
                     {"kind": "sessions", "bytes": 5, "detail": "messages, inside the database", "inside_db": true},
-                    {"kind": "invocation logs", "bytes": 3, "detail": "Tool inputs and outputs, inside the database", "inside_db": true},
+                    {"kind": "invocation logs", "bytes": 5, "detail": "Tool inputs and outputs, inside the database", "inside_db": true},
                     {"kind": "tool versions", "bytes": tool_code.len() + 4, "detail": "every version's code, inside the database", "inside_db": true},
                     {"kind": "file snapshots", "bytes": 6 + 2 + after_state.len(), "rows": 1, "retained_files": 1, "before_bytes": 6, "metadata_bytes": 2, "after_state_bytes": after_state.len(), "detail": "1 recorded paths, 1 retained snapshots, inside the database", "inside_db": true},
                     {"kind": "artifacts", "bytes": 11, "detail": "1 stored outputs"},
