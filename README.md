@@ -84,18 +84,18 @@ sandbox; the isolated worktree or directory is the boundary.
 
 Build from source with Rust stable, Cargo, and a C compiler. On Linux, also
 install `pkg-config` and the D-Bus development headers. See the
-[build requirements](CONTRIBUTING.md#local-checks) for details.
+[build requirements](https://github.com/athiwatc/formless/blob/main/CONTRIBUTING.md#local-checks)
+for details.
 
-```bash
-cargo install --git https://github.com/athiwatc/formless --locked formless-bin
-formless   # starts the daemon and opens the setup wizard
-```
+Install with `cargo install --git https://github.com/athiwatc/formless --locked formless-bin`,
+then run `formless` to start the daemon and open the setup wizard.
 
-The installer and package instructions require a matching published asset.
-If one is available on [GitHub Releases](https://github.com/athiwatc/formless/releases),
-see the [macOS/Linux installer and packages](docs/usage.md#install) or the
-[Windows ZIP guide](docs/windows-install.md). For a headless setup, see the
-[Docker guide](docs/docker.md).
+If [GitHub Releases](https://github.com/athiwatc/formless/releases) has a matching
+asset for your platform, see the [macOS/Linux install guide](docs/usage.md#install)
+for the [installer script](https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh)
+and packages, or see the [Windows ZIP guide](docs/windows-install.md). For a
+headless setup without a published release, [build the Docker image from source](docs/docker.md#building-it-yourself)
+and use `formless` as the local image name.
 
 The wizard needs a model endpoint with tool calling: OpenAI-compatible Chat
 Completions or Responses, or native Anthropic Messages. Ollama and LM Studio
