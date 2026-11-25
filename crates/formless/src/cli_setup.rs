@@ -68,13 +68,21 @@ where
         if entered.chars().any(char::is_whitespace) {
             bail!("API key must not contain internal whitespace");
         }
+        let runtime_override = runtime_api_key_override();
         let key = if !entered.is_empty() {
+            if let Some((source, override_key)) = &runtime_override {
+                if override_key != &entered {
+                    writeln!(
+                        output,
+                        "Note: {source} is set in your environment and overrides the saved key at runtime until unset."
+                    )?;
+                }
+            }
             (entered.clone(), Some(entered))
+        } else if let Some((_, key)) = runtime_override {
+            (key, None)
         } else if let Some((_, key)) = presets::env_key(preset) {
             (key.clone(), Some(key))
-        } else if let Ok(key) = std::env::var("FORMLESS_API_KEY") {
-            let key = key.trim().to_owned();
-            (key, None)
         } else {
             (String::new(), None)
         };
@@ -218,6 +226,27 @@ fn read_hidden_line<R: BufRead, W: Write>(
     writeln!(output)?;
     restored.context("restore terminal after API key entry")?;
     secret
+}
+
+fn runtime_api_key_override() -> Option<(&'static str, String)> {
+    if let Ok(value) = std::env::var("FORMLESS_API_KEY") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(("FORMLESS_API_KEY", trimmed.to_owned()));
+        }
+    }
+    if let Ok(path) = std::env::var("FORMLESS_API_KEY_FILE") {
+        let path = path.trim();
+        if !path.is_empty() {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                let trimmed = contents.trim();
+                if !trimmed.is_empty() {
+                    return Some(("FORMLESS_API_KEY_FILE", trimmed.to_owned()));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn select_preset(input: &str) -> Result<&'static presets::Preset> {
