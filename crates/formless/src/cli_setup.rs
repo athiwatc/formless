@@ -115,7 +115,12 @@ where
     } else {
         writeln!(output, "Available models:")?;
         for (index, model) in models.iter().enumerate() {
-            writeln!(output, "  {}. {}", index + 1, crate::table::cell_text(model))?;
+            writeln!(
+                output,
+                "  {}. {}",
+                index + 1,
+                crate::table::cell_text(model)
+            )?;
         }
     }
     let selection = prompt_line(
@@ -392,7 +397,9 @@ mod tests {
 
     #[test]
     fn hidden_key_events_handle_typing_backspace_enter_and_cancel() {
-        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        use crossterm::event::{
+            Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+        };
         let press = |code, modifiers| {
             Event::Key(KeyEvent {
                 code,
