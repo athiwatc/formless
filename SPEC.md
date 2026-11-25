@@ -6823,7 +6823,9 @@ configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 `FORMLESS_TEST_MAINTENANCE_CONFIG`, `FORMLESS_TEST_MAINTENANCE_DATA`,
 `FORMLESS_TEST_MAINTENANCE_ISOLATION`, `FORMLESS_TEST_MAINTENANCE_OPERATION`,
 `FORMLESS_TEST_OWNERSHIP_CONFIG`, `FORMLESS_TEST_OWNERSHIP_DATA`,
-`FORMLESS_TEST_PANIC_MARKER`, and `FORMLESS_TEST_DOCTOR_ARGS` (JSON CLI arguments
+`FORMLESS_TEST_PANIC_MARKER`, `FORMLESS_TEST_CONFIG_EDIT_ARGS` (JSON CLI
+arguments for the test-only config-edit subprocess, which uses a fake editor to
+verify unknown-key warnings), and `FORMLESS_TEST_DOCTOR_ARGS` (JSON CLI arguments
 for the test-only doctor subprocess, which installs an in-memory credential
 backend before read-only dispatch; the shipped binary does not read this variable).
 
