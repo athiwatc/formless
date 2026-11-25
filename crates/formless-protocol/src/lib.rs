@@ -4030,6 +4030,9 @@ pub enum DroppedEventKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    MainChatBackendChanged {
+        backend: MainChatBackend,
+    },
     TopicChanged {
         topic_id: String,
     },
@@ -4501,6 +4504,7 @@ impl Event {
             Event::SessionUpdated { session } => Some(&session.id),
             Event::SessionDeleted { id } => Some(id),
             Event::SettingsChanged
+            | Event::MainChatBackendChanged { .. }
             | Event::TopicChanged { .. }
             | Event::McpServersChanged
             | Event::ModelPullProgress { .. }

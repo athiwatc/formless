@@ -1060,6 +1060,9 @@ and returns the saved backend object, not the inventory. Backend objects are:
 - `{"kind":"harness","harness":"claude","acp_agent":null}` (use a harness
   listed by the daemon; specify a listed agent for `"harness":"acp"`)
 
+A successful setter broadcasts `main_chat_backend_changed` with the saved
+`backend` to subscribed clients.
+
 For an explicit request to organize work, the provider-backed Main or Topic
 Chat assistant can call
 `read_topic_context` for recent persisted user messages, the working directory,

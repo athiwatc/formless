@@ -985,6 +985,12 @@ impl State {
         self.overlay = Some(Overlay::Picker);
     }
 
+    pub fn main_backend_changed(&mut self, backend: MainChatBackend) {
+        if let Some(Overlay::MainBackend(picker)) = &mut self.overlay {
+            picker.catalog.selected = backend;
+        }
+    }
+
     pub fn open_main_backend(&mut self, catalog: MainChatBackends) {
         let rows = catalog.choices();
         let index = rows

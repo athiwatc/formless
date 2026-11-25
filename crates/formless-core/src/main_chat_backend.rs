@@ -567,6 +567,9 @@ impl Daemon {
             }
         }
         self.with_store(|st| st.set_main_chat_backend(&backend))?;
+        self.broadcast(Event::MainChatBackendChanged {
+            backend: backend.clone(),
+        });
         Ok(serde_json::to_value(backend)?)
     }
 }

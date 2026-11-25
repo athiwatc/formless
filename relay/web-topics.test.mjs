@@ -65,6 +65,20 @@ test('Main Chat picker shows readiness and saves the listed provider and overrid
   assert.equal(c.S.mainBackend.model, "new");
 });
 
+test('Main Chat backend change from another client updates the open web label', () => {
+  let renders = 0;
+  const c = setup(['onEvent'], {
+    forecastRevision: 0, branchSummaryEvent() {}, scheduleForecast() {}, notifyFor() {},
+    renderTopicContext() { renders++; },
+  });
+  c.S.mainBackend = { kind: 'provider', name: 'alternate' };
+  c.S.current = 'another-session';
+  const backend = { kind: 'harness', harness: 'claude', acp_agent: null };
+  c.onEvent({ type: 'main_chat_backend_changed', backend });
+  assert.deepEqual(json(c.S.mainBackend), backend);
+  assert.equal(renders, 1);
+});
+
 test('main/topic/attempt hierarchy uses Formless transcript IDs, not external harness IDs', () => {
   const c = setup(['topicSessionIds', 'topicForSession', 'currentTopicAttempt']);
   c.S.topics = [topic('running')];

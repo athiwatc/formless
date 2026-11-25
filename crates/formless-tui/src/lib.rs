@@ -6118,6 +6118,7 @@ impl App {
             ev @ (Event::HarnessPermissionRequested { .. }
             | Event::HarnessPermissionClosed { .. }) => self.topic_permission_event(ev),
             Event::TopicChanged { topic_id } => self.topic_changed(topic_id),
+            Event::MainChatBackendChanged { backend } => self.topic.main_backend_changed(backend),
             Event::MessageAppended {
                 session_id,
                 message,

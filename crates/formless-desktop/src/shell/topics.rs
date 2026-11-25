@@ -779,9 +779,9 @@ impl Shell {
                             Button::new("main-chat-backend")
                                 .small()
                                 .outline()
-                                .label(ui.state.main_backends.as_ref().map_or_else(
+                                .label(ui.state.main_backend.as_ref().map_or_else(
                                     || "Main Chat backend".into(),
-                                    |catalog| catalog.selected.label(),
+                                    MainChatBackend::label,
                                 ))
                                 .disabled(busy)
                                 .on_click(cx.listener(|this, _, _, cx| {

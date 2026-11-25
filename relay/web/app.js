@@ -10028,7 +10028,7 @@
 
   function onEvent(ev) {
     branchSummaryEvent(ev);
-    if (["settings_changed", "registry_changed", "session_updated", "messages_edited", "compaction_notice", "tool_updated", "tool_deleted", "message_appended", "message_complete", "run_started", "run_finished", "run_paused"].includes(ev.type)) {
+    if (["settings_changed", "registry_changed", "main_chat_backend_changed", "session_updated", "messages_edited", "compaction_notice", "tool_updated", "tool_deleted", "message_appended", "message_complete", "run_started", "run_finished", "run_paused"].includes(ev.type)) {
       forecastRevision++;
       scheduleForecast();
     }
@@ -10038,6 +10038,10 @@
     notifyFor(ev);
     const here = ev.session_id === S.current;
     switch (ev.type) {
+      case "main_chat_backend_changed":
+        S.mainBackend = ev.backend;
+        renderTopicContext();
+        break;
       case "deltas_dropped":
         reconcileDropped(ev);
         break;

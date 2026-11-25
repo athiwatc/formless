@@ -2650,6 +2650,14 @@ impl Engine {
                     }
                 }
                 let changed = match &event {
+                    Event::MainChatBackendChanged { backend } => {
+                        self.updates.push(Update::Topics {
+                            connection: self.connection,
+                            operation: None,
+                            result: Ok(crate::topics::Reply::MainBackendChanged(backend.clone())),
+                        });
+                        None
+                    }
                     Event::SessionUpdated { session } => Some((
                         session.id.as_str(),
                         Some((

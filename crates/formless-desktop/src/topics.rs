@@ -140,6 +140,7 @@ impl Action {
 pub enum Reply {
     MainBackends(MainChatBackends),
     MainBackendSaved(MainChatBackend),
+    MainBackendChanged(MainChatBackend),
     Harnesses(Vec<formless_protocol::HarnessAvailability>),
     Policy(Box<TopicInfo>),
     Main(SessionInfo),
@@ -396,6 +397,7 @@ pub fn feature_status(status: TopicFeatureStatus) -> &'static str {
 #[derive(Default)]
 pub struct State {
     pub main_backends: Option<MainChatBackends>,
+    pub main_backend: Option<MainChatBackend>,
     pub harnesses: Vec<formless_protocol::HarnessAvailability>,
     pub supported: bool,
     pub inventory_loaded: bool,
@@ -494,8 +496,12 @@ impl State {
     }
     pub fn apply(&mut self, reply: Reply) {
         match reply {
-            Reply::MainBackends(backends) => self.main_backends = Some(backends),
-            Reply::MainBackendSaved(backend) => {
+            Reply::MainBackends(backends) => {
+                self.main_backend = Some(backends.selected.clone());
+                self.main_backends = Some(backends);
+            }
+            Reply::MainBackendSaved(backend) | Reply::MainBackendChanged(backend) => {
+                self.main_backend = Some(backend.clone());
                 if let Some(backends) = &mut self.main_backends {
                     backends.selected = backend;
                 }
