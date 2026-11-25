@@ -589,7 +589,6 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                 continue;
             }
             if method == "turn/completed" && params["turnId"] == turn {
-                let message = output.complete(params)?;
                 tokio::time::timeout(START_TIMEOUT, async {
                     while !pending.is_empty() {
                         let event = self.receive().await?;
@@ -603,7 +602,7 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                 })
                 .await
                 .context("Muse Code completed the turn with unconfirmed decisions")??;
-                return Ok(message);
+                return output.complete(params);
             }
             if let Some(message) = output.message(method, params, turn) {
                 handler.on_update(HarnessUpdate::Message {
@@ -1390,6 +1389,52 @@ fi
                 .load(std::sync::atomic::Ordering::Relaxed),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn msp_saves_late_accepted_clarification_even_without_a_final_answer() {
+        for (terminal, error) in [
+            ("failed", "did not complete the turn"),
+            ("completed", "did not return a final answer"),
+        ] {
+            let (client, server) = tokio::io::duplex(4096);
+            let (client_input, client_output) = tokio::io::split(client);
+            let (server_input, server_output) = tokio::io::split(server);
+            let mut client = Msp {
+                input: client_output,
+                output: BufReader::new(client_input),
+                next_id: 0,
+            };
+            let mut server = Msp {
+                input: server_output,
+                output: BufReader::new(server_input),
+                next_id: 0,
+            };
+            let hooks = Hooks::default();
+            let cancel = CancellationToken::new();
+            let script = async {
+                server.send(json!({"jsonrpc": "2.0", "id": 9, "method": "userInput/request", "params": questions()})).await.unwrap();
+                assert_eq!(server.receive().await.unwrap()["id"], 9);
+                assert_eq!(
+                    server.receive().await.unwrap()["method"],
+                    "userInput/engaged"
+                );
+                let answer = server.receive().await.unwrap();
+                assert_eq!(answer["method"], "userInput/answer");
+                server.send(json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {"sessionId": "session", "turnId": "turn", "terminal": terminal}})).await.unwrap();
+                server.send(json!({"jsonrpc": "2.0", "id": answer["id"], "result": {"status": "accepted"}})).await.unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(START_TIMEOUT, async {
+                tokio::join!(
+                    client.run_turn("session", "turn", VecDeque::new(), true, &hooks, &cancel),
+                    script,
+                )
+            })
+            .await
+            .unwrap();
+            assert!(result.unwrap_err().to_string().contains(error));
+            assert_eq!(*hooks.accepted.lock().unwrap(), ["CSV"]);
+        }
     }
 
     #[tokio::test]
