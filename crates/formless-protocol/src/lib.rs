@@ -5547,6 +5547,41 @@ mod future_attempt_wire_tests {
         assert!(FEATURES.contains(&DURABLE_OUTBOX_FEATURE));
     }
     #[test]
+    fn scoped_search_round_trips_without_changing_the_legacy_request() {
+        for (wire, expected) in [
+            (
+                json!({"type":"search_sessions","query":"??","limit":10}),
+                Request::SearchSessions {
+                    query: "??".into(),
+                    limit: Some(10),
+                },
+            ),
+            (
+                json!({"type":"search_sessions_with_scope","query":"??","limit":10}),
+                Request::SearchSessionsWithScope {
+                    query: "??".into(),
+                    limit: Some(10),
+                },
+            ),
+        ] {
+            let decoded = serde_json::from_value::<Request>(wire.clone()).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&decoded),
+                std::mem::discriminant(&expected)
+            );
+            assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
+        }
+        let scoped = json!({"hits":[],"searched_latest":10000});
+        let results: SearchResults = serde_json::from_value(scoped.clone()).unwrap();
+        assert!(results.hits.is_empty());
+        assert_eq!(results.searched_latest, Some(10_000));
+        assert_eq!(serde_json::to_value(results).unwrap(), scoped);
+        assert!(serde_json::from_value::<Vec<SearchHit>>(json!([]))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn attempts_have_explicit_scope_identity_offset_and_terminal_semantics() {
         for change in [
             TranscriptAttemptChange::Started { base_seq: 0 },

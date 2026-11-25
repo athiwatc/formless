@@ -2,6 +2,56 @@
 use super::*;
 
 #[tokio::test]
+async fn scoped_session_search_handler_preserves_legacy_results_and_reports_empty_cutoff() {
+    let _env = crate::credential_env::EnvGuard::isolated();
+    let root = std::env::temp_dir().join(format!("fl-scoped-search-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+    Config::default().save(&paths).unwrap();
+    let daemon = Arc::new(Daemon::new(paths).unwrap());
+    daemon
+        .with_store(|store| {
+            let session = store.create_session(None)?;
+            store.append_message(&session.id, "user", "needle ??")?;
+            Ok(())
+        })
+        .unwrap();
+    let legacy = daemon
+        .handle(Request::SearchSessions {
+            query: "??".into(),
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    let scoped = daemon
+        .handle(Request::SearchSessionsWithScope {
+            query: "??".into(),
+            limit: Some(1),
+        })
+        .await
+        .unwrap();
+    assert_eq!(legacy.as_array().unwrap().len(), 1);
+    assert_eq!(scoped, json!({"hits":legacy,"searched_latest":10000}));
+    let empty = daemon
+        .handle(Request::SearchSessionsWithScope {
+            query: "!".into(),
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(empty, json!({"hits":[],"searched_latest":10000}));
+    let indexed = daemon
+        .handle(Request::SearchSessionsWithScope {
+            query: "needle".into(),
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(indexed, json!({"hits":legacy}));
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn summary_search_handler_ranks_before_limits_preserving_other_fields_and_eligibility() {
     let _env = crate::credential_env::EnvGuard::isolated();
     let root = std::env::temp_dir().join(format!("fl-summary-search-{}", uuid::Uuid::new_v4()));
