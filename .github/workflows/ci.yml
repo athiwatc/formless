@@ -229,7 +229,8 @@ jobs:
           set -euo pipefail
           for suite in scripts/test-doc-links.py scripts/test-inventory.py scripts/test-eval-tool-use.py \
             scripts/test-release-check.py scripts/test-release-publication.py scripts/test-release-doc-archive.py \
-            scripts/test-render-source-download.py scripts/test-storage-snapshot.py; do
+            scripts/test-render-source-download.py scripts/test-storage-snapshot.py \
+            scripts/test-ci-automation.py; do
             python3 "$suite" 2>&1 | tee "$CI_DIR/logs/$(basename "$suite").log"
           done
 
