@@ -22,7 +22,7 @@ class AutomationTests(unittest.TestCase):
             "mergeable_state": "clean",
             "changed_files": 1,
             "base": {"ref": "main"},
-            "head": {"sha": SHA, "repo": {"full_name": REPO}},
+            "head": {"sha": SHA, "ref": "change", "repo": {"full_name": REPO}},
         }
         self.run = {
             "id": 17,
@@ -151,6 +151,26 @@ class AutomationTests(unittest.TestCase):
         rerun["conclusion"] = "failure"
         previous["conclusion"] = "success"
         automation.merge(REPO, self.run)
+        self.gh.assert_not_called()
+
+    def test_ready_for_review_reevaluates_previously_green_draft(self):
+        self.pr["draft"] = True
+        automation.dispatch("merge", REPO, {"workflow_run": self.run})
+        self.gh.assert_not_called()
+
+        self.pr["draft"] = False
+        event = {"action": "ready_for_review", "pull_request": copy.deepcopy(self.pr)}
+        automation.dispatch("merge", REPO, event)
+        self.assert_merge()
+
+        self.gh.reset_mock()
+        self.pr["head"]["sha"] = OTHER
+        automation.dispatch("merge", REPO, event)
+        self.gh.assert_not_called()
+
+        event["pull_request"]["head"]["repo"]["full_name"] = "fork/repo"
+        self.pr["head"]["sha"] = SHA
+        automation.dispatch("merge", REPO, event)
         self.gh.assert_not_called()
 
     def test_non_green_checks_and_commit_statuses_block_merge(self):

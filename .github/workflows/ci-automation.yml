@@ -4,6 +4,9 @@ on:
   workflow_run:
     workflows: [CI, Optional desktop]
     types: [completed]
+  pull_request_target:
+    types: [ready_for_review]
+    branches: [main]
 
 permissions: {}
 
@@ -30,13 +33,16 @@ jobs:
 
   merge:
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.head_repository.id == github.event.repository.id
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'pull_request' &&
+       github.event.workflow_run.head_repository.id == github.event.repository.id) ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.head.repo.id == github.event.repository.id)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     concurrency:
-      group: ci-merge-${{ github.event.workflow_run.head_sha }}
+      group: ci-merge-${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
       cancel-in-progress: false
     permissions:
       actions: read

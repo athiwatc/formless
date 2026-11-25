@@ -131,10 +131,12 @@ def merge(repo, run):
     ):
         return
     pr = current_pr(repo, run)
-    if pr is None:
-        return
+    if pr is not None:
+        merge_pr(repo, pr, run["head_sha"])
+
+
+def merge_pr(repo, pr, sha):
     details = api(f"repos/{repo}/pulls/{pr}")
-    sha = run["head_sha"]
     if (
         details["head"]["sha"] != sha
         or (details["head"]["repo"] or {}).get("full_name") != repo
@@ -152,15 +154,24 @@ def merge(repo, run):
         return
     required = (CI, DESKTOP) if needs_desktop(files) else (CI,)
     if all(
-        successful_workflow(repo, workflow, pr, sha, run["head_branch"])
+        successful_workflow(repo, workflow, pr, sha, details["head"]["ref"])
         for workflow in required
     ) and successful_checks(repo, sha):
         print(f"Merging pull request #{pr} at {sha}.")
         gh("pr", "merge", str(pr), "--merge", "--match-head-commit", sha, "--repo", repo)
 
 
+def dispatch(operation, repo, event):
+    if operation == "retry":
+        retry(repo, event["workflow_run"])
+    elif "workflow_run" in event:
+        merge(repo, event["workflow_run"])
+    elif event.get("action") == "ready_for_review":
+        pr = event["pull_request"]
+        if (pr["head"]["repo"] or {}).get("full_name") == repo and pr["base"]["ref"] == "main":
+            merge_pr(repo, pr["number"], pr["head"]["sha"])
+
+
 if __name__ == "__main__":
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-    {"retry": retry, "merge": merge}[sys.argv[1]](
-        os.environ["GITHUB_REPOSITORY"], event["workflow_run"]
-    )
+    dispatch(sys.argv[1], os.environ["GITHUB_REPOSITORY"], event)
