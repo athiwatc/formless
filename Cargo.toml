@@ -50,3 +50,11 @@ candle-core = "0.11"
 candle-transformers = "0.11"
 ignore = "0.4"
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+
+# The native relay tests transfer full 32 MiB frames under real wire deadlines,
+# including on targets where these crates use portable software backends.
+[profile.test.package.aes]
+opt-level = 3
+
+[profile.test.package.polyval]
+opt-level = 3

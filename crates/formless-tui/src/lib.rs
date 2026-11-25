@@ -60,7 +60,7 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use formless_core::auth::has_provider_credential;
-use formless_core::config::{save_api_key, Config};
+use formless_core::config::Config;
 use formless_core::daemon::ensure_daemon;
 use formless_core::onboarding::{load as load_seen, Seen};
 use formless_core::provider::{list_models_blocking, probe_blocking, ProbeResult};
@@ -556,7 +556,7 @@ struct ModelOverlay {
     picker: picker::ModelPicker,
     /// `ListModels` metadata per id (efforts, context, prices).
     meta: serde_json::Value,
-    effort_idx: usize,
+    selected_effort: Option<String>,
     /// Opened from Settings: Enter sets the global default.
     default_only: bool,
 }
@@ -564,38 +564,50 @@ struct ModelOverlay {
 impl ModelOverlay {
     /// The efforts the highlighted model accepts (SPEC §4.2): its listed
     /// ones, none when effort has no effect, else all of them.
-    fn efforts(&self) -> Vec<Option<&'static str>> {
+    fn efforts(&self) -> Vec<Option<String>> {
         let id = self.picker.choice().unwrap_or_default();
         let listed = &self.meta[&id]["efforts"];
         match listed.as_array() {
             Some(a) if a.is_empty() => vec![None],
-            Some(a) => {
-                let names: Vec<&str> = a.iter().filter_map(|v| v.as_str()).collect();
-                std::iter::once(None)
-                    .chain(
-                        ALL_EFFORTS
-                            .iter()
-                            .copied()
-                            .filter(|e| names.contains(e))
-                            .map(Some),
-                    )
-                    .collect()
-            }
-            None => EFFORTS.to_vec(),
+            Some(a) => std::iter::once(None)
+                .chain(
+                    a.iter()
+                        .filter_map(|value| value.as_str())
+                        .filter(|effort| !effort.is_empty())
+                        .map(|effort| Some(effort.to_string())),
+                )
+                .collect(),
+            None => EFFORTS
+                .iter()
+                .map(|effort| effort.map(str::to_string))
+                .collect(),
         }
     }
 
     /// The chosen effort, if the highlighted model accepts it.
-    fn effort(&self) -> Option<&'static str> {
+    fn effort(&self) -> Option<String> {
         let all = self.efforts();
-        all.get(self.effort_idx % all.len().max(1))
-            .copied()
-            .flatten()
+        let idx = all
+            .iter()
+            .position(|effort| effort == &self.selected_effort)
+            .unwrap_or(0);
+        all[idx].clone()
+    }
+
+    fn cycle_effort(&mut self, backwards: bool) {
+        let all = self.efforts();
+        let current = all
+            .iter()
+            .position(|effort| effort == &self.selected_effort)
+            .unwrap_or(0);
+        let next = if backwards {
+            (current + all.len() - 1) % all.len()
+        } else {
+            (current + 1) % all.len()
+        };
+        self.selected_effort = all[next].clone();
     }
 }
-
-/// Every effort level a model may accept, lowest first.
-const ALL_EFFORTS: [&str; 4] = ["minimal", "low", "medium", "high"];
 
 /// A Session's unsent input and attachments.
 #[derive(Default)]
@@ -7559,8 +7571,8 @@ impl App {
         }
     }
 
-    /// Whether the current model takes images (`provider.vision`, else a
-    /// guess from its name).
+    /// Whether the current model takes images (per-model setting, provider
+    /// default, else a guess from its name).
     fn vision_model(&self) -> bool {
         let Ok(cfg) = Config::load(&self.paths) else {
             return true;
@@ -7570,10 +7582,8 @@ impl App {
             .as_ref()
             .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
             .and_then(|s| s.model.clone())
-            .unwrap_or(cfg.provider.model);
-        cfg.provider
-            .vision
-            .unwrap_or_else(|| formless_core::provider::is_vision_model(&model))
+            .unwrap_or_else(|| cfg.provider.model.clone());
+        formless_core::provider::model_sends_images(&cfg.provider, &model)
     }
 
     /// `/compact [focus]`: summarise the Session now (SPEC §11).
@@ -9028,14 +9038,10 @@ impl App {
                 .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
                 .and_then(|s| s.reasoning_effort.clone())
         };
-        let effort_idx = EFFORTS
-            .iter()
-            .position(|e| e.map(str::to_string) == effort)
-            .unwrap_or(0);
         self.model_overlay = Some(ModelOverlay {
             picker: picker::ModelPicker::loading(),
             meta: serde_json::Value::Null,
-            effort_idx,
+            selected_effort: effort,
             default_only: self.view == View::Settings,
         });
         self.request(Pending::ListModels, Request::ListModels);
@@ -9070,7 +9076,7 @@ impl App {
             let Some(model) = o.picker.choice() else {
                 return;
             };
-            let effort = o.effort().map(str::to_string);
+            let effort = o.effort();
             self.model_overlay = None;
             if global {
                 // Settings go through the daemon (principle 6).
@@ -9093,11 +9099,8 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => self.model_overlay = None,
-            KeyCode::Tab => o.effort_idx = (o.effort_idx + 1) % o.efforts().len().max(1),
-            KeyCode::BackTab => {
-                let n = o.efforts().len().max(1);
-                o.effort_idx = (o.effort_idx % n + n - 1) % n;
-            }
+            KeyCode::Tab => o.cycle_effort(false),
+            KeyCode::BackTab => o.cycle_effort(true),
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(model) = o.picker.choice() {
                     self.notes.push(format!("testing {model}…"));
@@ -9311,13 +9314,16 @@ impl App {
         w.apply_provider_endpoint(&mut cfg.provider);
         cfg.provider.model = w.model();
         cfg.provider.reasoning_effort = EFFORTS[w.effort_idx].map(str::to_string);
-        if w.prompt_fallback {
-            cfg.provider.tool_mode = "prompt".into();
-        }
-        cfg.save(&self.paths)?;
-        if let WizardKeyUpdate::Save(key) = key_update {
-            save_api_key(&self.paths, &key)?;
-        }
+        let save_key = match key_update {
+            WizardKeyUpdate::Save(key) => Some(key),
+            _ => None,
+        };
+        formless_core::profile_setup::save_verified_provider(
+            &self.paths,
+            &mut cfg,
+            w.prompt_fallback,
+            save_key.as_deref(),
+        )?;
         let w = self.wizard.take().expect("wizard");
         let _ = formless_core::setup_draft::discard(&self.paths);
         // A guided first task, offered once (#393).
@@ -13367,7 +13373,7 @@ fn draw_model_overlay(f: &mut Frame, o: &ModelOverlay, color: bool) {
     } else {
         Line::from(vec![
             Span::styled("Effort   ", ui::dim(color)),
-            Span::raw(o.effort().unwrap_or("default (provider)")),
+            Span::raw(o.effort().unwrap_or_else(|| "default (provider)".into())),
             Span::styled("  (Tab to change)", ui::dim(color)),
         ])
     };
@@ -26341,6 +26347,57 @@ mod tests {
                 !vision
             );
         }
+        for (model, resolved, per_model_vision, provider_vision, warns) in [
+            ("o3-alias", "o3-mini", true, Some(false), false),
+            ("gpt-5", "gpt-5", false, Some(true), true),
+        ] {
+            let mut cfg = Config::default();
+            cfg.provider.model = model.into();
+            cfg.provider.vision = provider_vision;
+            cfg.provider.model_meta.insert(
+                resolved.into(),
+                formless_core::config::ModelMetaCfg {
+                    vision: Some(per_model_vision),
+                    ..Default::default()
+                },
+            );
+            if model == "o3-alias" {
+                cfg.provider.aliases.insert(model.into(), resolved.into());
+            }
+            cfg.save(&app.paths).unwrap();
+            app.notes.clear();
+            app.add_attachment("fixture.png".into(), vec![1]);
+            assert_eq!(
+                app.notes
+                    .iter()
+                    .any(|note| note.contains("may not read images")),
+                warns,
+                "per-model vision override for {model}"
+            );
+        }
+        for (api_style, warns) in [("chat", true), ("anthropic", false)] {
+            let mut cfg = Config::default();
+            cfg.provider.model = "gpt-5".into();
+            cfg.provider.vision = Some(true);
+            cfg.provider.tool_mode = "prompt".into();
+            cfg.provider.api_style = api_style.into();
+            cfg.save(&app.paths).unwrap();
+            app.notes.clear();
+            app.attachments.clear();
+            app.add_attachment("fixture.png".into(), vec![1]);
+            assert_eq!(
+                formless_core::provider::model_sends_images(&cfg.provider, "gpt-5"),
+                !warns,
+                "provider image gate for {api_style} prompt tools"
+            );
+            assert_eq!(
+                app.notes
+                    .iter()
+                    .any(|note| note.contains("may not read images")),
+                warns,
+                "TUI attachment warning for {api_style} prompt tools"
+            );
+        }
     }
 
     #[test]
@@ -27368,7 +27425,7 @@ mod tests {
         app.model_overlay = Some(ModelOverlay {
             picker: picker::ModelPicker::new(Vec::new()),
             meta: serde_json::Value::Null,
-            effort_idx: 0,
+            selected_effort: None,
             default_only: false,
         });
         app.paste("literal\nmodel");
@@ -27409,7 +27466,7 @@ mod tests {
         app.model_overlay = Some(ModelOverlay {
             picker: picker::ModelPicker::new(Vec::new()),
             meta: serde_json::Value::Null,
-            effort_idx: 0,
+            selected_effort: None,
             default_only: false,
         });
         app.on_event(reconnect_approval("fixture", "s1"));
@@ -32648,7 +32705,7 @@ mod tests {
         let overlay = ModelOverlay {
             picker,
             meta: serde_json::json!({}),
-            effort_idx: 0,
+            selected_effort: None,
             default_only: false,
         };
         let render_overlay = |width, height| {
@@ -32731,13 +32788,66 @@ mod tests {
             o.picker.choice().as_deref(),
             Some("anthropic/claude-sonnet-4")
         );
-        assert_eq!(EFFORTS[o.effort_idx], Some("low"));
+        assert_eq!(o.selected_effort.as_deref(), Some("low"));
         for (w, h) in [(1, 1), (12, 4), (80, 24)] {
             render(&mut app, w, h);
         }
         assert!(render(&mut app, 80, 24).contains("Effort"));
         app.key(key(KeyCode::Esc));
         assert!(app.model_overlay.is_none());
+    }
+
+    #[test]
+    fn model_overlay_keeps_custom_effort_options() {
+        let mut picker = picker::ModelPicker::loading();
+        picker.set_items(
+            vec![picker::ModelItem {
+                id: "custom-model".into(),
+                source: None,
+                recent: false,
+                detail: None,
+            }],
+            "custom-model",
+        );
+        let overlay = ModelOverlay {
+            picker,
+            meta: serde_json::json!({"custom-model":{"efforts":["ultra"]}}),
+            selected_effort: Some("ultra".into()),
+            default_only: false,
+        };
+
+        assert_eq!(overlay.efforts(), vec![None, Some("ultra".into())]);
+        assert_eq!(overlay.effort().as_deref(), Some("ultra"));
+    }
+
+    #[test]
+    fn model_overlay_preserves_saved_effort_by_value() {
+        for (saved, listed) in [
+            ("xhigh", vec!["low", "xhigh"]),
+            ("low", vec!["high", "low"]),
+        ] {
+            let mut app = test_app();
+            app.view = View::Settings;
+            let mut cfg = Config::default();
+            cfg.provider.reasoning_effort = Some(saved.into());
+            cfg.save(&app.paths).unwrap();
+            let (client, _) = DaemonClient::recording();
+            app.client = Some(client);
+            app.open_model_picker();
+
+            let overlay = app.model_overlay.as_mut().unwrap();
+            overlay.picker.set_items(
+                vec![picker::ModelItem {
+                    id: "custom-model".into(),
+                    source: None,
+                    recent: false,
+                    detail: None,
+                }],
+                "custom-model",
+            );
+            overlay.meta = serde_json::json!({"custom-model":{"efforts":listed}});
+            assert_eq!(overlay.effort().as_deref(), Some(saved));
+        }
     }
 
     #[test]
