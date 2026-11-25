@@ -322,12 +322,20 @@ const RECENT_SEARCH_SQL: &str =
 
 const SEARCH_READ_BYTES: usize = 16 * 1024;
 
-struct SearchContent<'conn>(rusqlite::blob::Blob<'conn>);
+#[derive(Clone, Copy, PartialEq)]
+enum SearchEncoding {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+}
+
+struct SearchContent<'conn>(rusqlite::blob::Blob<'conn>, SearchEncoding);
 
 impl SearchContent<'_> {
     fn scan<T>(&self, f: impl FnOnce(&mut SearchChars<'_>) -> T) -> Result<T> {
         let mut chars = SearchChars {
             blob: &self.0,
+            encoding: self.1,
             bytes: [0; SEARCH_READ_BYTES],
             offset: 0,
             start: 0,
@@ -361,6 +369,7 @@ impl SearchContent<'_> {
 
 struct SearchChars<'a> {
     blob: &'a rusqlite::blob::Blob<'a>,
+    encoding: SearchEncoding,
     bytes: [u8; SEARCH_READ_BYTES],
     offset: usize,
     start: usize,
@@ -371,16 +380,54 @@ struct SearchChars<'a> {
 impl SearchChars<'_> {
     fn refill(&mut self) -> Result<()> {
         let len = self.blob.read_at(&mut self.bytes, self.offset)?;
-        self.end = match std::str::from_utf8(&self.bytes[..len]) {
-            Ok(_) => len,
-            Err(error) if error.error_len().is_none() && self.offset + len < self.blob.len() => {
-                error.valid_up_to()
+        self.end = if self.encoding == SearchEncoding::Utf8 {
+            match std::str::from_utf8(&self.bytes[..len]) {
+                Ok(_) => len,
+                Err(error)
+                    if error.error_len().is_none() && self.offset + len < self.blob.len() =>
+                {
+                    error.valid_up_to()
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
+        } else {
+            anyhow::ensure!(len % 2 == 0, "invalid UTF-16 message content");
+            if len > 0
+                && self.offset + len < self.blob.len()
+                && (0xd800..=0xdbff).contains(&self.utf16_unit(len - 2))
+            {
+                len - 2
+            } else {
+                len
+            }
         };
         self.start = 0;
         self.offset += self.end;
         Ok(())
+    }
+
+    fn utf16_unit(&self, start: usize) -> u16 {
+        let bytes = [self.bytes[start], self.bytes[start + 1]];
+        if self.encoding == SearchEncoding::Utf16Le {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        }
+    }
+
+    fn next_utf16(&mut self) -> Result<char> {
+        let mut units = [self.utf16_unit(self.start), 0];
+        self.start += 2;
+        let len = if (0xd800..=0xdbff).contains(&units[0]) && self.start < self.end {
+            units[1] = self.utf16_unit(self.start);
+            self.start += 2;
+            2
+        } else {
+            1
+        };
+        Ok(char::decode_utf16(units[..len].iter().copied())
+            .next()
+            .unwrap()?)
     }
 }
 
@@ -400,6 +447,15 @@ impl Iterator for SearchChars<'_> {
                 return None;
             }
         }
+        if self.encoding != SearchEncoding::Utf8 {
+            return match self.next_utf16() {
+                Ok(ch) => Some(ch),
+                Err(error) => {
+                    self.error = Some(error);
+                    None
+                }
+            };
+        }
         let start = self.start;
         let byte = self.bytes[start];
         if byte.is_ascii() {
@@ -417,7 +473,9 @@ impl Iterator for SearchChars<'_> {
         while n != 0 {
             let available = (self.end - self.start).min(n);
             let bytes = &self.bytes[self.start..self.start + available];
-            let ascii = if bytes.is_ascii() {
+            let ascii = if self.encoding != SearchEncoding::Utf8 {
+                0
+            } else if bytes.is_ascii() {
                 available
             } else {
                 bytes.iter().position(|byte| !byte.is_ascii()).unwrap()
@@ -3362,15 +3420,26 @@ impl Store {
         let literal_needle: Option<Vec<_>> = literal
             .as_ref()
             .map(|text| text.chars().map(|ch| ch.to_ascii_lowercase()).collect());
+        let encoding: String = self
+            .ps("PRAGMA encoding")?
+            .query_row([], |row| row.get(0))?;
+        let encoding = match encoding.as_str() {
+            "UTF-16le" => SearchEncoding::Utf16Le,
+            "UTF-16be" => SearchEncoding::Utf16Be,
+            _ => SearchEncoding::Utf8,
+        };
         let mut hits = Vec::new();
         while let Some(row) = rows.next()? {
-            let content = SearchContent(self.conn.blob_open(
-                rusqlite::DatabaseName::Main,
-                "messages",
-                "content",
-                row.get(5)?,
-                true,
-            )?);
+            let content = SearchContent(
+                self.conn.blob_open(
+                    rusqlite::DatabaseName::Main,
+                    "messages",
+                    "content",
+                    row.get(5)?,
+                    true,
+                )?,
+                encoding,
+            );
             if let Some(terms) = &verify_terms {
                 if !session_search_matches(&content, terms)? {
                     continue;
@@ -9822,6 +9891,7 @@ mod snippet_tests {
                     true,
                 )
                 .unwrap(),
+            super::SearchEncoding::Utf8,
         );
         make_snippet(
             &content,

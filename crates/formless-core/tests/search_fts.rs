@@ -36,6 +36,36 @@ fn session_and_audit_search_fold_greek_final_sigma() {
 }
 
 #[test]
+fn search_reads_both_utf16_database_encodings_across_surrogate_boundaries() {
+    for encoding in ["UTF-16le", "UTF-16be"] {
+        let root =
+            std::env::temp_dir().join(format!("fl-search-encoding-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("data.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA encoding='{encoding}'; CREATE TABLE encoding_fixture(value);"
+        ))
+        .unwrap();
+        drop(conn);
+        let store = Store::open(&db).unwrap();
+        let session = store.create_session(None).unwrap();
+        let text = format!("{}😀 needle λόγος ??", "a".repeat(8191));
+        let message = store.append_message(&session.id, "user", &text).unwrap();
+        for query in ["needle", "ΟΣ", "??"] {
+            let hits = store.search_sessions(query, 10).unwrap();
+            assert_eq!(hits[0].message_id, message.id, "{encoding}, {query}");
+            assert!(
+                hits[0].snippet.contains("😀 needle λόγος ??"),
+                "{encoding}, {query}"
+            );
+        }
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn unicode_verification_and_snippets_cross_storage_read_boundaries() {
     let store = Store::open_in_memory().unwrap();
     let session = store.create_session(None).unwrap();
