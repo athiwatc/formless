@@ -5926,10 +5926,13 @@ When a Relay browser returns to a visible page or comes back online, it probes
 the authenticated encrypted connection immediately and refreshes the selected
 Session (or all Sessions) from daemon state after success. While visible, it
 sends an encrypted health probe every 15 seconds and replaces an unresponsive
-socket after a five-second timeout without waiting for a close event. Mobile
-platforms may suspend a hidden page and its probes; on return the browser
-rechecks or reopens the connection and reloads state rather than assuming the
-subscription survived. An installed PWA uses the Badging API, when available,
+socket after 15 seconds without a response or valid Relay transport progress,
+without waiting for a close event. The daemon retires a browser channel after
+five minutes without browser transport input; the Relay closes that channel
+with code 4002. Mobile platforms may suspend a hidden page and its probes long
+enough to reach this deadline, so on return the browser rechecks or reopens the
+connection and reloads state rather than assuming the subscription survived.
+An installed PWA uses the Badging API, when available,
 to show the count of pending approvals and clears the badge when none remain.
 While watching a running Session, a user may opt in to Keep awake; the screen
 wake lock is released when the page is hidden or the Run is no longer active

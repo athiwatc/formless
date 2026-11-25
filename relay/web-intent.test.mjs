@@ -1470,6 +1470,26 @@ test('same-session GetSession refresh restores a pending step from its prompt pr
   assert.equal(c.S.step.count, 2);
 });
 
+test('same-session GetSession refresh preserves full arguments for the same pending step', async () => {
+  const { c, wait } = liveSetup();
+  c.S.current = 'A';
+  const fullArguments = JSON.stringify({ path: 'src', filter: 'x'.repeat(5000) });
+  c.S.step = {
+    session_id: 'A', run_id: 'run-1', step_id: 'step-1', tool_name: 'reader',
+    arguments: fullArguments, index: 1, count: 2,
+  };
+  const load = c.openSession('A');
+  wait.resolve({ messages: [], running: true, pending_events: [], pending_steps: { prompts: [
+    {
+      session_id: 'A', run_id: 'run-1', step_id: 'step-1', tool_name: 'reader',
+      arguments_preview: fullArguments.slice(0, 4096), arguments_bytes: fullArguments.length,
+      index: 1, count: 2,
+    },
+  ], more: false } });
+  await load;
+  assert.equal(c.S.step.arguments, fullArguments);
+});
+
 test('live step events received during a same-session refresh supersede its older prompt snapshot', async () => {
   const { c, wait } = liveSetup();
   c.S.current = 'A';

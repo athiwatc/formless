@@ -713,7 +713,7 @@
 
   // ------------------------------------------------------------ transport
   /** Request with a response (rejects on daemon error or timeout). */
-  function request(req, timeoutMs) {
+  function request(req, timeoutMs, extendOnRelayActivity = false) {
     return new Promise((resolve, reject) => {
       if (!S.ws || S.ws.readyState !== 1) return reject(new Error("not connected to the relay"));
       if (!S.channel || (!S.local && !S.relayReady)) return reject(new Error("still connecting to the daemon"));
@@ -729,10 +729,20 @@
           lease = S.relayMemory.reserve(12 * bytes + 1024 * 1024 + 4 * S.relayModule.LIMITS.windowFrames * S.relayModule.LIMITS.wire + 4096);
         }
       } catch (error) { return reject(error); }
-      const timer = setTimeout(() => {
+      const timeout = timeoutMs || 30000;
+      let activity = S.relayActivity || 0;
+      let timer;
+      const onTimeout = () => {
+        const currentActivity = S.relayActivity || 0;
+        if (extendOnRelayActivity && currentActivity !== activity) {
+          activity = currentActivity;
+          timer = setTimeout(onTimeout, timeout);
+          return;
+        }
         S.pending.delete(id);
         reject(new Error("the daemon did not answer (is it online?)"));
-      }, timeoutMs || 30000);
+      };
+      timer = setTimeout(onTimeout, timeout);
       S.pending.set(id, {
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject: (e) => { clearTimeout(timer); reject(e); },
@@ -1089,7 +1099,6 @@
   }
   function download(name, value) {
     const serialized = JSON.stringify(value, null, 2);
-    if (relayProbe) localJsonSerializationSeq++;
     downloadBlob(name, new Blob([serialized], { type: "application/json" }));
   }
   function downloadBlob(name, blob) {
@@ -8829,9 +8838,14 @@
       renderPlan();
       S.stepMode = !!r.step_mode;
       if (r.pending_steps && Array.isArray(r.pending_steps.prompts)) {
-        let step = r.pending_steps.prompts[0]
-          ? { ...r.pending_steps.prompts[0], arguments: r.pending_steps.prompts[0].arguments_preview }
-          : null;
+        const prompt = r.pending_steps.prompts[0];
+        let step = prompt ? {
+          ...prompt,
+          arguments: S.step && S.step.session_id === prompt.session_id && S.step.run_id === prompt.run_id &&
+            S.step.step_id === prompt.step_id && typeof S.step.arguments === "string"
+            ? S.step.arguments
+            : prompt.arguments_preview,
+        } : null;
         for (const ev of snapshot.events) {
           if (ev.session_id !== id) continue;
           if (ev.type === "step_pending") step = ev;
@@ -10658,6 +10672,7 @@
   }
   function openRelay() {
     S.local = false;
+    S.daemonOnline = false;
     if (S.relayLink) S.relayLink.endpoint.dispose();
     S.relayLink = null;
     S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
@@ -10709,7 +10724,9 @@
           });
           S.relayLink = { ws, endpoint };
         }
-        S.relayLink.endpoint.receive(frame);
+        const endpoint = S.relayLink.endpoint;
+        endpoint.receive(frame);
+        if (!endpoint.closed) S.relayActivity = (S.relayActivity || 0) + 1;
       } catch (_) { try { ws.close(1008, "relay transport failed"); } catch (_) {} }
     };
     async function onFrame(ws, frame) {
@@ -10900,21 +10917,18 @@
     renderChrome();
   }
   setInterval(() => { if (S.reconnect) renderChrome(); }, 1000);
-  let localJsonSerializationSeq = 0;
   const RELAY_PROBE_INTERVAL_MS = 15000;
-  const RELAY_PROBE_TIMEOUT_MS = 5000;
+  const RELAY_PROBE_TIMEOUT_MS = 15000;
   let relayProbe = null;
   let relayResume = null;
   function probeRelay() {
     if (!S.channel || S.local || !S.relayReady || S.userClosed || S.ws?.readyState !== 1 || navigator.onLine === false) return Promise.resolve(false);
     if (relayProbe) return relayProbe;
     const ws = S.ws, channel = S.channel;
-    const serializationSeq = localJsonSerializationSeq;
-    relayProbe = request({ type: "ping" }, RELAY_PROBE_TIMEOUT_MS)
+    relayProbe = request({ type: "ping" }, RELAY_PROBE_TIMEOUT_MS, true)
       .then(() => S.ws === ws && S.channel === channel)
       .catch(() => {
         if (S.ws !== ws || S.channel !== channel) return false;
-        if (localJsonSerializationSeq !== serializationSeq) return false;
         note("relay probe failed; reconnecting", true);
         try { openRelay(); }
         catch (error) {
