@@ -1120,7 +1120,7 @@ impl Daemon {
         }
     }
 
-    fn close_topic_permission(&self, permission_id: &str) -> bool {
+    pub(super) fn close_topic_permission(&self, permission_id: &str) -> bool {
         let removed = self.harness_permissions.locked().remove(permission_id);
         if removed.is_some() {
             self.broadcast(Event::HarnessPermissionClosed {
@@ -1155,6 +1155,7 @@ impl Daemon {
                 sender,
             },
         );
+        let _pending = main_chat_backend::MainPrompt::permission(self, &id);
         self.broadcast(Event::HarnessPermissionRequested {
             permission_id: id.clone(),
             session_id: session_id.into(),

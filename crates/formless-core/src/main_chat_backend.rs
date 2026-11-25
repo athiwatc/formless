@@ -161,6 +161,37 @@ struct MainInteraction {
     harness: MainChatHarness,
 }
 
+pub(super) struct MainPrompt<'a> {
+    daemon: &'a Daemon,
+    id: &'a str,
+    permission: bool,
+}
+
+impl<'a> MainPrompt<'a> {
+    pub(super) fn permission(daemon: &'a Daemon, id: &'a str) -> Self {
+        Self {
+            daemon,
+            id,
+            permission: true,
+        }
+    }
+}
+
+impl Drop for MainPrompt<'_> {
+    fn drop(&mut self) {
+        if self.permission {
+            self.daemon.close_topic_permission(self.id);
+        } else {
+            self.daemon.questions.locked().remove(self.id);
+            let answered_by = self.daemon.question_answered_by.locked().remove(self.id);
+            self.daemon.broadcast(Event::UserQuestionClosed {
+                question_id: self.id.into(),
+                answered_by,
+            });
+        }
+    }
+}
+
 impl InteractionHandler for MainInteraction {
     fn request_permission<'a>(
         &'a self,
@@ -202,6 +233,11 @@ impl InteractionHandler for MainInteraction {
             let id = uuid::Uuid::new_v4().to_string();
             let (tx, rx) = oneshot::channel();
             self.daemon.questions.locked().insert(id.clone(), tx);
+            let pending = MainPrompt {
+                daemon: &self.daemon,
+                id: &id,
+                permission: false,
+            };
             let question = questions
                 .iter()
                 .map(|q| q.question.as_str())
@@ -223,11 +259,7 @@ impl InteractionHandler for MainInteraction {
                 questions: questions.clone(),
             });
             let answer = prompt_reply::wait(&self.daemon.questions, &id, rx, cancel, || {}).await;
-            let answered_by = self.daemon.question_answered_by.locked().remove(&id);
-            self.daemon.broadcast(Event::UserQuestionClosed {
-                question_id: id,
-                answered_by,
-            });
+            drop(pending);
             let (answer, answers) = answer?;
             if answers.is_empty() && questions.len() == 1 {
                 let selected = questions[0]
