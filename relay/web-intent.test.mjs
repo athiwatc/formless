@@ -1419,6 +1419,71 @@ function liveSetup(extras = {}) {
   c.S.running = new Set(); c.S.approvals = []; c.S.questions = []; c.S.liveTools = [];
   return { c, wait };
 }
+test('same-session foreground refresh preserves unsent text in a message edit', async () => {
+  const { c, wait } = liveSetup();
+  c.S.current = 'A';
+  c.S.editMessageId = 'message-being-edited';
+  c.$('input').value = 'unsent correction';
+  const load = c.openSession('A');
+  assert.equal(c.S.editMessageId, 'message-being-edited');
+  assert.equal(c.$('input').value, 'unsent correction');
+  wait.resolve({ messages: [], running: true, pending_events: [], pending_steps: { prompts: [], more: false } });
+  await load;
+  assert.equal(c.S.editMessageId, 'message-being-edited');
+  assert.equal(c.$('input').value, 'unsent correction');
+});
+
+test('same-session foreground refresh preserves partial live output and racing deltas', async () => {
+  const { c, wait } = liveSetup();
+  c.S.current = 'A';
+  c.S.liveRun = { id: 'run-1' };
+  c.S.streaming = 'answer prefix';
+  c.S.thinking = 'reasoning prefix';
+  c.S.liveTools = [{ tool_name: 'reader' }];
+  const tools = c.S.liveTools;
+  const load = c.openSession('A');
+  assert.equal(c.S.streaming, 'answer prefix');
+  assert.equal(c.S.thinking, 'reasoning prefix');
+  c.onEvent({ type: 'message_delta', session_id: 'A', delta: ' tail' });
+  c.onEvent({ type: 'reasoning_delta', session_id: 'A', delta: ' tail' });
+  wait.resolve({ messages: [], running: true, pending_events: [], pending_steps: { prompts: [], more: false }, latest_run: { run_id: 'run-1', status: 'running' } });
+  await load;
+  assert.equal(c.S.streaming, 'answer prefix tail');
+  assert.equal(c.S.thinking, 'reasoning prefix tail');
+  assert.equal(c.S.liveTools, tools);
+});
+
+test('same-session GetSession refresh restores a pending step from its prompt preview', async () => {
+  const { c, wait } = liveSetup();
+  c.S.current = 'A';
+  const existing = { step_id: 'previous', tool_name: 'old-tool' };
+  c.S.step = existing;
+  const load = c.openSession('A');
+  assert.equal(c.S.step, existing, 'keep the current controls while the snapshot is in flight');
+  wait.resolve({ messages: [], running: true, pending_events: [], pending_steps: { prompts: [
+    { session_id: 'A', run_id: 'run-1', step_id: 'step-1', tool_name: 'reader', arguments_preview: '{"path":"src"}', arguments_bytes: 15, index: 1, count: 2 },
+  ], more: false } });
+  await load;
+  assert.equal(c.S.step.step_id, 'step-1');
+  assert.equal(c.S.step.arguments, '{"path":"src"}');
+  assert.equal(c.S.step.index, 1);
+  assert.equal(c.S.step.count, 2);
+});
+
+test('live step events received during a same-session refresh supersede its older prompt snapshot', async () => {
+  const { c, wait } = liveSetup();
+  c.S.current = 'A';
+  const load = c.openSession('A');
+  c.onEvent({ type: 'step_resolved', session_id: 'A', step_id: 'snapshot-step' });
+  c.onEvent({ type: 'step_pending', session_id: 'A', run_id: 'run-2', step_id: 'live-step', tool_name: 'writer', arguments: '{"path":"out"}', index: 1, count: 3 });
+  wait.resolve({ messages: [], running: true, pending_events: [], pending_steps: { prompts: [
+    { session_id: 'A', run_id: 'run-1', step_id: 'snapshot-step', tool_name: 'reader', arguments_preview: '{}', arguments_bytes: 2, index: 0, count: 1 },
+  ], more: false } });
+  await load;
+  assert.equal(c.S.step.step_id, 'live-step');
+  assert.equal(c.S.step.arguments, '{"path":"out"}');
+});
+
 test('global attention snapshot preserves another Session question and entered dialog', async () => {
   const cancelled = [], { c, wait } = liveSetup({ cancelAsk: tag => cancelled.push(tag) });
   c.onEvent({ type: 'user_question', question_id: 'qa', session_id: 'A', question: 'A?' });

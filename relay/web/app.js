@@ -8749,6 +8749,8 @@
     if (S.view === "chat") renderHistory();
   }
   async function openSession(id, stay) {
+    const sameSession = S.current === id;
+    const editingMessageId = sameSession ? S.editMessageId : null;
     if (S.current && !S.editMessageId) saveDraft(S.current, $("input").value);
     S.topicFocus = null;
     if (S.current !== id) invalidateBranchSummary();
@@ -8762,8 +8764,10 @@
     S.sessionLoad = { id, status: "pending" };
     const snapshot = S.sessionSnapshot = { events: [] };
     S.messages = [];
-    clearLiveText();
-    S.liveTools = []; S.liveRun = null;
+    if (!sameSession) {
+      clearLiveText();
+      S.liveTools = []; S.liveRun = null;
+    }
     renderHistory();
     S.runTools = null;
     renderRunTools();
@@ -8782,7 +8786,7 @@
     const draft = Object.prototype.hasOwnProperty.call(attachmentDrafts, draftKey) ? attachmentDrafts[draftKey] : loadDraft(S.storageScope, id);
     S.drafts[id] = draft;
     delete attachmentDrafts[draftKey];
-    $("input").value = draft;
+    if (!editingMessageId) $("input").value = draft;
     saveDraft(id, draft);
     autosize();
     void refreshAttachmentInventory(id);
@@ -8797,10 +8801,10 @@
         renderStatus();
       }).catch(() => {});
     prefs.set(sessionStorageKey(S.storageScope), id);
-    S.editMessageId = null;
+    S.editMessageId = editingMessageId || null;
     S.queued = []; renderQueue();
     S.plan = []; S.planState = null; renderPlan();
-    S.step = null; renderStep();
+    if (!sameSession) { S.step = null; renderStep(); }
     S.recap = null; S.recapRunId = null;
     const r = await act({ type: "get_session", id });
     if (seq !== sessionSeq || S.current !== id) return;
@@ -8823,6 +8827,18 @@
       }
       renderPlan();
       S.stepMode = !!r.step_mode;
+      if (r.pending_steps && Array.isArray(r.pending_steps.prompts)) {
+        let step = r.pending_steps.prompts[0]
+          ? { ...r.pending_steps.prompts[0], arguments: r.pending_steps.prompts[0].arguments_preview }
+          : null;
+        for (const ev of snapshot.events) {
+          if (ev.session_id !== id) continue;
+          if (ev.type === "step_pending") step = ev;
+          else if (ev.type === "step_resolved" && step && step.step_id === ev.step_id) step = null;
+        }
+        S.step = step;
+        renderStep();
+      }
       const i = S.sessions.findIndex((s) => s.id === id);
       if (i >= 0 && r.session) S.sessions[i] = r.session;
     }
@@ -9876,7 +9892,7 @@
       forecastRevision++;
       scheduleForecast();
     }
-    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "run_recap", "plan_updated", "approval_requested", "approval_answered", "approval_closed", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed", "harness_permission_requested", "harness_permission_closed"].includes(ev.type)) {
+    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "run_recap", "plan_updated", "step_pending", "step_resolved", "approval_requested", "approval_answered", "approval_closed", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed", "harness_permission_requested", "harness_permission_closed"].includes(ev.type)) {
       S.sessionSnapshot.events.push(ev);
     }
     notifyFor(ev);
