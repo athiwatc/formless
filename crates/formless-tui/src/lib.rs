@@ -7425,9 +7425,8 @@ impl App {
             return;
         }
         if self.editing_step {
-            let text = self.input.take();
             self.editing_step = false;
-            self.step_decide("edit", Some(text.trim().to_string()));
+            self.step_decide("edit", Some(text));
             return;
         }
         if let Some(message_id) = self.editing_id.take() {
@@ -20906,6 +20905,16 @@ mod tests {
         app.input.clear();
         app.key(key(KeyCode::Char('e')));
         assert_eq!(app.input.expanded(), pretty_json(draft));
+
+        let corrected = r#"{"value":2}"#;
+        app.input.set(corrected);
+        app.key(key(KeyCode::Enter));
+        assert!(!app.editing_step);
+        assert_eq!(
+            app.step.as_ref().unwrap().draft.as_deref(),
+            Some(corrected),
+            "Enter in the step editor sends the typed arguments"
+        );
     }
 
     include!("hunk_tests.rs");
