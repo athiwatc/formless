@@ -2601,6 +2601,11 @@ impl Daemon {
                     st.search_sessions(&query, limit.unwrap_or(50))
                 })?)?)
             }
+            Request::SearchSessionsWithScope { query, limit } => {
+                Ok(serde_json::to_value(self.with_reader(|st| {
+                    st.search_sessions_with_scope(&query, limit.unwrap_or(50))
+                })?)?)
+            }
             Request::EditMessage {
                 session_id,
                 message_id,
@@ -16733,6 +16738,22 @@ impl Daemon {
         }
     }
 
+    async fn database_maintenance_loop(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            let daemon = self.clone();
+            match tokio::task::spawn_blocking(move || {
+                daemon.with_store(Store::optimize_message_search)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "database maintenance"),
+                Err(error) => tracing::warn!(%error, "database maintenance worker failed"),
+            }
+        }
+    }
+
     async fn log_rotator(self: Arc<Self>) {
         if std::env::var_os(crate::logs::DAEMON_LOG_ENV).is_none() {
             return;
@@ -16928,6 +16949,10 @@ impl Daemon {
             let this = self.clone();
             tokio::spawn(async move { this.backup_loop().await })
         };
+        let database_maintenance = {
+            let this = self.clone();
+            tokio::spawn(async move { this.database_maintenance_loop().await })
+        };
         let model_check = {
             let this = self.clone();
             tokio::spawn(async move { this.check_models_loop().await })
@@ -16944,6 +16969,7 @@ impl Daemon {
         logs.abort();
         artifact_gc.abort();
         backups.abort();
+        database_maintenance.abort();
         model_check.abort();
         mcp.abort();
         jobs.abort();

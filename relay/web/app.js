@@ -2770,13 +2770,17 @@
     await openTopic(topic);
   }
 
-  function renderSearch(hits, query) {
+  function renderSearch(hits, query, searchedLatest) {
     const box = $("search-results");
     box.replaceChildren();
     if (hits == null) { box.classList.add("hidden"); return; }
     box.classList.remove("hidden");
     box.append(h("div", { class: "muted", style: "padding:0.25rem 0.5rem;font-size:0.75rem" },
       hits.length + " hit" + (hits.length === 1 ? "" : "s") + " for “" + query + "”"));
+    if (searchedLatest != null) {
+      box.append(h("div", { class: "muted", style: "padding:0.25rem 0.5rem;font-size:0.75rem" },
+        "Searched latest " + searchedLatest + " messages."));
+    }
     const literal = query.trim();
     const words = literal.match(/[\p{Alphabetic}\p{Number}]+/gu);
     const terms = words && new Set(words.map((word) => foldMap(word, foldSearchCharacter).folded).filter(Boolean));
@@ -9654,8 +9658,8 @@
     const seq = ++searchSeq;
     q = q.trim();
     if (!q) { renderSearch(null); return; }
-    const hits = await act({ type: "search_sessions", query: q, limit: 50 });
-    if (seq === searchSeq && hits) renderSearch(hits, q);
+    const result = await act({ type: "search_sessions_with_scope", query: q, limit: 50 });
+    if (seq === searchSeq && result) renderSearch(result.hits, q, result.searched_latest);
   }
 
   function autosize() {

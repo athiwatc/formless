@@ -12,6 +12,7 @@ use unicode_segmentation::UnicodeSegmentation;
 pub(super) struct Context {
     pub query: String,
     pub limit: usize,
+    pub searched_latest: Option<usize>,
 }
 
 pub(super) fn label(value: &str) -> String {
@@ -32,6 +33,9 @@ pub(super) fn title(count: usize, context: Option<&Context>, width: usize) -> St
     }
     let mut title = format!(" Search ({count} hits)");
     if let Some(context) = context {
+        if let Some(latest) = context.searched_latest {
+            let _ = write!(title, " · Searched latest {latest} messages");
+        }
         if count == context.limit {
             title.push_str(" · more may exist");
             if text::width(&title) > width {
@@ -151,6 +155,7 @@ mod tests {
         let context = Context {
             query: "ไทย界👩‍💻\u{202e}\n".into(),
             limit: 50,
+            searched_latest: None,
         };
         let wide = title(50, Some(&context), 90);
         assert!(wide.contains("more may exist"));

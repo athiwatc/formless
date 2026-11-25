@@ -36,6 +36,79 @@ fn session_and_audit_search_fold_greek_final_sigma() {
 }
 
 #[test]
+fn unicode_verification_and_snippets_cross_storage_read_boundaries() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(None).unwrap();
+    let text = format!("{}λόγος 文件目标", "a".repeat(16 * 1024 - 1));
+    let message = store.append_message(&session.id, "user", &text).unwrap();
+    let hits = store.search_sessions("ΟΣ", 10).unwrap();
+    assert_eq!(hits[0].message_id, message.id);
+    assert!(hits[0].snippet.contains("λόγος 文件目标"));
+    let hits = store.search_sessions("文件 目标", 10).unwrap();
+    assert_eq!(hits[0].message_id, message.id);
+    assert!(hits[0].snippet.contains("文件目标"));
+}
+
+#[test]
+fn literal_search_caps_live_candidates_before_reading_bodies() {
+    let root = std::env::temp_dir().join(format!("fl-search-scope-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("data.db");
+    let store = Store::open(&db).unwrap();
+    let live = store.create_session(None).unwrap();
+    let deleted = store.create_session(None).unwrap();
+    let old = store.append_message(&live.id, "user", "?? older").unwrap();
+    let excluded = store
+        .append_message(&deleted.id, "user", "?? deleted")
+        .unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE messages SET created_at='2000' WHERE id=?1",
+        [&old.id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sessions SET deleted_at='2026' WHERE id=?1",
+        [&deleted.id],
+    )
+    .unwrap();
+    conn.execute(
+        "WITH RECURSIVE seq(n) AS (SELECT 2 UNION ALL SELECT n+1 FROM seq WHERE n<10001)
+         INSERT INTO messages(id, session_id, seq, role, content, created_at)
+         SELECT 'literal-fixture-'||n, ?1, n, 'user', 'plain', '2026' FROM seq",
+        [&live.id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE messages SET created_at='9999' WHERE id=?1",
+        [&excluded.id],
+    )
+    .unwrap();
+    let scoped = store.search_sessions_with_scope("??", 20).unwrap();
+    assert!(scoped.hits.is_empty());
+    assert_eq!(scoped.searched_latest, Some(10_000));
+    conn.execute(
+        "UPDATE messages SET content='?? included' WHERE id='literal-fixture-2'",
+        [],
+    )
+    .unwrap();
+    let scoped = store.search_sessions_with_scope("??", 20).unwrap();
+    assert_eq!(scoped.hits.len(), 1);
+    assert_eq!(scoped.hits[0].message_id, "literal-fixture-2");
+    assert_eq!(store.search_sessions("??", 20).unwrap(), scoped.hits);
+    assert_eq!(
+        store
+            .search_sessions_with_scope("included", 20)
+            .unwrap()
+            .searched_latest,
+        None
+    );
+    drop(conn);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn search_snippets_prefer_nearby_word_prefixes_and_keep_the_original_text() {
     let store = Store::open_in_memory().unwrap();
     let session = store.create_session(None).unwrap();

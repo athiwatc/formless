@@ -314,25 +314,183 @@ fn run_id_prefix_end(prefix: &str) -> Option<String> {
     Some(upper)
 }
 
-fn make_snippet(content: &str, needle_lower: &str) -> String {
-    let flat: String = content
-        .chars()
-        .map(|c| if c == '\n' { ' ' } else { c })
-        .collect();
-    let chars: Vec<char> = flat.chars().collect();
-    // Found in a folded copy that keeps each char's original index, so
-    // the snippet centres on the match whatever case folding or Unicode
-    // normal form did to the length (#789).
-    let found = crate::fuzzy::find_folded(&flat, needle_lower).unwrap_or(0..0);
-    let start = found.start.saturating_sub(40);
-    let end = (found.end + 60).min(chars.len());
-    let core: String = chars[start..end].iter().collect();
-    format!(
-        "{}{}{}",
-        if start > 0 { "…" } else { "" },
-        core,
-        if end < chars.len() { "…" } else { "" }
-    )
+const SEARCH_RECENT_MESSAGES: usize = 10_000;
+const RECENT_SEARCH_SQL: &str =
+    "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.rowid, m.created_at
+     FROM messages m JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL
+     ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?1";
+
+const SEARCH_READ_BYTES: usize = 16 * 1024;
+
+struct SearchContent<'conn>(rusqlite::blob::Blob<'conn>);
+
+impl SearchContent<'_> {
+    fn scan<T>(&self, f: impl FnOnce(&mut SearchChars<'_>) -> T) -> Result<T> {
+        let mut chars = SearchChars {
+            blob: &self.0,
+            bytes: [0; SEARCH_READ_BYTES],
+            offset: 0,
+            start: 0,
+            end: 0,
+            error: None,
+        };
+        let out = f(&mut chars);
+        match chars.error {
+            Some(error) => Err(error),
+            None => Ok(out),
+        }
+    }
+
+    fn snippet(&self, range: std::ops::Range<usize>) -> Result<String> {
+        self.scan(|chars| {
+            let mut out = String::new();
+            if range.start > 0 {
+                out.push('…');
+            }
+            let mut chars = chars.skip(range.start);
+            for ch in chars.by_ref().take(range.len()) {
+                out.push(if ch == '\n' { ' ' } else { ch });
+            }
+            if chars.next().is_some() {
+                out.push('…');
+            }
+            out
+        })
+    }
+}
+
+struct SearchChars<'a> {
+    blob: &'a rusqlite::blob::Blob<'a>,
+    bytes: [u8; SEARCH_READ_BYTES],
+    offset: usize,
+    start: usize,
+    end: usize,
+    error: Option<anyhow::Error>,
+}
+
+impl SearchChars<'_> {
+    fn refill(&mut self) -> Result<()> {
+        let len = self.blob.read_at(&mut self.bytes, self.offset)?;
+        self.end = match std::str::from_utf8(&self.bytes[..len]) {
+            Ok(_) => len,
+            Err(error) if error.error_len().is_none() && self.offset + len < self.blob.len() => {
+                error.valid_up_to()
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.start = 0;
+        self.offset += self.end;
+        Ok(())
+    }
+}
+
+impl Iterator for SearchChars<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        if self.error.is_some() {
+            return None;
+        }
+        if self.start == self.end {
+            if self.offset == self.blob.len() {
+                return None;
+            }
+            if let Err(error) = self.refill() {
+                self.error = Some(error);
+                return None;
+            }
+        }
+        let start = self.start;
+        let byte = self.bytes[start];
+        if byte.is_ascii() {
+            self.start += 1;
+            return Some(char::from(byte));
+        }
+        self.start += byte.leading_ones() as usize;
+        std::str::from_utf8(&self.bytes[start..self.start])
+            .ok()?
+            .chars()
+            .next()
+    }
+
+    fn nth(&mut self, mut n: usize) -> Option<char> {
+        while n != 0 {
+            let available = (self.end - self.start).min(n);
+            let bytes = &self.bytes[self.start..self.start + available];
+            let ascii = if bytes.is_ascii() {
+                available
+            } else {
+                bytes.iter().position(|byte| !byte.is_ascii()).unwrap()
+            };
+            if ascii != 0 {
+                self.start += ascii;
+                n -= ascii;
+            } else {
+                self.next()?;
+                n -= 1;
+            }
+        }
+        self.next()
+    }
+}
+
+fn matching_range(
+    chars: impl Iterator<Item = (usize, char)>,
+    needle: &[char],
+    boundary: bool,
+) -> Option<std::ops::Range<usize>> {
+    if needle.is_empty() {
+        return None;
+    }
+    let mut window = VecDeque::with_capacity(needle.len());
+    let mut pending = None;
+    for (index, ch) in chars {
+        if let Some(found) = pending.take() {
+            if !unicode_normalization::char::is_combining_mark(ch) {
+                return Some(found);
+            }
+        }
+        if window.is_empty() && ch != needle[0] {
+            continue;
+        }
+        if window.len() == needle.len() {
+            window.pop_front();
+        }
+        window.push_back((index, ch));
+        if window.len() == needle.len()
+            && window.iter().map(|&(_, ch)| ch).eq(needle.iter().copied())
+        {
+            let found = window[0].0..index + 1;
+            if !boundary {
+                return Some(found);
+            }
+            pending = Some(found);
+        }
+    }
+    pending
+}
+
+fn make_snippet(content: &SearchContent<'_>, needle: &[char]) -> Result<String> {
+    let found = content
+        .scan(|chars| {
+            matching_range(
+                chars.enumerate().flat_map(|(index, ch)| {
+                    let ch = if ch == '\n' { ' ' } else { ch };
+                    let ascii = ch.is_ascii().then(|| (index, ch.to_ascii_lowercase()));
+                    ascii.into_iter().chain(
+                        (!ch.is_ascii())
+                            .then(|| crate::fuzzy::fold_char(ch))
+                            .into_iter()
+                            .flatten()
+                            .map(move |ch| (index, ch)),
+                    )
+                }),
+                needle,
+                false,
+            )
+        })?
+        .unwrap_or(0..0);
+    content.snippet(found.start.saturating_sub(40)..found.end + 60)
 }
 
 /// For multi-term searches, fit as many distinct word-prefix matches as
@@ -346,19 +504,17 @@ fn is_han_char(character: char) -> bool {
     )
 }
 
-type MultiTermSnippetMatch = (usize, usize, usize, usize, Vec<usize>);
+type MultiTermSnippetMatch = (usize, usize, Vec<usize>);
 
 fn record_multi_term_snippet_matches(
     window: &mut VecDeque<MultiTermSnippetMatch>,
-    end_counts: &mut BTreeMap<usize, (usize, usize)>,
+    end_counts: &mut BTreeMap<usize, usize>,
     counts: &mut [usize],
     covered: &mut usize,
-    best: &mut ((usize, Reverse<usize>, Reverse<usize>), usize, usize, usize),
+    best: &mut (usize, Reverse<usize>, Reverse<usize>),
     budget: usize,
     start_char: usize,
-    start_byte: usize,
     end_char: usize,
-    end_byte: usize,
     matched: Vec<usize>,
 ) {
     for &id in &matched {
@@ -367,18 +523,12 @@ fn record_multi_term_snippet_matches(
     }
     let position = window
         .iter()
-        .position(|(start, _, _, _, _)| *start > start_char)
+        .position(|(start, _, _)| *start > start_char)
         .unwrap_or(window.len());
-    window.insert(
-        position,
-        (start_char, start_byte, end_char, end_byte, matched),
-    );
-    end_counts
-        .entry(end_char)
-        .and_modify(|(_, count)| *count += 1)
-        .or_insert((end_byte, 1));
+    window.insert(position, (start_char, end_char, matched));
+    *end_counts.entry(end_char).or_default() += 1;
     loop {
-        let Some((start, _, _, _, ids)) = window.front() else {
+        let Some((start, _, ids)) = window.front() else {
             break;
         };
         let Some((&right_char, _)) = end_counts.last_key_value() else {
@@ -387,139 +537,135 @@ fn record_multi_term_snippet_matches(
         if right_char - *start <= budget && !ids.iter().all(|&id| counts[id] > 1) {
             break;
         }
-        let (_, _, removed_end, _, ids) = window.pop_front().unwrap();
+        let (_, removed_end, ids) = window.pop_front().unwrap();
         for id in ids {
             counts[id] -= 1;
             *covered -= usize::from(counts[id] == 0);
         }
-        let remove_end = if let Some((_, count)) = end_counts.get_mut(&removed_end) {
-            *count -= 1;
-            *count == 0
-        } else {
-            false
-        };
-        if remove_end {
+        let count = end_counts.get_mut(&removed_end).unwrap();
+        *count -= 1;
+        if *count == 0 {
             end_counts.remove(&removed_end);
         }
     }
-    if let (Some(&(start, from, _, _, _)), Some((&end_char, &(end_byte, _)))) =
+    if let (Some(&(start, _, _)), Some((&end_char, _))) =
         (window.front(), end_counts.last_key_value())
     {
-        let width = end_char - start;
-        let score = (*covered, Reverse(width), Reverse(start));
-        if score > best.0 {
-            *best = (score, from, end_byte, width);
-        }
+        *best = (*best).max((*covered, Reverse(end_char - start), Reverse(start)));
     }
 }
 
-fn multi_term_snippet(content: &str, terms: &HashMap<String, usize>) -> String {
+fn multi_term_snippet(
+    content: &SearchContent<'_>,
+    terms: &HashMap<String, usize>,
+) -> Result<String> {
     const BUDGET: usize = 100;
     let max_term_bytes = terms.keys().map(String::len).max().unwrap_or(0);
-    let mut han_terms_by_last_char = HashMap::<char, Vec<(&str, usize, usize)>>::new();
+    let mut han_terms = HashMap::<char, Vec<(&str, usize, usize)>>::new();
     for (term, &id) in terms {
-        if !term.is_empty() && term.chars().all(is_han_char) {
-            han_terms_by_last_char
-                .entry(term.chars().next_back().unwrap())
-                .or_default()
-                .push((term, id, term.chars().count()));
+        if let Some(last) = term.chars().next_back() {
+            if term.chars().all(is_han_char) {
+                han_terms
+                    .entry(last)
+                    .or_default()
+                    .push((term, id, term.chars().count()));
+            }
         }
     }
+    let longest_han = han_terms
+        .values()
+        .flatten()
+        .map(|&(_, _, len)| len)
+        .max()
+        .unwrap_or(0);
     let mut counts = vec![0; terms.len()];
     let mut covered = 0;
-    let mut window: VecDeque<MultiTermSnippetMatch> = VecDeque::new();
+    let mut window = VecDeque::new();
     let mut end_counts = BTreeMap::new();
-    let mut folded = String::new();
-    let mut best = ((0, Reverse(0), Reverse(0)), 0, 0, 0);
-    let mut word_start = None;
-    let chars = content.char_indices().chain([(content.len(), '\0')]);
-    for (end_char, (end_byte, ch)) in chars.enumerate() {
-        if !unicode_normalization::char::is_combining_mark(ch) {
-            if let Some(last_char) = content[..end_byte].chars().next_back() {
-                if let Some(candidates) = han_terms_by_last_char.get(&last_char) {
-                    for &(term, id, term_chars) in candidates {
-                        if end_byte >= term.len() {
-                            let start_byte = end_byte - term.len();
-                            if content.get(start_byte..end_byte) == Some(term) {
-                                if let Some(start_char) = end_char.checked_sub(term_chars) {
-                                    record_multi_term_snippet_matches(
-                                        &mut window,
-                                        &mut end_counts,
-                                        &mut counts,
-                                        &mut covered,
-                                        &mut best,
-                                        BUDGET,
-                                        start_char,
-                                        start_byte,
-                                        end_char,
-                                        end_byte,
-                                        vec![id],
-                                    );
-                                }
-                            }
+    let mut best = (0, Reverse(0), Reverse(0));
+    content.scan(|chars| {
+        let mut suffix = VecDeque::with_capacity(longest_han);
+        let mut word_start = None;
+        let mut word = String::new();
+        let mut folded = String::new();
+        for (end, ch) in chars.chain(['\0']).enumerate() {
+            let combining = unicode_normalization::char::is_combining_mark(ch);
+            if !combining {
+                if let Some(candidates) = suffix.back().and_then(|last| han_terms.get(last)) {
+                    for &(term, id, len) in candidates {
+                        if suffix.len() >= len
+                            && suffix
+                                .iter()
+                                .rev()
+                                .take(len)
+                                .copied()
+                                .eq(term.chars().rev())
+                        {
+                            record_multi_term_snippet_matches(
+                                &mut window,
+                                &mut end_counts,
+                                &mut counts,
+                                &mut covered,
+                                &mut best,
+                                BUDGET,
+                                end - len,
+                                end,
+                                vec![id],
+                            );
                         }
                     }
                 }
             }
-        }
-        if ch.is_alphanumeric() {
-            word_start.get_or_insert((end_char, end_byte));
-            continue;
-        }
-        if unicode_normalization::char::is_combining_mark(ch) {
-            continue;
-        }
-        let Some((start_char, start_byte)) = word_start.take() else {
-            continue;
-        };
-        if end_char - start_char > BUDGET {
-            continue;
-        }
-        folded.clear();
-        let mut matched = Vec::new();
-        for key in crate::fuzzy::fold_chars(&content[start_byte..end_byte]) {
-            if folded.len() + key.len_utf8() > max_term_bytes {
-                break;
+            if longest_han != 0 {
+                if suffix.len() == longest_han {
+                    suffix.pop_front();
+                }
+                suffix.push_back(ch);
             }
-            folded.push(key);
-            if let Some(&id) = terms.get(&folded) {
-                matched.push(id);
+            let alphanumeric = ch.is_alphanumeric();
+            if alphanumeric {
+                word_start.get_or_insert(end);
+            }
+            if alphanumeric || combining {
+                if word_start.is_some_and(|start| end - start < BUDGET) {
+                    word.push(ch);
+                }
+                continue;
+            }
+            if let Some(start) = word_start.take() {
+                if end - start <= BUDGET {
+                    folded.clear();
+                    let mut matched = Vec::new();
+                    for key in crate::fuzzy::fold_chars(&word) {
+                        if folded.len() + key.len_utf8() > max_term_bytes {
+                            break;
+                        }
+                        folded.push(key);
+                        if let Some(&id) = terms.get(&folded) {
+                            matched.push(id);
+                        }
+                    }
+                    if !matched.is_empty() {
+                        record_multi_term_snippet_matches(
+                            &mut window,
+                            &mut end_counts,
+                            &mut counts,
+                            &mut covered,
+                            &mut best,
+                            BUDGET,
+                            start,
+                            end,
+                            matched,
+                        );
+                    }
+                }
+                word.clear();
             }
         }
-        if matched.is_empty() {
-            continue;
-        }
-        record_multi_term_snippet_matches(
-            &mut window,
-            &mut end_counts,
-            &mut counts,
-            &mut covered,
-            &mut best,
-            BUDGET,
-            start_char,
-            start_byte,
-            end_char,
-            end_byte,
-            matched,
-        );
-    }
-    let (_, from, to, width) = best;
-    let mut start = from;
-    let mut after = BUDGET - width;
-    for (index, _) in content[..from].char_indices().rev().take(after.min(40)) {
-        start = index;
-        after -= 1;
-    }
-    let end = content[to..]
-        .char_indices()
-        .nth(after)
-        .map_or(content.len(), |(index, _)| to + index);
-    format!(
-        "{}{}{}",
-        if start > 0 { "…" } else { "" },
-        content[start..end].replace('\n', " "),
-        if end < content.len() { "…" } else { "" }
-    )
+    })?;
+    let (_, Reverse(width), Reverse(start)) = best;
+    let from = start.saturating_sub((BUDGET - width).min(40));
+    content.snippet(from..from + BUDGET)
 }
 
 /// Name of a Session nobody has named yet; auto-naming replaces it.
@@ -801,6 +947,7 @@ const SESSION_SUMMARY: &str = "s.*";
 // These indexes are rebuilt from existing rows and change no record layout.
 // Install them on writable opens without accepting a new schema stamp.
 const DERIVED_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
     CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, up_to_seq);
     CREATE INDEX IF NOT EXISTS idx_run_usage_created ON run_usage(created_at);
     CREATE INDEX IF NOT EXISTS idx_inv_replay_recent ON invocations(tool_id)
@@ -3041,12 +3188,48 @@ impl Store {
 
     /// English word-prefix and Unicode substring search across session messages.
     pub fn search_sessions(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        Ok(self.search_sessions_with_scope(query, limit)?.hits)
+    }
+
+    pub(crate) fn optimize_message_search(&self) -> Result<()> {
+        for (index, sql) in [
+            (
+                "messages_fts",
+                "INSERT INTO messages_fts(messages_fts) VALUES('optimize')",
+            ),
+            (
+                "messages_unicode_fts",
+                "INSERT INTO messages_unicode_fts(messages_unicode_fts) VALUES('optimize')",
+            ),
+        ] {
+            let started = std::time::Instant::now();
+            let result = self.conn.execute(sql, []);
+            tracing::info!(
+                index,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                success = result.is_ok(),
+                "optimize message search"
+            );
+            result.with_context(|| format!("optimize {index}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn search_sessions_with_scope(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<formless_protocol::SearchResults> {
         let query = query.trim();
         if query.is_empty() {
-            return Ok(Vec::new());
+            return Ok(formless_protocol::SearchResults {
+                hits: Vec::new(),
+                searched_latest: None,
+            });
         }
         let limit = limit.clamp(1, 200);
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        let mut literal = None;
         let (sql, verify_terms) = if query.is_ascii() {
             let fts = fts_query(query);
             let phrase = fts.as_ref().and_then(|_| identifier_prefix_phrase(query));
@@ -3056,7 +3239,7 @@ impl Store {
                     args.push((limit as i64).into());
                     args.push(phrase.into());
                     (
-                        "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+                        "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.rowid, m.created_at \
                          FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
                          JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
                          WHERE messages_fts MATCH ?1 \
@@ -3070,7 +3253,7 @@ impl Store {
                     args.push(fts.into());
                     args.push((limit as i64).into());
                     (
-                        "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+                        "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.rowid, m.created_at \
                          FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
                          JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
                          WHERE messages_fts MATCH ?1 \
@@ -3080,16 +3263,9 @@ impl Store {
                     )
                 }
             } else {
-                args.push(query.to_owned().into());
-                args.push((limit as i64).into());
-                (
-                    "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
-                     FROM messages m JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
-                     WHERE instr(lower(m.content),lower(?1))>0 \
-                     ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?2"
-                        .to_owned(),
-                    None,
-                )
+                literal = Some(query.to_owned());
+                args.push((SEARCH_RECENT_MESSAGES as i64).into());
+                (RECENT_SEARCH_SQL.to_owned(), None)
             }
         } else {
             let normalized_query = search_normalize(query);
@@ -3139,7 +3315,7 @@ impl Store {
                     ));
                 }
                 let sql = format!(
-                    "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+                    "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.rowid, m.created_at \
                      FROM messages m JOIN sessions s ON s.id=m.session_id AND s.deleted_at IS NULL \
                      WHERE {}",
                     conditions.join(" AND ")
@@ -3158,7 +3334,7 @@ impl Store {
                 args.push(ascii_fts.into());
                 args.push((limit as i64).into());
                 (
-                    "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+                    "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.rowid, m.created_at \
                      FROM messages_fts f JOIN messages m ON m.rowid=f.rowid \
                      JOIN sessions s ON s.id=m.session_id AND s.deleted_at IS NULL \
                      WHERE messages_fts MATCH ?1 \
@@ -3167,16 +3343,9 @@ impl Store {
                     None,
                 )
             } else {
-                args.push(normalized_query.into());
-                args.push((limit as i64).into());
-                (
-                    "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
-                     FROM messages m JOIN sessions s ON s.id=m.session_id AND s.deleted_at IS NULL \
-                     WHERE instr(lower(m.content),lower(?1))>0 \
-                     ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?2"
-                        .to_owned(),
-                    None,
-                )
+                literal = Some(normalized_query);
+                args.push((SEARCH_RECENT_MESSAGES as i64).into());
+                (RECENT_SEARCH_SQL.to_owned(), None)
             }
         };
         let mut stmt = self.ps(&sql)?;
@@ -3189,14 +3358,35 @@ impl Store {
                 .entry(crate::fuzzy::fold_chars(word).collect())
                 .or_insert(next);
         }
+        let needle: Vec<_> = crate::fuzzy::fold_chars(&needle).collect();
+        let literal_needle: Option<Vec<_>> = literal
+            .as_ref()
+            .map(|text| text.chars().map(|ch| ch.to_ascii_lowercase()).collect());
         let mut hits = Vec::new();
         while let Some(row) = rows.next()? {
-            let content = row.get_ref(5)?.as_str()?;
-            if verify_terms
-                .as_ref()
-                .is_some_and(|terms| !session_search_matches(content, terms))
-            {
-                continue;
+            let content = SearchContent(self.conn.blob_open(
+                rusqlite::DatabaseName::Main,
+                "messages",
+                "content",
+                row.get(5)?,
+                true,
+            )?);
+            if let Some(terms) = &verify_terms {
+                if !session_search_matches(&content, terms)? {
+                    continue;
+                }
+            }
+            if let Some(needle) = &literal_needle {
+                if !content.scan(|chars| {
+                    matching_range(
+                        chars.map(|ch| ch.to_ascii_lowercase()).enumerate(),
+                        needle,
+                        false,
+                    )
+                    .is_some()
+                })? {
+                    continue;
+                }
             }
             hits.push(SearchHit {
                 session_id: row.get(0)?,
@@ -3205,9 +3395,9 @@ impl Store {
                 seq: row.get(3)?,
                 role: row.get(4)?,
                 snippet: if terms.len() > 1 {
-                    multi_term_snippet(content, &terms)
+                    multi_term_snippet(&content, &terms)?
                 } else {
-                    make_snippet(content, &needle)
+                    make_snippet(&content, &needle)?
                 },
                 created_at: row.get(6)?,
             });
@@ -3215,7 +3405,10 @@ impl Store {
                 break;
             }
         }
-        Ok(hits)
+        Ok(formless_protocol::SearchResults {
+            hits,
+            searched_latest: literal.map(|_| SEARCH_RECENT_MESSAGES),
+        })
     }
 
     /// Edit a user message in place and delete everything after it
@@ -9180,12 +9373,7 @@ fn search_words(text: &str) -> impl Iterator<Item = &str> {
 }
 
 fn search_normalize(text: &str) -> String {
-    text.nfc()
-        .flat_map(char::to_lowercase)
-        .map(|character| if character == 'ς' { 'σ' } else { character })
-        .collect::<String>()
-        .nfc()
-        .collect()
+    normalized_search_chars(text.chars()).collect()
 }
 
 fn unicode_search_tokens(text: &str) -> Vec<String> {
@@ -9217,19 +9405,7 @@ struct UnicodeSearchTerm {
 }
 
 fn fold_latin_marks(text: &str) -> String {
-    let mut folded = String::with_capacity(text.len());
-    let mut follows_latin_letter = false;
-    for character in text.nfkd().flat_map(char::to_lowercase) {
-        if unicode_normalization::char::is_combining_mark(character) {
-            if !follows_latin_letter {
-                folded.push(character);
-            }
-        } else {
-            follows_latin_letter = character.is_ascii_alphabetic();
-            folded.push(character);
-        }
-    }
-    folded
+    latin_search_chars(text.chars()).collect()
 }
 
 fn latin_folded_term(term: &str) -> Option<String> {
@@ -9248,39 +9424,86 @@ fn unicode_search_query(terms: &[UnicodeSearchTerm]) -> Option<String> {
     (!tokens.is_empty()).then(|| tokens.into_iter().collect::<Vec<_>>().join(" AND "))
 }
 
-fn contains_without_splitting_combining_marks(content: &str, term: &str) -> bool {
-    !term.is_empty()
-        && content.match_indices(term).any(|(start, matched)| {
-            let end = start + matched.len();
-            !content[start..]
-                .chars()
-                .next()
-                .is_some_and(unicode_normalization::char::is_combining_mark)
-                && !content[end..]
-                    .chars()
-                    .next()
-                    .is_some_and(unicode_normalization::char::is_combining_mark)
+fn normalized_search_chars(chars: impl Iterator<Item = char>) -> impl Iterator<Item = char> {
+    chars
+        .nfc()
+        .flat_map(char::to_lowercase)
+        .map(|character| if character == 'ς' { 'σ' } else { character })
+        .nfc()
+}
+
+fn latin_search_chars(chars: impl Iterator<Item = char>) -> impl Iterator<Item = char> {
+    let mut follows_latin_letter = false;
+    chars
+        .nfkd()
+        .flat_map(char::to_lowercase)
+        .filter(move |&character| {
+            if unicode_normalization::char::is_combining_mark(character) {
+                !follows_latin_letter
+            } else {
+                follows_latin_letter = character.is_ascii_alphabetic();
+                true
+            }
         })
 }
 
-fn session_search_matches(content: &str, unicode_terms: &[UnicodeSearchTerm]) -> bool {
-    let content = search_normalize(content);
-    let folded_content = unicode_terms
-        .iter()
-        .any(|term| term.latin_folded.is_some())
-        .then(|| fold_latin_marks(&content));
-    unicode_terms.iter().all(|term| {
-        contains_without_splitting_combining_marks(&content, &term.normalized)
-            || term.latin_folded.as_ref().is_some_and(|folded_term| {
-                folded_content.as_ref().is_some_and(|folded_content| {
-                    if folded_term.is_ascii() {
-                        search_words(folded_content).any(|word| word.starts_with(folded_term))
-                    } else {
-                        contains_without_splitting_combining_marks(folded_content, folded_term)
+fn session_search_matches(
+    content: &SearchContent<'_>,
+    terms: &[UnicodeSearchTerm],
+) -> Result<bool> {
+    for term in terms {
+        let normalized: Vec<_> = term.normalized.chars().collect();
+        if content.scan(|chars| {
+            matching_range(
+                normalized_search_chars(chars).enumerate(),
+                &normalized,
+                true,
+            )
+            .is_some()
+        })? {
+            continue;
+        }
+        let Some(folded) = &term.latin_folded else {
+            return Ok(false);
+        };
+        let matched = content.scan(|chars| {
+            let chars = latin_search_chars(normalized_search_chars(chars));
+            if folded.is_ascii() {
+                let mut matched = 0;
+                let mut word_started = false;
+                for ch in chars {
+                    if ch.is_alphanumeric() {
+                        word_started = true;
+                    } else if !unicode_normalization::char::is_combining_mark(ch) {
+                        matched = 0;
+                        word_started = false;
                     }
-                })
-            })
-    })
+                    if word_started {
+                        if folded
+                            .as_bytes()
+                            .get(matched)
+                            .is_some_and(|&b| char::from(b) == ch)
+                        {
+                            matched += 1;
+                            if matched == folded.len() {
+                                return true;
+                            }
+                        } else {
+                            matched = folded.len();
+                        }
+                    }
+                }
+                false
+            } else {
+                let folded: Vec<_> = folded.chars().collect();
+                matching_range(chars.enumerate(), &folded, true).is_some()
+            }
+        })?;
+        if !matched {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// An FTS5 query from free text: each word quoted as a prefix term, all
@@ -9288,6 +9511,48 @@ fn session_search_matches(content: &str, unicode_terms: &[UnicodeSearchTerm]) ->
 pub fn fts_query(text: &str) -> Option<String> {
     let terms: Vec<String> = search_words(text).map(|w| format!("\"{w}\"*")).collect();
     (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+#[cfg(test)]
+mod message_search_maintenance_tests {
+    use super::*;
+
+    #[test]
+    fn fts_optimization_merges_segments_in_both_indexes() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO messages_fts(messages_fts,rank) VALUES('automerge',0);
+             INSERT INTO messages_unicode_fts(messages_unicode_fts,rank) VALUES('automerge',0);",
+            )
+            .unwrap();
+        for _ in 0..6 {
+            store
+                .append_message(&session.id, "user", "needle 文件目标")
+                .unwrap();
+        }
+        let segments = |table: &str| {
+            store
+                .conn
+                .query_row(
+                    &format!("SELECT count(DISTINCT segid) FROM {table}_idx"),
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap()
+        };
+        for table in ["messages_fts", "messages_unicode_fts"] {
+            assert!(segments(table) > 1, "{table}");
+        }
+        store.optimize_message_search().unwrap();
+        for table in ["messages_fts", "messages_unicode_fts"] {
+            assert_eq!(segments(table), 1, "{table}");
+        }
+        assert_eq!(store.search_sessions("needle", 10).unwrap().len(), 6);
+        assert_eq!(store.search_sessions("目标", 10).unwrap().len(), 6);
+    }
 }
 
 #[cfg(test)]
@@ -9532,7 +9797,38 @@ mod migration_failure_tests {
 
 #[cfg(test)]
 mod snippet_tests {
-    use super::make_snippet;
+    use super::{make_snippet, SearchContent, Store};
+
+    fn snippet(text: &str, needle: &str) -> String {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap();
+        let message = store.append_message(&session.id, "user", text).unwrap();
+        let rowid = store
+            .conn
+            .query_row(
+                "SELECT rowid FROM messages WHERE id=?1",
+                [message.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let content = SearchContent(
+            store
+                .conn
+                .blob_open(
+                    rusqlite::DatabaseName::Main,
+                    "messages",
+                    "content",
+                    rowid,
+                    true,
+                )
+                .unwrap(),
+        );
+        make_snippet(
+            &content,
+            &crate::fuzzy::fold_chars(needle).collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
 
     /// The snippet centres on the match even when folding changes the
     /// text's length, typed in either normal form (#789).
@@ -9540,12 +9836,12 @@ mod snippet_tests {
     fn snippets_centre_on_folded_matches() {
         let text = format!("{}İstanbul trip{}", "x".repeat(100), "y".repeat(100));
         for needle in ["i\u{307}stanbul", "istanbul"] {
-            let s = make_snippet(&text, needle);
+            let s = snippet(&text, needle);
             assert!(s.contains("İstanbul trip"), "{needle}: {s}");
             let before = s.split("İstanbul").next().unwrap().trim_start_matches('…');
             assert_eq!(before.chars().count(), 40, "{needle}: {s}");
         }
-        let s = make_snippet("a café here", "cafe\u{301}");
+        let s = snippet("a café here", "cafe\u{301}");
         assert!(s.contains("café"), "{s}");
     }
 }

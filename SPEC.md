@@ -4263,6 +4263,11 @@ run_tool = "network_policy"     # a registry Tool, or…
     text in those scripts wraps between clusters, never inside one.
   - Key releases (the Windows console, kitty's event types) are ignored;
     in the web client no key handler acts while an IME is composing.
+- **Session search scope.** When a query has no indexable words, search
+  checks only the latest 10,000 messages in non-deleted Sessions, newest
+  timestamp and then recording order first. The `search_sessions` response
+  remains an array; `search_sessions_with_scope` returns `hits` and, for
+  that fallback, `searched_latest`, even if no message matched.
 - **Unicode matching and direction.** Fuzzy pickers, `@` file mentions,
   search snippets and web search highlights match on folded text that
   keeps each character's original position: case folding never shifts a

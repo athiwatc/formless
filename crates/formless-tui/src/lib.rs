@@ -3646,10 +3646,14 @@ impl App {
                                 }
                             }
                         }
-                        Pending::SearchSessions { context, .. } => {
-                            if let Ok(v) = serde_json::from_value::<Vec<SearchHit>>(result) {
-                                self.notes.push(format!("{} search hit(s)", v.len()));
-                                self.search_hits = v;
+                        Pending::SearchSessions { mut context, .. } => {
+                            if let Ok(results) =
+                                serde_json::from_value::<formless_protocol::SearchResults>(result)
+                            {
+                                self.notes
+                                    .push(format!("{} search hit(s)", results.hits.len()));
+                                self.search_hits = results.hits;
+                                context.searched_latest = results.searched_latest;
                                 self.search_context = Some(context);
                                 self.search_idx = 0;
                                 self.open_view(View::Search);
@@ -7404,12 +7408,13 @@ impl App {
                     context: search_display::Context {
                         query: text.clone(),
                         limit: LIMIT,
+                        searched_latest: None,
                     },
                     serial: self.search_serial,
                     view: self.view,
                     session: self.current.clone(),
                 },
-                Request::SearchSessions {
+                Request::SearchSessionsWithScope {
                     query: text,
                     limit: Some(LIMIT),
                 },
@@ -30192,7 +30197,7 @@ mod tests {
         let envelope: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
         assert!(matches!(
             envelope.request,
-            Request::SearchSessions { query: text, limit: Some(50) } if text == query
+            Request::SearchSessionsWithScope { query: text, limit: Some(50) } if text == query
         ));
         envelope.id
     }
@@ -30218,14 +30223,26 @@ mod tests {
         app.inbox = Some(rx);
 
         let first = send_fixture_search(&mut app, &sent, "first query");
-        let second = send_fixture_search(&mut app, &sent, "second query");
-        branch_summary_reply(&tx, second, serde_json::json!([]));
-        branch_summary_reply(&tx, first, serde_json::json!([fixture_search_hit(93)]));
+        let second = send_fixture_search(&mut app, &sent, "??");
+        branch_summary_reply(
+            &tx,
+            second,
+            serde_json::json!({"hits":[],"searched_latest":10000}),
+        );
+        branch_summary_reply(
+            &tx,
+            first,
+            serde_json::json!({"hits":[fixture_search_hit(93)]}),
+        );
         app.drain_daemon();
         assert_eq!(app.view, View::Search);
         assert!(app.search_hits.is_empty());
         let screen = render(&mut app, 85, 18);
-        assert!(screen.contains("No hits for “second query”"), "{screen}");
+        assert!(screen.contains("No hits for “??”"), "{screen}");
+        assert!(
+            screen.contains("Searched latest 10000 messages"),
+            "{screen}"
+        );
         assert!(!screen.contains("first query"), "{screen}");
         assert!(!screen.contains("more may exist"), "{screen}");
 
@@ -30234,7 +30251,7 @@ mod tests {
             let current = send_fixture_search(&mut app, &sent, "capped fixture");
             assert_eq!(app.search_context.as_ref().unwrap().limit, 50);
             let hits: Vec<_> = (0..count).rev().map(fixture_search_hit).collect();
-            branch_summary_reply(&tx, current, serde_json::to_value(&hits).unwrap());
+            branch_summary_reply(&tx, current, serde_json::json!({"hits":hits}));
             app.drain_daemon();
             assert_eq!(app.view, View::Search);
             assert_eq!(app.search_hits, hits);
@@ -30280,7 +30297,7 @@ mod tests {
             Instant::now() - REQUEST_DEADLINE - Duration::from_secs(1),
         );
         let notes_before = app.notes.clone();
-        branch_summary_reply(&tx, requests[0], serde_json::json!([]));
+        branch_summary_reply(&tx, requests[0], serde_json::json!({"hits":[]}));
         tx.send(ServerMessage::Response {
             id: requests[1],
             ok: false,
@@ -30297,7 +30314,7 @@ mod tests {
         app.slash("rename auto");
         let suggest: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
         assert!(matches!(suggest.request, Request::SuggestSessionName { id } if id == "s1"));
-        branch_summary_reply(&tx, before_suggestion, serde_json::json!([]));
+        branch_summary_reply(&tx, before_suggestion, serde_json::json!({"hits":[]}));
         branch_summary_reply(
             &tx,
             suggest.id,
@@ -30312,7 +30329,7 @@ mod tests {
         let before_switch = send_fixture_search(&mut app, &sent, "before switch");
         app.switch_session("other".into());
         app.switch_session("s1".into());
-        branch_summary_reply(&tx, before_switch, serde_json::json!([]));
+        branch_summary_reply(&tx, before_switch, serde_json::json!({"hits":[]}));
         app.drain_daemon();
         assert_eq!(app.view, View::Chat);
         assert!(app.search_context.is_none());

@@ -816,6 +816,13 @@ pub struct SearchHit {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SearchResults {
+    pub hits: Vec<SearchHit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub searched_latest: Option<usize>,
+}
+
 /// [`Request::SecurityStatus`]'s answer as text, for the CLI and TUI.
 pub fn security_report(v: &serde_json::Value) -> String {
     let mut out = Vec::new();
@@ -2705,6 +2712,11 @@ pub enum Request {
         candidate_hash: String,
     },
     SearchSessions {
+        query: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    SearchSessionsWithScope {
         query: String,
         #[serde(default)]
         limit: Option<usize>,

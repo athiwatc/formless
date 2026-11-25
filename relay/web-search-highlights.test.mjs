@@ -10,7 +10,7 @@ const fold = source.indexOf('  function foldMap(');
 const foldEnd = source.indexOf('\n  }', fold) + 4;
 assert.ok(start >= 0 && end > start && fold >= 0 && foldEnd > fold);
 
-function renderSnippet(text, query) {
+function renderResults(hits, query, searchedLatest) {
   const h = (tag, props, ...children) => ({
     tag, props, children,
     append(...parts) { this.children.push(...parts); },
@@ -20,7 +20,12 @@ function renderSnippet(text, query) {
   const results = h('div');
   const c = vm.createContext({ h, $: () => results });
   vm.runInContext(source.slice(start, end) + source.slice(fold, foldEnd), c);
-  c.renderSearch([{ session_name: 'Fixture', seq: 1, role: 'user', snippet: text }], query);
+  c.renderSearch(hits, query, searchedLatest);
+  return results;
+}
+
+function renderSnippet(text, query) {
+  const results = renderResults([{ session_name: 'Fixture', seq: 1, role: 'user', snippet: text }], query);
   const snippet = results.children[1].children[1];
   const segments = snippet.children;
   const marks = segments.filter(part => typeof part !== 'string');
@@ -36,6 +41,12 @@ test('search marks present term prefixes in snippet order, once per term', () =>
   assert.deepEqual(renderSnippet('Apple later Apple', 'app apple'), ['Apple']);
   assert.deepEqual(renderSnippet('upstaging only', 'stag deploy'), []);
   assert.deepEqual(renderSnippet('…staging only', 'stag'), ['stag']);
+});
+
+test('empty bounded results still show the searched message limit', () => {
+  const results = renderResults([], '??', 10000);
+  assert.equal(results.children[1].children[0], 'Searched latest 10000 messages.');
+  assert.equal(renderResults([], 'hello').children.length, 1);
 });
 
 test('search retains original accent and case in NFC and decomposed snippets', () => {

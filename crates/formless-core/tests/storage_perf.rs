@@ -7,7 +7,113 @@
 use formless_core::storage::SCHEMA_VERSION;
 use formless_core::Store;
 use rusqlite::{params, Connection};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+thread_local! {
+    static SEARCH_ALLOCATED: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+struct SearchAllocator;
+
+fn record_search_allocation(bytes: usize) {
+    let _ = SEARCH_ALLOCATED.try_with(|allocated| {
+        if let Some(total) = allocated.get() {
+            allocated.set(Some(total.saturating_add(bytes)));
+        }
+    });
+}
+
+unsafe impl GlobalAlloc for SearchAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        record_search_allocation(layout.size());
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        record_search_allocation(layout.size());
+        unsafe { System.alloc_zeroed(layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        record_search_allocation(size);
+        unsafe { System.realloc(ptr, layout, size) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static SEARCH_ALLOCATOR: SearchAllocator = SearchAllocator;
+
+fn large_hit_search(messages: usize, large_hits: usize, budget: Duration) {
+    let db = temp_db("large-search");
+    let store = Store::open(&db).unwrap();
+    let session = store.create_session(None).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    if messages > large_hits {
+        conn.execute(
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<?2)
+             INSERT INTO messages(id, session_id, seq, role, content, created_at)
+             SELECT 'large-search-fixture-'||n, ?1, n, 'assistant', 'ordinary transcript', '2026' FROM seq",
+            params![session.id, messages - large_hits],
+        ).unwrap();
+    }
+    let marker = " before needle here ";
+    let body = format!("{}{marker}", "x".repeat((1024 * 1024) - marker.len()));
+    let tx = conn.unchecked_transaction().unwrap();
+    for i in 0..large_hits {
+        tx.execute(
+            "INSERT INTO messages(id, session_id, seq, role, content, created_at)
+             VALUES (?1, ?2, ?3, 'assistant', ?4, '2026')",
+            params![
+                format!("large-hit-{i}"),
+                session.id,
+                messages - large_hits + i + 1,
+                body
+            ],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    drop(body);
+    drop(conn);
+
+    let started = Instant::now();
+    SEARCH_ALLOCATED.with(|allocated| allocated.set(Some(0)));
+    let result = store.search_sessions("needle", large_hits);
+    let allocated = SEARCH_ALLOCATED.with(|allocated| allocated.replace(None).unwrap());
+    let elapsed = started.elapsed();
+    let hits = result.unwrap();
+    assert_eq!(hits.len(), large_hits);
+    assert!(hits.iter().all(|hit| hit.snippet.contains(marker)));
+    assert!(hits.iter().all(|hit| hit.snippet.chars().count() <= 102));
+    // Gross Rust heap allocation is an upper bound on peak live allocations
+    // caused by the query. The budget scales with result count, not body length.
+    assert!(
+        allocated < (64 * 1024) + large_hits * 4096,
+        "{allocated} bytes"
+    );
+    assert!(
+        elapsed < budget,
+        "search took {elapsed:?}, budget {budget:?}"
+    );
+    println!("{messages} messages, {large_hits} MiB-sized hits: {elapsed:?}, {allocated} Rust heap bytes");
+    drop(store);
+    std::fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn search_allocation_does_not_scale_with_megabyte_hits() {
+    large_hit_search(3, 3, Duration::from_secs(10));
+}
+
+#[test]
+#[ignore = "run in release mode: builds a one-million-message database"]
+fn million_message_search_fits_its_allocation_and_latency_budget() {
+    large_hit_search(1_000_000, 100, Duration::from_secs(30));
+}
 
 fn temp_db(tag: &str) -> PathBuf {
     let short = &uuid::Uuid::new_v4().to_string()[..8];
