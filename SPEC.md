@@ -472,7 +472,20 @@ without redesign.
 - **Which model answered.** When another model than the requested one
   produced an answer (a fallback, or auto routing's pick), the message is
   stored with `meta.model {name, via, requested}` and clients show "via
-  gpt-4.1-mini (fallback)" under its header.
+  gpt-4.1-mini (fallback)" under its header. `via` is `fallback` when the
+  provider used a fallback attempt, or `routing:<picked-model>` when auto
+  routing selected the intended model. The pick is captured from the
+  resolved route, not inferred from model-name equality. Tool-call and
+  pause-turn assistant messages retain the same metadata.
+  Sub-agent assistant messages retain it in their transcript; completed
+  sub-agent nodes carry optional structured `served_model` attribution
+  separately from the role/model label. `llm.complete` keeps its text/value
+  result contract and records any served-model attribution on the enclosing
+  Tool Invocation; the invocation detail displays it.
+  Session exports preserve assistant message metadata. Headless `run` prints
+  a `via <name> (<via>)` line for a served-different final answer, and its
+  JSON result includes `served_model`. `ComparisonReady` includes the served
+  model for each fork when it differs from the compared model.
 - **Gateways and Azure.** `provider.query_params` are added to every
   request, `provider.api_key_header` sends the key in that header instead
   of `Authorization: Bearer`, and `extra_headers` as before. The provider
@@ -3966,6 +3979,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   stored credential. Enter at an empty key step can reuse the stored
   credential for fetching/probing only when the endpoint matches the
   on-disk provider; it is never reused for a changed endpoint.
+- **Accessible first-time setup.** `formless setup` is a numbered, line-mode
+  alternative: choose a provider preset, enter an API key without echo, pick a
+  listed model or type its ID, and see the endpoint probe verdict. It saves the
+  provider and entered key only after a successful probe. Plain mode, `chat`,
+  and headless `run` name this command when setup is missing; their guidance
+  also names `FORMLESS_BASE_URL`, `FORMLESS_MODEL`, and `FORMLESS_API_KEY` as
+  the environment-based path for headless Runs without setup.
 - **Moving around.** Esc goes back one step at every step (effort →
   model → key → URL → provider), keeping what was typed; the header shows
   "step N of 5". Going back invalidates outstanding model-list/probe
@@ -5108,6 +5128,9 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
 - **Plain mode for screen readers.** `formless --plain` (or
   `tui.screen_reader = true`) runs a line-oriented client instead of the
   full-screen TUI: no alternate screen, redraws, spinners or box drawing.
+  When no provider is configured, it exits non-zero and points to
+  `formless setup` (or the active profile's equivalent) and the documented
+  environment variables for headless Runs.
   - Each event prints once, as a sentence, in order: the streamed answer
     after "Formless:", "Tool started: name.", "Run paused: why. Next: what
     to do.", and notes.
@@ -5451,6 +5474,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless runs` | No action: list; `show`, `cancel`, `running` | List recent Runs, inspect/cancel an exact Run, or read a live Invocation snapshot. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
 | `formless sessions` | `subagents`, `subagent`, `fork`, `compare`, `list`, `show`, `usage`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `pin`, `unpin`, `tag`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
+| `formless setup` | No arguments | Configure a first provider in line mode for screen readers; choose a preset and model, enter a hidden API key, then verify the endpoint. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `diff`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
@@ -6915,6 +6939,13 @@ unrelated history leave an otherwise identical quote valid.
 No history means prompt size only; missing prices mean no dollar range. Cache
 fractions and compaction probabilities describe comparable history, not guarantees.
 A draft already above the local compaction trigger is flagged immediately.
+
+The optional `RunForecast.routing_pick` wire field names the model selected when
+the effective forecast selector was automatically routed. It is omitted when no
+automatic route occurred, rather than serialized as `null`. This records the
+forecast's selection, not a provider attempt or a guarantee of the response's
+served model; response attribution records the model that actually served the
+response, including fallback.
 
 TUI/web composer hints debounce and discard stale results after draft, Session,
 model, attachment, persisted context, Tool or settings changes. Retry, edit and

@@ -1,8 +1,39 @@
 //! Read-only setup context. Never load credentials, apply another profile's
 //! environment overrides, start a daemon, or probe an alternate provider.
-use crate::{Config, Paths};
+use crate::{config, Config, Paths};
+use anyhow::Result;
 
-pub fn setup_command(profile: &str) -> String {
+pub fn save_verified_provider(
+    paths: &Paths,
+    cfg: &mut Config,
+    prompt_fallback: bool,
+    api_key: Option<&str>,
+) -> Result<()> {
+    if prompt_fallback {
+        cfg.provider.tool_mode = "prompt".into();
+    }
+    let had_configured_provider =
+        Config::load_file_only(paths).is_ok_and(|existing| existing.provider.is_configured());
+    if had_configured_provider {
+        cfg.save(paths)?;
+        if let Some(key) = api_key {
+            config::save_api_key(paths, key)?;
+        }
+    } else {
+        if let Some(key) = api_key {
+            config::save_api_key(paths, key)?;
+        }
+        if let Err(err) = cfg.save(paths) {
+            if api_key.is_some() {
+                config::delete_api_key(paths);
+            }
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+pub fn open_command(profile: &str) -> String {
     if profile == "default" {
         "formless".into()
     } else {
@@ -10,9 +41,14 @@ pub fn setup_command(profile: &str) -> String {
     }
 }
 
+pub fn setup_command(profile: &str) -> String {
+    format!("{} setup", open_command(profile))
+}
+
 pub fn missing_setup_message(paths: &Paths) -> String {
+    let open = open_command(&paths.profile);
     let mut message = format!(
-        "Profile '{}' is not configured; run `{}` for the wizard.",
+        "Profile '{}' is not configured; run `{}` for line-mode setup.\nFor headless use, set FORMLESS_BASE_URL, FORMLESS_MODEL, and FORMLESS_API_KEY before `{open} run`.",
         paths.profile,
         setup_command(&paths.profile)
     );
@@ -34,10 +70,20 @@ pub fn alternate_setup_hint(paths: &Paths) -> Option<String> {
         .collect();
     match others.as_slice() {
         [] => None,
-        [other] => Some(format!("Saved setup exists in profile '{}'.\nOpen it with `{}`.\nSee profiles with `formless profiles list`.", other.profile, setup_command(&other.profile))),
+        [other] => Some(format!(
+            "Saved setup exists in profile '{}'.\nOpen it with `{}`.\nSee profiles with `formless profiles list`.",
+            other.profile,
+            open_command(&other.profile)
+        )),
         _ => {
-            let choices = others.iter().map(|other| format!("  '{}': `{}`", other.profile, setup_command(&other.profile))).collect::<Vec<_>>().join("\n");
-            Some(format!("Saved setup exists in these profiles:\n{choices}\nSee profiles with `formless profiles list`."))
+            let choices = others
+                .iter()
+                .map(|other| format!("  '{}': `{}`", other.profile, open_command(&other.profile)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(format!(
+                "Saved setup exists in these profiles:\n{choices}\nSee profiles with `formless profiles list`."
+            ))
         }
     }
 }
@@ -71,7 +117,13 @@ mod tests {
         for active in [&base, &scratch] {
             let message = missing_setup_message(active);
             assert!(message.contains(&format!("Profile '{}'", active.profile)));
-            assert!(message.contains("formless --profile work"));
+            assert!(message.contains(&setup_command(&active.profile)));
+            assert!(message.contains(&format!("`{} run`", open_command(&active.profile))));
+            assert!(message.contains("FORMLESS_BASE_URL"));
+            assert!(message.contains("FORMLESS_MODEL"));
+            assert!(message.contains("FORMLESS_API_KEY"));
+            assert!(message.contains("Open it with `formless --profile work`."));
+            assert!(!message.contains("Open it with `formless --profile work setup`."));
             assert!(message.contains("formless profiles list"));
             assert!(!active.config_file().exists());
             assert!(!active.db_file().exists());

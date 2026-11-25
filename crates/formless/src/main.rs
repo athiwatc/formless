@@ -24,6 +24,7 @@ mod cli_session_org;
 mod cli_session_report;
 mod cli_session_templates;
 mod cli_session_usage;
+mod cli_setup;
 mod cli_subagents;
 mod cli_tool_detail;
 mod cli_tool_diff;
@@ -483,6 +484,9 @@ enum Cmd {
         #[command(subcommand)]
         action: SessionsAction,
     },
+    /// Accessible line-mode first-time provider setup
+    #[command(after_help = "Examples:\n  formless setup\n  formless --profile work setup")]
+    Setup,
     /// Skills: SKILL.md know-how the agent loads on demand (SPEC §7.10)
     #[command(
         after_help = "Examples:\n  formless skills list\n  formless skills show example-skill"
@@ -2613,6 +2617,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Providers { action }) => providers_cmd(paths, action),
+        Some(Cmd::Setup) => cli_setup::run(&paths),
         Some(Cmd::Prices { action }) => match action {
             PricesAction::Import {
                 provider,
@@ -4725,7 +4730,7 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
                 next: Some(if cfg.provider.oauth() {
                     "formless auth login".into()
                 } else {
-                    "formless (the wizard stores the key), or set FORMLESS_API_KEY".into()
+                    "formless setup, or set FORMLESS_API_KEY".into()
                 }),
                 fix: None,
             });
@@ -5332,6 +5337,13 @@ fn run_headless(
                                     }
                                 }
                             }
+                            summary.served_model = message
+                                .meta
+                                .as_deref()
+                                .and_then(|meta| serde_json::from_str::<Value>(meta).ok())
+                                .and_then(|meta| {
+                                    serde_json::from_value(meta["model"].clone()).ok()
+                                });
                             final_answer = Some(message.content);
                         }
                     }
@@ -5519,6 +5531,11 @@ fn run_headless(
             summary.line(&status.replace('_', " "), started.elapsed())
         );
     }
+    if !quiet && !matches!(output, RunOutput::Json | RunOutput::JsonlEvents) {
+        if let Some(served) = &summary.served_model {
+            eprintln!("via {} ({})", served.name, served.via);
+        }
+    }
     if policy.has_schema() && code != 0 {
         final_answer = None;
         validated_result = None;
@@ -5584,6 +5601,7 @@ fn run_headless(
                     final_answer.as_deref(),
                     validated_result.as_ref(),
                     run_error.as_deref(),
+                    summary.served_model.as_ref(),
                 )?
             };
             let receipt = formless_core::pipeline::write_result_file(&path, &bytes)?;
@@ -5603,6 +5621,7 @@ fn run_headless(
                 final_answer.as_deref(),
                 validated_result.as_ref(),
                 run_error.as_deref(),
+                summary.served_model.as_ref(),
             )?;
             std::io::stdout().write_all(&bytes)?;
         }
@@ -5647,6 +5666,7 @@ fn headless_preview_request(
 #[derive(Default)]
 struct RunSummary {
     usage: formless_protocol::UsageInfo,
+    served_model: Option<formless_protocol::ServedModelInfo>,
     tools_created: usize,
     tools_used: std::collections::BTreeSet<String>,
 }

@@ -305,7 +305,8 @@ pub(crate) fn estimate_store_with_window_and_pending_attachments(
             })
         },
     );
-    if ProviderCfg::is_auto_model(&model) {
+    let was_routed = ProviderCfg::is_auto_model(&model);
+    if was_routed {
         if let Some(r) = rcfg.filter(|r| !r.candidates.is_empty()) {
             let candidates: Vec<_> = r.candidates.iter().map(|m| pcfg.resolve_alias(m)).collect();
             model = st
@@ -324,6 +325,7 @@ pub(crate) fn estimate_store_with_window_and_pending_attachments(
         // resolved, including any auto-routing choice.
         model = selected.to_string();
     }
+    let routing_pick = was_routed.then(|| model.clone());
     let (window, window_source) = if let Some(window) = pcfg.model_context_tokens.get(&model) {
         (*window, "configured")
     } else if let Some(window) = cached.and_then(|f| f(name, &pcfg, &model)) {
@@ -625,6 +627,7 @@ pub(crate) fn estimate_store_with_window_and_pending_attachments(
     let mut f = RunForecast {
         fingerprint: String::new(),
         basis,
+        routing_pick,
         comparable_runs: n,
         comparables,
         steps: range(steps),
@@ -910,6 +913,45 @@ mod tests {
         );
         c.naming.enabled = false;
         c
+    }
+
+    #[test]
+    fn forecast_routing_provenance_tracks_effective_model_selector() {
+        let st = Store::open_in_memory().unwrap();
+        let mut cfg = config();
+        cfg.provider.model = "auto".into();
+        cfg.provider.routing_models = vec!["routed-model".into()];
+        let session_id = st.create_session(None).unwrap().id;
+        let explicit = estimate_store(
+            &st,
+            &cfg,
+            &ForecastInput {
+                session_id: Some(session_id.clone()),
+                options: RunOptions {
+                    model: Some("explicit-model".into()),
+                    ..Default::default()
+                },
+                draft: "task".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(explicit.basis.model, "explicit-model");
+        assert_eq!(explicit.routing_pick, None);
+
+        let automatic = estimate_store(
+            &st,
+            &cfg,
+            &ForecastInput {
+                session_id: Some(session_id),
+                model: Some("auto".into()),
+                draft: "task".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(automatic.basis.model, "routed-model");
+        assert_eq!(automatic.routing_pick.as_deref(), Some("routed-model"));
     }
 
     #[test]

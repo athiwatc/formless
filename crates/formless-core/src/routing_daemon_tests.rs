@@ -8,6 +8,8 @@ mod exact_run_tests;
 #[derive(Clone, Copy)]
 enum Mode {
     Fallback,
+    FallbackToolCallRecovery,
+    RouteSuccess,
     Neutral(u16),
     Pending,
     Held,
@@ -36,11 +38,11 @@ impl Fixture {
         let turns = Arc::new(AtomicUsize::new(0));
         let app=Router::new().route("/chat/completions",post({let models=models.clone();let posts=posts.clone();let nested=nested.clone();let release=release.clone();move|Json(body):Json<Value>|{
             let models=models.clone();let posts=posts.clone();let nested=nested.clone();let release=release.clone();let turns=turns.clone();async move {
-                posts.fetch_add(1,Ordering::SeqCst);
+                let post_index=posts.fetch_add(1,Ordering::SeqCst);
                 models.locked().push(body["model"].as_str().unwrap().to_string());
                 assert!(matches!(body["model"].as_str(),Some("requested"|"served"|"agent-model"|"tool-model")),"unexpected physical identity: {}",body["model"]);
                 if let Mode::Neutral(status)=mode {return (StatusCode::from_u16(status).unwrap(),Json(json!({"error":{"message":if status==400{"context_length_exceeded"}else{"private auth/rate/server failure"}},"usage":{"prompt_tokens":3,"completion_tokens":2,"cost":0.004}}))).into_response();}
-                if matches!(mode,Mode::Fallback)&&body["model"]=="requested"{return(StatusCode::NOT_FOUND,Json(json!({"error":{"code":"model_not_found","message":"model not found"},"usage":{"prompt_tokens":3,"completion_tokens":2,"cost":0.004}}))).into_response();}
+                if (matches!(mode,Mode::Fallback)||matches!(mode,Mode::FallbackToolCallRecovery))&&body["model"]=="requested"&&(!matches!(mode,Mode::FallbackToolCallRecovery)||post_index==0){return(StatusCode::NOT_FOUND,Json(json!({"error":{"code":"model_not_found","message":"model not found"},"usage":{"prompt_tokens":3,"completion_tokens":2,"cost":0.004}}))).into_response();}
                 if matches!(mode,Mode::Held) {
                     nested.notify_one();let Ok(permit)=release.acquire().await else{return StatusCode::SERVICE_UNAVAILABLE.into_response()};permit.forget();
                 }
@@ -49,9 +51,11 @@ impl Fixture {
                     let Ok(permit)=release.acquire().await else{return StatusCode::SERVICE_UNAVAILABLE.into_response()};permit.forget();
                     return Json(json!({"choices":[{"message":{"content":"nested result"}}],"usage":{"prompt_tokens":3,"completion_tokens":2,"cost":0.3}})).into_response();
                 }
-                let event=if matches!(mode,Mode::Pending)&&turns.fetch_add(1,Ordering::SeqCst)==0 {
+                let event=if matches!(mode,Mode::FallbackToolCallRecovery)&&body["model"]=="served"&&post_index==1 {
+                    json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"fallback-call","type":"function","function":{"name":"recovery_tool","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"cost":0.006}})
+                }else if matches!(mode,Mode::Pending)&&turns.fetch_add(1,Ordering::SeqCst)==0 {
                     json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"private-pending-call","type":"function","function":{"name":"spender","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"cost":0.1}})
-                }else{json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"cost":if matches!(mode,Mode::Fallback){0.006}else{0.1}}})};
+                }else{json!({"choices":[{"index":0,"delta":{"content":if matches!(mode,Mode::FallbackToolCallRecovery){"recovered"}else{"done"}},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"cost":if matches!(mode,Mode::Fallback){0.006}else{0.1}}})};
                 ([("content-type","text/event-stream")],format!("data: {event}\n\ndata: [DONE]\n\n")).into_response()
             }
         }}));
@@ -62,18 +66,21 @@ impl Fixture {
         let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
         let mut cfg = Config::default();
         cfg.provider.base_url = base.clone();
-        cfg.provider.model = if matches!(mode, Mode::Pending) {
-            "agent-model"
-        } else {
-            "requested"
+        cfg.provider.model = match mode {
+            Mode::Pending => "agent-model",
+            Mode::FallbackToolCallRecovery | Mode::RouteSuccess => "auto",
+            _ => "requested",
         }
         .into();
         cfg.provider.max_retries = 0;
         cfg.provider.max_backoff_secs = 0;
         cfg.provider.first_byte_timeout_secs = 0;
         cfg.provider.auto_test_models = false;
-        if matches!(mode, Mode::Fallback) {
+        if matches!(mode, Mode::Fallback | Mode::FallbackToolCallRecovery) {
             cfg.provider.fallback_models = vec!["served".into()];
+        }
+        if matches!(mode, Mode::FallbackToolCallRecovery | Mode::RouteSuccess) {
+            cfg.provider.routing_models = vec!["requested".into()];
         }
         cfg.naming.enabled = false;
         cfg.skills.auto_create = false;
@@ -167,6 +174,24 @@ impl Fixture {
         }
     }
 }
+
+#[test]
+fn assistant_turn_metadata_keeps_tool_calls_and_uses_attempt_provenance() {
+    let mut tool_meta = json!({"tool_calls": [{"id": "call-1"}]});
+    add_served_model_meta(&mut tool_meta, "requested", Some("picked"), "picked", false);
+    assert_eq!(tool_meta["tool_calls"][0]["id"], "call-1");
+    assert_eq!(tool_meta["model"]["name"], "picked");
+    assert_eq!(tool_meta["model"]["via"], "routing:picked");
+    assert_eq!(tool_meta["model"]["requested"], "requested");
+
+    let mut fallback_meta = json!({});
+    add_served_model_meta(&mut fallback_meta, "requested", None, "fallback", true);
+    assert_eq!(fallback_meta["model"]["via"], "fallback");
+
+    let mut unchanged = json!({});
+    add_served_model_meta(&mut unchanged, "requested", None, "requested", false);
+    assert!(unchanged.get("model").is_none());
+}
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop();
@@ -184,6 +209,19 @@ async fn actual_run_fallback_records_served_quality_and_all_billed_physical_spen
     let f = Fixture::new(&env, Mode::Fallback).await;
     f.send().await;
     f.idle().await;
+    let messages = f
+        .daemon()
+        .with_reader(|st| st.list_messages(&f.sid))
+        .unwrap();
+    let answer = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant" && !message.content.is_empty())
+        .unwrap();
+    let metadata: Value = serde_json::from_str(answer.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(metadata["model"]["name"], "served");
+    assert_eq!(metadata["model"]["via"], "fallback");
+    assert_eq!(metadata["model"]["requested"], "requested");
     tokio::time::timeout(Duration::from_secs(10), async {
         while Arc::strong_count(f.daemon()) != 1 {
             tokio::task::yield_now().await;
@@ -208,6 +246,91 @@ async fn actual_run_fallback_records_served_quality_and_all_billed_physical_spen
     );
     f.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_routed_fallback_tool_call_keeps_failover_metadata_through_recovery() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env, Mode::FallbackToolCallRecovery).await;
+    let migrated = f.daemon().config().unwrap();
+    assert_eq!(migrated.provider.model, "role:primary");
+    assert_eq!(migrated.roles["primary"].model, "auto");
+    let (created, ok) = f
+        .daemon()
+        .call_tool_direct_outcome(
+            &f.sid,
+            "create_tool",
+            json!({
+                "name": "recovery_tool",
+                "description": "fallback recovery fixture",
+                "input_schema": {"type": "object"},
+                "output_schema": {},
+                "implementation_js": "function run(){return {text:'tool complete'};}",
+                "capabilities": []
+            }),
+        )
+        .await;
+    assert!(ok && created.contains("created"), "{created}");
+
+    f.send().await;
+    f.idle().await;
+    assert_eq!(*f.models.locked(), ["requested", "served", "served"]);
+    let messages = f
+        .daemon()
+        .with_reader(|st| st.list_messages(&f.sid))
+        .unwrap();
+    let tool_turn = messages
+        .iter()
+        .find(|message| {
+            message.role == "assistant"
+                && message
+                    .meta
+                    .as_deref()
+                    .and_then(|meta| serde_json::from_str::<Value>(meta).ok())
+                    .is_some_and(|meta| meta["tool_calls"].is_array())
+        })
+        .unwrap();
+    let tool_meta: Value = serde_json::from_str(tool_turn.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(tool_meta["model"]["requested"], "requested");
+    assert_eq!(tool_meta["model"]["name"], "served");
+    assert_eq!(tool_meta["model"]["via"], "fallback");
+    let answer = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant" && message.content == "recovered")
+        .unwrap();
+    let answer_meta: Value = serde_json::from_str(answer.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(answer_meta["model"]["requested"], "requested");
+    assert_eq!(answer_meta["model"]["name"], "served");
+    assert_eq!(answer_meta["model"]["via"], "fallback");
+    f.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migrated_primary_role_route_success_records_selected_model() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env, Mode::RouteSuccess).await;
+    let migrated = f.daemon().config().unwrap();
+    assert_eq!(migrated.provider.model, "role:primary");
+    assert_eq!(migrated.roles["primary"].model, "auto");
+
+    f.send().await;
+    f.idle().await;
+    assert_eq!(*f.models.locked(), ["requested"]);
+    let answer = f
+        .daemon()
+        .with_reader(|st| st.list_messages(&f.sid))
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|message| message.role == "assistant" && message.content == "done")
+        .unwrap();
+    let meta: Value = serde_json::from_str(answer.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(meta["model"]["name"], "requested");
+    assert_eq!(meta["model"]["requested"], "requested");
+    assert_eq!(meta["model"]["via"], "routing:requested");
+    f.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_terminal_auth_rate_context_and_server_failures_remain_neutral_not_free() {
     let env = crate::credential_env::EnvGuard::isolated();
@@ -394,6 +517,7 @@ async fn selection_keeps_one_pass_aliases_and_admitted_role_identity_without_htt
             cfg: cfg.clone(),
             requested: "role:worker".into(),
             resolved_model: "served".into(),
+            routing_pick: None,
             effort: None,
             recovery_messages: vec![],
             resumed_from: None,

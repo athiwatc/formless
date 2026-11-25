@@ -958,6 +958,13 @@ pub struct MessageInfo {
     pub meta: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServedModelInfo {
+    pub name: String,
+    pub via: String,
+    pub requested: String,
+}
+
 #[cfg(test)]
 mod generated_message_wire_tests {
     use super::*;
@@ -971,6 +978,30 @@ mod generated_message_wire_tests {
             serde_json::to_value(message).unwrap()["generated_by"],
             "topic_kickoff"
         );
+    }
+}
+
+#[cfg(test)]
+mod comparison_model_wire_tests {
+    use super::*;
+
+    #[test]
+    fn comparison_result_adds_served_model_without_breaking_old_events() {
+        let old = serde_json::json!({
+            "model": "requested", "session_id": "s", "status": "completed",
+            "answer": "answer", "duration_ms": 1, "tokens": 2, "cost": null, "steps": 1
+        });
+        let mut result: ComparisonResult = serde_json::from_value(old).unwrap();
+        assert!(result.served_model.is_none());
+        result.served_model = Some(ServedModelInfo {
+            name: "served".into(),
+            via: "fallback".into(),
+            requested: "requested".into(),
+        });
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["served_model"]["name"], "served");
+        assert_eq!(value["served_model"]["via"], "fallback");
+        assert_eq!(value["served_model"]["requested"], "requested");
     }
 }
 
@@ -1844,6 +1875,9 @@ pub struct ForecastComparable {
 pub struct RunForecast {
     pub fingerprint: String,
     pub basis: ForecastBasis,
+    /// The model selected by automatic routing, if this request was routed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_pick: Option<String>,
     pub comparable_runs: usize,
     #[serde(default)]
     pub comparables: Vec<ForecastComparable>,
@@ -1912,6 +1946,8 @@ pub struct RunSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ComparisonResult {
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<ServedModelInfo>,
     /// The fork the Run happened in (open it to continue there).
     pub session_id: String,
     /// completed, paused or interrupted.
@@ -2292,6 +2328,9 @@ pub struct SubagentInfo {
     /// The role and model it ran on ("explorer · qwen3", or just a model).
     #[serde(default)]
     pub model: String,
+    /// Attribution for its last response when the provider used another model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<ServedModelInfo>,
     pub status: String,
     pub steps: i64,
     pub result: Option<String>,
@@ -2402,6 +2441,8 @@ pub struct ToolCallInfo {
     pub error: String,
     pub duration_ms: i64,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub served_models: Vec<ServedModelInfo>,
 }
 
 /// What the user has allowed a Tool, accumulated across approvals.
