@@ -1,6 +1,23 @@
 //! Read-only setup context. Never load credentials, apply another profile's
 //! environment overrides, start a daemon, or probe an alternate provider.
-use crate::{Config, Paths};
+use crate::{config, Config, Paths};
+use anyhow::Result;
+
+pub fn save_verified_provider(
+    paths: &Paths,
+    cfg: &mut Config,
+    prompt_fallback: bool,
+    api_key: Option<&str>,
+) -> Result<()> {
+    if prompt_fallback {
+        cfg.provider.tool_mode = "prompt".into();
+    }
+    if let Some(key) = api_key {
+        config::save_api_key(paths, key)?;
+    }
+    cfg.save(paths)?;
+    Ok(())
+}
 
 pub fn open_command(profile: &str) -> String {
     if profile == "default" {

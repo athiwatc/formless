@@ -143,13 +143,12 @@ where
             ""
         }
     )?;
-    if verdict.prompt_fallback {
-        cfg.provider.tool_mode = "prompt".into();
-    }
-    cfg.save(paths)?;
-    if let Some(key) = save_key {
-        config::save_api_key(paths, &key)?;
-    }
+    formless_core::profile_setup::save_verified_provider(
+        paths,
+        &mut cfg,
+        verdict.prompt_fallback,
+        save_key.as_deref(),
+    )?;
     let open = formless_core::profile_setup::open_command(&paths.profile);
     writeln!(
         output,
