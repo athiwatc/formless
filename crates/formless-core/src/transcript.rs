@@ -2,7 +2,7 @@
 //! into `<details>`, and a self-contained HTML page. The JSON bundle stays
 //! the re-importable format.
 
-use formless_protocol::MessageInfo;
+use formless_protocol::{MessageInfo, ServedModelInfo};
 use pulldown_cmark::{html, CodeBlockKind, Event, Options, Parser, Tag};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ const MARKDOWN_OPTIONS: Options = Options::ENABLE_TABLES.union(Options::ENABLE_S
 /// One turn of the transcript, ready to render.
 enum Part {
     User(String),
-    Assistant(String),
+    Assistant(String, Option<ServedModelInfo>),
     Note(String),
     /// A Tool call: name, arguments, and its result once it came back.
     Call(String, String, Option<CallResult>),
@@ -39,8 +39,9 @@ fn parts(msgs: &[MessageInfo], arguments: impl Fn(&str) -> String) -> Vec<Part> 
         match m.role.as_str() {
             "user" => out.push(Part::User(m.content.clone())),
             "assistant" => {
-                if !m.content.trim().is_empty() {
-                    out.push(Part::Assistant(m.content.clone()));
+                let served_model = serde_json::from_value(meta["model"].clone()).ok();
+                if !m.content.trim().is_empty() || served_model.is_some() {
+                    out.push(Part::Assistant(m.content.clone(), served_model));
                 }
                 for c in meta["tool_calls"].as_array().into_iter().flatten() {
                     let args = c["function"]["arguments"].as_str().unwrap_or_default();
@@ -167,7 +168,16 @@ pub fn markdown(name: &str, msgs: &[MessageInfo]) -> String {
         out.push('\n');
         match part {
             Part::User(t) => append_markdown_turn(&mut out, "## You\n\n", &t),
-            Part::Assistant(t) => append_markdown_turn(&mut out, "## Assistant\n\n", &t),
+            Part::Assistant(t, served) => {
+                append_markdown_turn(&mut out, "## Assistant\n\n", &t);
+                if let Some(served) = served {
+                    out.push_str(&format!(
+                        "\n*via {} ({})*\n",
+                        escape_markdown_inline(&served.name),
+                        escape_markdown_inline(&served.via)
+                    ));
+                }
+            }
             Part::Note(t) => out.push_str(&format!("> *{}*\n", t.trim().replace('\n', " "))),
             Part::Call(tool, args, result) => {
                 out.push_str(&format!(
@@ -200,6 +210,21 @@ fn escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+fn escape_markdown_inline(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for character in s.chars() {
+        if character.is_control() {
+            escaped.push(' ');
+        } else {
+            if character.is_ascii_punctuation() {
+                escaped.push('\\');
+            }
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 /// Markdown to HTML with any raw HTML in it shown as text, so a message
@@ -257,10 +282,19 @@ pub fn html(name: &str, msgs: &[MessageInfo]) -> String {
                 "<section class=\"user\"><h2>You</h2>{}</section>\n",
                 md_html(&t)
             )),
-            Part::Assistant(t) => body.push_str(&format!(
-                "<section class=\"assistant\"><h2>Assistant</h2>{}</section>\n",
-                md_html(&t)
-            )),
+            Part::Assistant(t, served) => {
+                let served = served.map_or_else(String::new, |served| {
+                    format!(
+                        "<p class=\"model\">via {} ({})</p>",
+                        escape(&served.name),
+                        escape(&served.via)
+                    )
+                });
+                body.push_str(&format!(
+                    "<section class=\"assistant\"><h2>Assistant</h2>{served}{}</section>\n",
+                    md_html(&t)
+                ));
+            }
             Part::Note(t) => body.push_str(&format!("<p class=\"note\">{}</p>\n", escape(&t))),
             Part::Call(tool, args, result) => {
                 body.push_str(&format!(
@@ -297,6 +331,7 @@ pre {{ padding: 10px 12px; overflow-x: auto; white-space: pre-wrap; overflow-wra
 details {{ border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; margin: 8px 0; }}
 summary {{ cursor: pointer; color: var(--muted); }}
 .note {{ color: var(--muted); font-style: italic; }}
+.model {{ color: var(--muted); font-size: .9em; margin: 0 0 8px; }}
 table {{ border-collapse: collapse; display: block; overflow-x: auto; }} td, th {{ border: 1px solid var(--line); padding: 4px 8px; }}
 </style></head>
 <body><h1>{title}</h1>
@@ -402,6 +437,30 @@ mod tests {
     }
 
     #[test]
+    fn markdown_model_labels_cannot_inject_links_images_or_blocks() {
+        let name = "![pixel](https://evil.example/pixel.png)\n\n[click](https://evil.example)";
+        let message = MessageInfo {
+            id: "assistant".into(),
+            session_id: "session".into(),
+            seq: 1,
+            role: "assistant".into(),
+            generated_by: None,
+            content: "answer".into(),
+            created_at: String::new(),
+            meta: Some(
+                serde_json::json!({"model":{"name":name,"via":"fallback","requested":"requested"}})
+                    .to_string(),
+            ),
+        };
+        let rendered = markdown("fixture", &[message]);
+        assert!(!rendered.contains("![pixel]"), "{rendered}");
+        assert!(!rendered.contains("[click]("), "{rendered}");
+        let html = md_html(&rendered);
+        assert!(!html.contains("<img"), "{html}");
+        assert!(!html.contains("<a href"), "{html}");
+    }
+
+    #[test]
     fn markdown_keeps_balanced_fences_and_other_blocks_unchanged() {
         for content in [
             "````rust\n```\n   `````",
@@ -490,6 +549,49 @@ mod tests {
         assert!(page.contains("<strong>3</strong>"));
         assert!(page.contains("<summary>Tool: grep</summary>"));
         assert!(!page.contains("http"), "no external resources");
+    }
+
+    #[test]
+    fn exports_show_served_model_for_assistant_turns_including_tool_calls() {
+        let meta = serde_json::json!({
+            "model": {"name": "served", "via": "fallback", "requested": "requested"},
+            "tool_calls": [{"id": "c1", "function": {"name": "grep", "arguments": "{}"}}]
+        })
+        .to_string();
+        let messages = [msg("assistant", "", Some(&meta))];
+        let markdown = markdown("fixture", &messages);
+        assert!(markdown.contains("*via served (fallback)*"), "{markdown}");
+        assert!(
+            markdown.contains("<summary>Tool: grep</summary>"),
+            "{markdown}"
+        );
+        let html = html("fixture", &messages);
+        assert!(
+            html.contains("<p class=\"model\">via served (fallback)</p>"),
+            "{html}"
+        );
+        assert!(html.contains("<summary>Tool: grep</summary>"), "{html}");
+    }
+
+    #[test]
+    fn markdown_served_model_is_not_inside_answer_blockquote() {
+        let meta = serde_json::json!({
+            "model": {"name": "served", "via": "fallback", "requested": "requested"}
+        })
+        .to_string();
+        let markdown = markdown(
+            "fixture",
+            &[msg("assistant", "> quoted answer", Some(&meta))],
+        );
+        assert!(
+            markdown.contains("> quoted answer\n\n*via served (fallback)*\n"),
+            "{markdown}"
+        );
+
+        let html = md_html(&markdown);
+        let quote_end = html.find("</blockquote>").unwrap();
+        let attribution = html.find("<em>via served (fallback)</em>").unwrap();
+        assert!(attribution > quote_end, "{html}");
     }
 
     /// Tool output is attacker-controlled: an exported page must not fetch

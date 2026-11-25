@@ -1657,7 +1657,12 @@ fn subagent_line(m: &serde_json::Value) -> String {
         ),
         None => m["content"].as_str().unwrap_or_default().replace('\n', " "),
     };
-    format!("  [{role}] {}", truncate_chars(&text, 120))
+    let served = m["meta"]["model"]["name"]
+        .as_str()
+        .zip(m["meta"]["model"]["via"].as_str())
+        .map(|(name, via)| format!(" · via {name} ({via})"))
+        .unwrap_or_default();
+    format!("  [{role}] {}{served}", truncate_chars(&text, 120))
 }
 
 /// Identifies a rendered streaming prefix without hashing all of it: the
@@ -7008,6 +7013,19 @@ impl App {
                         .iter_mut()
                         .find(|c| c.subagent.as_deref() == Some(&subagent.id))
                     {
+                        if !subagent.model.is_empty() || subagent.served_model.is_some() {
+                            let served = subagent
+                                .served_model
+                                .as_ref()
+                                .map_or_else(String::new, |served| {
+                                    format!(" · via {} ({})", served.name, served.via)
+                                });
+                            node.name = format!(
+                                "sub-agent ({}{served}): {}",
+                                subagent.model,
+                                truncate_chars(&subagent.task, 60)
+                            );
+                        }
                         node.status = if subagent.status == "completed" {
                             "ok".into()
                         } else {
@@ -15029,10 +15047,17 @@ fn wrap_rows(text: &str, width: usize) -> Vec<String> {
 /// columns side by side (stacked when the screen is narrow).
 fn compare_lines(results: &[formless_protocol::ComparisonResult], width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthStr;
+    let model_label = |r: &formless_protocol::ComparisonResult| {
+        r.served_model
+            .as_ref()
+            .filter(|served| served.name != r.model)
+            .map(|served| format!("{} → {} (via {})", r.model, served.name, served.via))
+            .unwrap_or_else(|| r.model.clone())
+    };
     let head = |r: &formless_protocol::ComparisonResult| {
         format!(
             "{} · {} · {:.1}s · {} tokens · {} steps{}",
-            r.model,
+            model_label(r),
             r.status,
             r.duration_ms as f64 / 1000.0,
             i18n::number(r.tokens),
@@ -15046,7 +15071,7 @@ fn compare_lines(results: &[formless_protocol::ComparisonResult], width: usize) 
     let col = (width.saturating_sub(3 * (n - 1)) / n).max(1);
     if col < 30 {
         for r in results {
-            out.push(format!("── {} ──", r.model));
+            out.push(format!("── {} ──", model_label(r)));
             out.extend(wrap_rows(&r.answer, width));
             out.push(String::new());
         }
@@ -15054,7 +15079,7 @@ fn compare_lines(results: &[formless_protocol::ComparisonResult], width: usize) 
         let cols: Vec<Vec<String>> = results
             .iter()
             .map(|r| {
-                let mut c = vec![format!("── {} ──", r.model)];
+                let mut c = vec![format!("── {} ──", model_label(r))];
                 c.extend(wrap_rows(&r.answer, col));
                 c
             })
@@ -16214,6 +16239,11 @@ impl App {
             lines.push("Output:".into());
             lines.extend(pretty(&c.output).lines().map(str::to_string));
         }
+        lines.extend(
+            c.served_models
+                .iter()
+                .map(|served| format!("Served model: via {} ({})", served.name, served.via)),
+        );
         if !c.error.is_empty() {
             lines.push(String::new());
             lines.push("Error:".into());
@@ -22814,8 +22844,9 @@ mod tests {
     #[test]
     fn compare_answers_sit_side_by_side_or_stack_when_narrow() {
         use formless_protocol::ComparisonResult;
-        let r = |m: &str, a: &str| ComparisonResult {
+        let r = |m: &str, a: &str, served_model| ComparisonResult {
             model: m.into(),
+            served_model,
             session_id: format!("s-{m}"),
             status: "completed".into(),
             answer: a.into(),
@@ -22824,9 +22855,20 @@ mod tests {
             cost: Some(0.0012),
             steps: 1,
         };
-        let results = vec![r("alpha", "short"), r("beta", "a longer answer here")];
+        let results = vec![
+            r(
+                "alpha",
+                "short",
+                Some(formless_protocol::ServedModelInfo {
+                    name: "alpha-fallback".into(),
+                    via: "fallback".into(),
+                    requested: "alpha".into(),
+                }),
+            ),
+            r("beta", "a longer answer here", None),
+        ];
         let wide = compare_lines(&results, 100);
-        assert!(wide[0].contains("alpha · completed · 1.5s · 42 tokens · 1 steps · $0.0012"));
+        assert!(wide[0].contains("alpha → alpha-fallback (via fallback) · completed · 1.5s · 42 tokens · 1 steps · $0.0012"));
         assert!(
             wide.iter()
                 .any(|l| l.contains("short") && l.contains("│ a longer answer here")),
@@ -22834,6 +22876,9 @@ mod tests {
         );
         let narrow = compare_lines(&results, 40);
         assert!(narrow.iter().any(|l| l == "── beta ──"));
+        assert!(narrow
+            .iter()
+            .any(|l| l == "── alpha → alpha-fallback (via fallback) ──"));
         assert!(!narrow.iter().any(|l| l.contains('│')));
     }
 
@@ -32054,6 +32099,7 @@ mod tests {
             error: error.into(),
             duration_ms: 120,
             created_at: at.into(),
+            served_models: vec![],
         };
         app.tool_detail = Some(ToolDetail {
             description_review: Default::default(),
@@ -32070,7 +32116,14 @@ mod tests {
             used_by: vec![],
             example: None,
             recent_calls: vec![
-                call("i2", "failure", "timeout after 30s", "2026-01-01T10:05:00Z"),
+                ToolCallInfo {
+                    served_models: vec![formless_protocol::ServedModelInfo {
+                        name: "actual-model".into(),
+                        via: "fallback".into(),
+                        requested: "auto".into(),
+                    }],
+                    ..call("i2", "failure", "timeout after 30s", "2026-01-01T10:05:00Z")
+                },
                 call("i1", "success", "", "2026-01-01T10:00:00Z"),
             ],
             attention: vec!["the last 3 calls failed: timeout after 30s".into()],
@@ -32086,6 +32139,10 @@ mod tests {
         assert_eq!(app.call_idx, Some(0));
         app.key(key(KeyCode::Enter));
         let pager = app.pager.take().expect("pager");
+        assert!(pager
+            .lines
+            .iter()
+            .any(|line| line == "Served model: via actual-model (fallback)"));
         assert!(pager.lines.iter().any(|l| l == "Error:"));
         assert!(pager
             .lines

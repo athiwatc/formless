@@ -517,6 +517,39 @@ fn stop_note(result: &crate::provider::ChatResult) -> Option<String> {
     }
 }
 
+fn served_model_info(
+    requested: &str,
+    routing_pick: Option<&str>,
+    served: &str,
+    used_fallback: bool,
+) -> Option<ServedModelInfo> {
+    let via = if used_fallback {
+        "fallback".to_string()
+    } else if let Some(routing_pick) = routing_pick {
+        format!("routing:{routing_pick}")
+    } else {
+        return None;
+    };
+    (!served.is_empty() && (served != requested || (!used_fallback && routing_pick.is_some())))
+        .then(|| ServedModelInfo {
+            name: served.to_string(),
+            via,
+            requested: requested.to_string(),
+        })
+}
+
+fn add_served_model_meta(
+    meta: &mut Value,
+    requested: &str,
+    routing_pick: Option<&str>,
+    served: &str,
+    used_fallback: bool,
+) {
+    if let Some(served) = served_model_info(requested, routing_pick, served, used_fallback) {
+        meta["model"] = json!(served);
+    }
+}
+
 /// What the daemon's own model calls inside [`counted`] are for, and the
 /// Session/Run they serve ("" when none).
 #[derive(Clone)]
@@ -801,6 +834,7 @@ struct RunAdmission {
     cfg: Config,
     requested: String,
     resolved_model: String,
+    routing_pick: Option<String>,
     effort: Option<String>,
     recovery_messages: Vec<MessageInfo>,
     resumed_from: Option<String>,
@@ -889,7 +923,7 @@ pub struct Daemon {
     /// Persistent evidence for configured model listings (SPEC §4.2).
     model_listing_health: StdMutex<model_listing_health::State>,
     /// Comparisons in flight: id → (origin Session, [(fork, model)]).
-    comparisons: StdMutex<HashMap<String, (String, Vec<(String, String)>)>>,
+    comparisons: StdMutex<HashMap<String, (String, Vec<(String, String, i64)>)>>,
     branch_summary_state: Arc<StdMutex<branch_summary::BranchSummaryState>>,
     hunk_reviews: StdMutex<review_daemon::ReviewState>,
     run_file_post_images: StdMutex<HashMap<(String, String), String>>,
@@ -1456,6 +1490,7 @@ impl Daemon {
                 .map(|c| pcfg.resolve_alias(c))
                 .collect();
             let provider = self.provider_named(cfg, role.provider.as_deref()).await?;
+            let mut routing_pick = None;
             let model = if role.model.is_empty() {
                 cfg.provider_cfg(role.provider.as_deref())?.model
             } else if ProviderCfg::is_auto_model(&role.model) && !role.candidates.is_empty() {
@@ -1474,6 +1509,7 @@ impl Daemon {
                     .context("no role model candidates")?;
                 choice.explanation["kind"] = json!(format!("role:{role_name}"));
                 self.note_routing(session_id, choice.explanation);
+                routing_pick = Some(choice.model.clone());
                 choice.model
             } else {
                 role.model.clone()
@@ -1486,6 +1522,7 @@ impl Daemon {
             return Ok(Target {
                 provider: provider.resolved_dispatch(&model),
                 model,
+                routing_pick,
                 effort,
                 system: role.system.clone(),
                 role: Some(role_name.to_string()),
@@ -1497,6 +1534,7 @@ impl Daemon {
                 .await?
                 .resolved_dispatch(resolved.unwrap_or(&wanted)),
             model: resolved.unwrap_or(&wanted).to_string(),
+            routing_pick: None,
             effort: session_effort,
             system: None,
             role: None,
@@ -6399,6 +6437,7 @@ impl Daemon {
             .rsplit_once(':')
             .map(|(name, _)| name)
             .unwrap_or(crate::config::DEFAULT_PROVIDER);
+        let routing_pick = forecast.routing_pick.clone();
         let mut fixed = cfg.clone();
         let requested = if forecast.basis.role.starts_with("role:") {
             let role = forecast.basis.role.trim_start_matches("role:");
@@ -6458,6 +6497,7 @@ impl Daemon {
             cfg: fixed,
             requested,
             resolved_model: forecast.basis.model.clone(),
+            routing_pick,
             effort,
             recovery_messages,
             resumed_from,
@@ -6808,10 +6848,8 @@ impl Daemon {
         let taint_scope = self.taint_scope(&session_id, &run_id);
         let mut final_status = "completed";
         loop {
-            match self
-                .run_step(&session_id, &run_id, &cancel, &cancel_flag)
-                .await
-            {
+            let step = Box::pin(self.run_step(&session_id, &run_id, &cancel, &cancel_flag));
+            match step.await {
                 Ok(()) => {
                     #[cfg(test)]
                     if let Some(hook) = self.run_final_decision_test.locked().take() {
@@ -7551,6 +7589,7 @@ impl Daemon {
         };
         if let Some(admitted) = &admitted {
             target.effort = admitted.effort.clone();
+            target.routing_pick = admitted.routing_pick.clone();
         }
         let provider = {
             let (sid, rid, subs) = (
@@ -7620,6 +7659,10 @@ impl Daemon {
             &cfg,
         )?;
         let model = self.resolve_model_named(&requested_model, &cfg, provider.name(), complex)?;
+        let routing_pick = target
+            .routing_pick
+            .as_deref()
+            .or_else(|| ProviderCfg::is_auto_model(&requested_model).then_some(model.as_str()));
         self.run_models
             .lock()
             .unwrap()
@@ -8077,6 +8120,13 @@ impl Daemon {
                 if paused_turns < 3 {
                     paused_turns += 1;
                     let mut meta = json!({"stop_reason": "pause_turn"});
+                    add_served_model_meta(
+                        &mut meta,
+                        &requested_model,
+                        routing_pick,
+                        &result.model_used,
+                        result.used_fallback,
+                    );
                     if !result.reasoning.is_empty() {
                         meta["reasoning_content"] = json!(result.reasoning);
                     }
@@ -8173,14 +8223,12 @@ impl Daemon {
                     )
                     .await?;
                 }
-                // Which model answered, when not the one asked for: a
-                // fallback, or auto routing's pick (SPEC §4.5).
-                let served = (!result.model_used.is_empty() && result.model_used != requested_model)
-                    .then(|| {
-                        let via = if result.model_used == model { "routing" } else { "fallback" };
-                        json!({"model": {"name": result.model_used, "via": via, "requested": requested_model}})
-                            .to_string()
-                    });
+                let served = served_model_info(
+                    &requested_model,
+                    routing_pick,
+                    &result.model_used,
+                    result.used_fallback,
+                );
                 // Never an empty answer for a refusal or a filter stop (#615).
                 // The placeholder is marked as such (#1104): clients show it
                 // as a note, and the model never sees it as its own words.
@@ -8200,8 +8248,8 @@ impl Daemon {
                     .or(result.truncated.then_some("max_tokens"));
                 let meta = match (stored_stop, served) {
                     (Some(stop), served) => {
-                        let mut m: Value = served
-                            .and_then(|s| serde_json::from_str(&s).ok())
+                        let mut m = served
+                            .map(|served| json!({"model": served}))
                             .unwrap_or_else(|| json!({}));
                         m["stop_reason"] = json!(stop);
                         if result.truncated || stop == "model_context_window_exceeded" {
@@ -8212,7 +8260,7 @@ impl Daemon {
                         }
                         Some(m.to_string())
                     }
-                    (None, served) => served,
+                    (None, served) => served.map(|served| json!({"model": served}).to_string()),
                 };
                 let msg = self.with_store(|st| {
                     st.append_message_meta(session_id, "assistant", &content, meta)
@@ -8253,6 +8301,13 @@ impl Daemon {
             // (thinking-mode endpoints require it echoed back; §10.6) —
             // it is never stored as the assistant's answer content.
             let mut meta = json!({"tool_calls": calls_json});
+            add_served_model_meta(
+                &mut meta,
+                &requested_model,
+                routing_pick,
+                &result.model_used,
+                result.used_fallback,
+            );
             if !result.reasoning.is_empty() {
                 meta["reasoning_content"] = json!(result.reasoning);
             }
@@ -8539,7 +8594,7 @@ impl Daemon {
         })?;
         let forks: Vec<_> = prepared
             .iter()
-            .map(|(fork, _, _, _, model)| (fork.id.clone(), model.clone()))
+            .map(|(fork, message, _, _, model)| (fork.id.clone(), model.clone(), message.seq))
             .collect();
         self.comparisons.locked().insert(
             comparison_id.clone(),
@@ -8558,18 +8613,35 @@ impl Daemon {
             }
         }
         Ok(
-            json!({"comparison_id":comparison_id,"forks":forks.iter().map(|(s,m)|json!({"session_id":s,"model":m})).collect::<Vec<_>>()}),
+            json!({"comparison_id":comparison_id,"forks":forks.iter().map(|(s,m,_)|json!({"session_id":s,"model":m})).collect::<Vec<_>>()}),
         )
     }
 
     /// A compared fork finished: once every fork has, report the answers
     /// to the Session the comparison came from.
+    fn comparison_answer(
+        messages: &[formless_protocol::MessageInfo],
+        prompt_seq: i64,
+    ) -> (String, Option<formless_protocol::ServedModelInfo>) {
+        let answer = messages.iter().rev().find(|message| {
+            message.seq > prompt_seq && message.role == "assistant" && !message.content.is_empty()
+        });
+        let served_model = answer.and_then(|message| {
+            let meta: Value = serde_json::from_str(message.meta.as_deref()?).ok()?;
+            serde_json::from_value(meta["model"].clone()).ok()
+        });
+        (
+            answer.map_or_else(String::new, |message| message.content.clone()),
+            served_model,
+        )
+    }
+
     fn comparison_run_ended(&self, session_id: &str) {
         let done = {
             let mut all = self.comparisons.locked();
             let Some(id) = all
                 .iter()
-                .find(|(_, (_, forks))| forks.iter().any(|(f, _)| f == session_id))
+                .find(|(_, (_, forks))| forks.iter().any(|(f, _, _)| f == session_id))
                 .map(|(id, _)| id.clone())
             else {
                 return;
@@ -8579,7 +8651,7 @@ impl Daemon {
                 all[&id]
                     .1
                     .iter()
-                    .any(|(f, _)| f != session_id && runs.contains_key(f))
+                    .any(|(f, _, _)| f != session_id && runs.contains_key(f))
             };
             if busy {
                 return;
@@ -8592,15 +8664,11 @@ impl Daemon {
         let cfg = self.config().unwrap_or_default();
         let results = forks
             .into_iter()
-            .map(|(fork, model)| {
-                let answer = self
+            .map(|(fork, model, prompt_seq)| {
+                let messages = self
                     .with_reader(|st| st.list_messages(&fork))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .rev()
-                    .find(|m| m.role == "assistant" && !m.content.is_empty())
-                    .map(|m| m.content)
                     .unwrap_or_default();
+                let (answer, served_model) = Self::comparison_answer(&messages, prompt_seq);
                 let run = self
                     .with_reader(|st| st.run_metrics_for(Some(&fork), 1, None))
                     .unwrap_or_default()
@@ -8612,6 +8680,7 @@ impl Daemon {
                     .and_then(|u| u.cost);
                 ComparisonResult {
                     model,
+                    served_model,
                     session_id: fork,
                     status: run
                         .as_ref()
@@ -11339,6 +11408,7 @@ impl Daemon {
                 _ = cancel.cancelled() => bail!("interrupted"),
                 result = self.target(cfg, session_id, model) => result?,
             };
+            let target_routing_pick = target.routing_pick.clone();
             let provider = target.provider;
             let session_effort = target.effort;
             let requested = target.model;
@@ -11362,6 +11432,7 @@ impl Daemon {
             let mut task_tokens = 0i64;
             // USD of those tokens; None once a step's model has no price.
             let mut task_cost = Some(0.0);
+            let mut last_served_model = None;
             let sub_defs = || -> Result<Vec<Value>> {
                 self.with_store(|st| {
                     let mut defs =
@@ -11392,6 +11463,9 @@ impl Daemon {
                 provider.name(),
                 self.routing_complex(&provider, &requested, &messages, &sub_defs()?, cfg)?,
             )?;
+            let routing_pick = target_routing_pick
+                .as_deref()
+                .or_else(|| ProviderCfg::is_auto_model(&requested).then_some(model.as_str()));
             let label = match &role {
                 Some(r) => format!("{r} · {model}"),
                 None => model.clone(),
@@ -11451,6 +11525,17 @@ impl Daemon {
                     drop(routing_call);
                     self.flush_routing()?;
                     let result=result?;
+                    let served_model = served_model_info(
+                        &requested,
+                        routing_pick,
+                        &result.model_used,
+                        result.used_fallback,
+                    );
+                    last_served_model = served_model.clone();
+                    if let (Some(inv), Some(served)) = (parent_inv, served_model.as_ref()) {
+                        let _ = self
+                            .with_store(|st| st.add_invocation_served_model(inv, served));
+                    }
                     self.record_data_origin(
                         session_id,
                         run_id,
@@ -11482,7 +11567,12 @@ impl Daemon {
                         tool_calls: result.tool_calls.iter().map(|c| c.name.clone()).collect(),
                     });
                     if result.tool_calls.is_empty() {
-                        record(&json!({"role": "assistant", "content": result.content}));
+                        let mut assistant =
+                            json!({"role": "assistant", "content": result.content.clone()});
+                        if let Some(served) = &served_model {
+                            assistant["meta"] = json!({"model": served});
+                        }
+                        record(&assistant);
                         return Ok(result.content);
                     }
                     let calls_json: Vec<Value> = result
@@ -11505,7 +11595,11 @@ impl Daemon {
                     if !result.thinking_blocks.is_empty() {
                         assistant["thinking_blocks"] = json!(result.thinking_blocks);
                     }
-                    record(&assistant);
+                    let mut stored_assistant = assistant.clone();
+                    if let Some(served) = &served_model {
+                        stored_assistant["meta"] = json!({"model": served});
+                    }
+                    record(&stored_assistant);
                     messages.push(assistant);
                     if result.truncated {
                         let mut stuck = None;
@@ -11603,7 +11697,9 @@ impl Daemon {
                     )
                 });
             }
-            if let Ok(sub) = self.with_store(|st| st.finish_subagent(&sub_id, status, &result)) {
+            if let Ok(sub) = self.with_store(|st| {
+                st.finish_subagent(&sub_id, status, &result, &label, last_served_model.as_ref())
+            }) {
                 self.broadcast(Event::SubagentFinished {
                     session_id: session_id.to_string(),
                     subagent: sub,
@@ -18342,6 +18438,7 @@ impl HostOps for NestedOps {
             .handle
             .block_on(self.daemon.target(&self.cfg, &self.session_id, model))
             .map_err(|e| e.to_string())?;
+        let target_routing_pick = target.routing_pick.clone();
         let provider = target.provider;
         let effort = target.effort;
         let requested = target.model;
@@ -18365,6 +18462,9 @@ impl HostOps for NestedOps {
             .daemon
             .resolve_model_named(&requested, &self.cfg, provider.name(), complex)
             .map_err(|e| e.to_string())?;
+        let routing_pick = target_routing_pick
+            .as_deref()
+            .or_else(|| ProviderCfg::is_auto_model(&requested).then_some(model.as_str()));
         let (routing_call, (result, terminal)) = self.block_cancellable(async {
             let call =
                 crate::routing_observation::Call::new(self.daemon.routing_recorder.call_sink());
@@ -18396,6 +18496,17 @@ impl HostOps for NestedOps {
             }
         })?;
         self.data_observed("llm", &result.model_used)?;
+        let served = served_model_info(
+            &requested,
+            routing_pick,
+            &result.model_used,
+            result.used_fallback,
+        );
+        if let (Some(inv), Some(served)) = (self.parent_inv.as_deref(), served.as_ref()) {
+            let _ = self
+                .daemon
+                .with_store(|st| st.add_invocation_served_model(inv, served));
+        }
         let usage = result.usage;
         // A Tool's own model calls count toward its Cost per Success, and
         // as its model use (§10.4).
@@ -19034,6 +19145,7 @@ pub(crate) struct Target {
     pub provider: Provider,
     /// The model to request (may still be `auto`, resolved by routing).
     pub model: String,
+    pub routing_pick: Option<String>,
     pub effort: Option<String>,
     /// A role's system prompt addendum.
     pub system: Option<String>,

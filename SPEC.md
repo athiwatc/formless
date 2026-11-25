@@ -472,7 +472,20 @@ without redesign.
 - **Which model answered.** When another model than the requested one
   produced an answer (a fallback, or auto routing's pick), the message is
   stored with `meta.model {name, via, requested}` and clients show "via
-  gpt-4.1-mini (fallback)" under its header.
+  gpt-4.1-mini (fallback)" under its header. `via` is `fallback` when the
+  provider used a fallback attempt, or `routing:<picked-model>` when auto
+  routing selected the intended model. The pick is captured from the
+  resolved route, not inferred from model-name equality. Tool-call and
+  pause-turn assistant messages retain the same metadata.
+  Sub-agent assistant messages retain it in their transcript; completed
+  sub-agent nodes carry optional structured `served_model` attribution
+  separately from the role/model label. `llm.complete` keeps its text/value
+  result contract and records any served-model attribution on the enclosing
+  Tool Invocation; the invocation detail displays it.
+  Session exports preserve assistant message metadata. Headless `run` prints
+  a `via <name> (<via>)` line for a served-different final answer, and its
+  JSON result includes `served_model`. `ComparisonReady` includes the served
+  model for each fork when it differs from the compared model.
 - **Gateways and Azure.** `provider.query_params` are added to every
   request, `provider.api_key_header` sends the key in that header instead
   of `Authorization: Bearer`, and `extra_headers` as before. The provider
@@ -6925,6 +6938,13 @@ unrelated history leave an otherwise identical quote valid.
 No history means prompt size only; missing prices mean no dollar range. Cache
 fractions and compaction probabilities describe comparable history, not guarantees.
 A draft already above the local compaction trigger is flagged immediately.
+
+The optional `RunForecast.routing_pick` wire field names the model selected when
+the effective forecast selector was automatically routed. It is omitted when no
+automatic route occurred, rather than serialized as `null`. This records the
+forecast's selection, not a provider attempt or a guarantee of the response's
+served model; response attribution records the model that actually served the
+response, including fallback.
 
 TUI/web composer hints debounce and discard stale results after draft, Session,
 model, attachment, persisted context, Tool or settings changes. Retry, edit and

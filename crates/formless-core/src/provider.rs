@@ -342,6 +342,7 @@ pub struct CompletionResult {
     pub usage: Option<Usage>,
     pub output_limited: bool,
     pub model_used: String,
+    pub used_fallback: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -970,6 +971,7 @@ pub struct ChatResult {
     pub dropped_reasoning_effort: bool,
     /// Model that actually served the request (failover routing).
     pub model_used: String,
+    pub used_fallback: bool,
     /// Output stopped at the token limit (`finish_reason: "length"`): the
     /// answer or the tool-call arguments are cut off.
     pub truncated: bool,
@@ -2738,13 +2740,15 @@ impl Provider {
         effort: Option<&str>,
     ) -> Result<(CompletionResult, Option<StructuredOutputError>)> {
         let dispatch = self.native_dispatch(messages, model);
-        let (v, served, unknown_cost) = if self.cfg.anthropic() {
+        let (v, served, used_fallback, unknown_cost) = if self.cfg.anthropic() {
             let mut body = crate::anthropic::body(model, messages, &[], false, effort, false);
-            let (resp, _, served, permit) = dispatch.post_provider(&mut body, None, true).await?;
+            let (resp, _, served, used_fallback, permit) =
+                dispatch.post_provider(&mut body, None, true).await?;
             let unknown = permit.accounting.as_ref().is_some_and(|a| a.unknown_cost);
             (
                 completed_json(resp, permit, "parse Messages response").await?,
                 served,
+                used_fallback,
                 unknown,
             )
         } else {
@@ -2815,6 +2819,7 @@ impl Provider {
                 usage,
                 output_limited,
                 model_used: served,
+                used_fallback,
             },
             terminal,
         ))
@@ -2828,12 +2833,14 @@ impl Provider {
         &self,
         body: &mut Value,
         effort: Option<&str>,
-    ) -> Result<(Value, String, bool)> {
-        let (resp, _, served, permit) = self.post_provider(body, effort, true).await?;
+    ) -> Result<(Value, String, bool, bool)> {
+        let (resp, _, served, used_fallback, permit) =
+            self.post_provider(body, effort, true).await?;
         let unknown = permit.accounting.as_ref().is_some_and(|a| a.unknown_cost);
         Ok((
             completed_json(resp, permit, "parse chat completion").await?,
             served,
+            used_fallback,
             unknown,
         ))
     }
@@ -2843,7 +2850,7 @@ impl Provider {
         body: &mut Value,
         effort: Option<&str>,
         allow_failover: bool,
-    ) -> Result<(reqwest::Response, Recovered, String, BreakerPermit)> {
+    ) -> Result<(reqwest::Response, Recovered, String, bool, BreakerPermit)> {
         self.post_provider_with_auth(body, effort, allow_failover, &mut AuthRecovery::default())
             .await
     }
@@ -2854,7 +2861,7 @@ impl Provider {
         effort: Option<&str>,
         allow_failover: bool,
         auth: &mut AuthRecovery,
-    ) -> Result<(reqwest::Response, Recovered, String, BreakerPermit)> {
+    ) -> Result<(reqwest::Response, Recovered, String, bool, BreakerPermit)> {
         let endpoint = if self.cfg.anthropic() {
             "messages"
         } else if self.cfg.responses() {
@@ -2862,9 +2869,10 @@ impl Provider {
         } else {
             "chat/completions"
         };
+        let original_model = body["model"].clone();
         let requested = self
             .cfg
-            .resolve_alias(body["model"].as_str().unwrap_or_default());
+            .resolve_alias(original_model.as_str().unwrap_or_default());
         let mut models = vec![requested.clone()];
         if allow_failover {
             for m in &self.cfg.fallback_models {
@@ -2877,7 +2885,7 @@ impl Provider {
         let mut recovered = Recovered::default();
         let mut applied_fixes = Vec::new();
         let mut last_err = String::new();
-        for model in &models {
+        for (fallback_attempt, model) in models.iter().enumerate() {
             let credential = self
                 .credential()
                 .await
@@ -2999,7 +3007,13 @@ impl Provider {
                             if let Some(hook) = &self.on_input {
                                 hook(&b);
                             }
-                            return Ok((resp, recovered, model.clone(), permit));
+                            return Ok((
+                                resp,
+                                recovered,
+                                model.clone(),
+                                fallback_attempt > 0,
+                                permit,
+                            ));
                         }
                         server_wait = retry_after(resp.headers());
                         let raw_body = resp.text().await;
@@ -3104,6 +3118,7 @@ impl Provider {
                             };
                             if let Some(fix) = fix.filter(|f| !applied_fixes.contains(f)) {
                                 *body = repaired;
+                                body["model"] = original_model.clone();
                                 if let Some(projection) = &self.native_projection {
                                     projection.repairs.locked().remember(fix, body);
                                 }
@@ -3123,6 +3138,7 @@ impl Provider {
                                 let mut repairs = projection.repairs.locked();
                                 if let Some(note) = repairs.reject_native(&b, &lower) {
                                     *body = b;
+                                    body["model"] = original_model.clone();
                                     repairs.apply(body);
                                     recovered.notes.push(note.into());
                                     continue;
@@ -3379,9 +3395,11 @@ impl Provider {
             }
             b
         };
+        let requested_model = body["model"].clone();
         let mut attempt = 0;
         let mut auth = AuthRecovery::default();
-        let (state, recovered, model_used) = 'request: loop {
+        let (state, recovered, model_used, used_fallback) = 'request: loop {
+            body["model"] = requested_model.clone();
             // All stream assembly belongs to this attempt. Every retry path
             // drops it, including flags/finish reasons from a discarded stream.
             let StreamAttempt {
@@ -3398,7 +3416,7 @@ impl Provider {
             let mut response_terminal = false;
             // Waiting for the response headers is cancellable too (a slow or
             // stuck endpoint must not outlive an interrupt).
-            let (resp, recovered, model_used, permit) = tokio::select! {
+            let (resp, recovered, model_used, used_fallback, permit) = tokio::select! {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
                 r = dispatch.post_provider_with_auth(&mut body, effort, true, &mut auth) => r?,
             };
@@ -3714,6 +3732,7 @@ impl Provider {
                 },
                 recovered,
                 model_used,
+                used_fallback,
             );
         };
         let StreamAttempt {
@@ -3757,6 +3776,7 @@ impl Provider {
             thinking_blocks: Vec::new(),
             dropped_reasoning_effort: recovered.dropped_effort,
             model_used,
+            used_fallback,
             truncated,
             usage,
             // Chat / Responses: a filter or refusal stop is said (#615);
@@ -3784,13 +3804,15 @@ impl Provider {
         let dispatch = self.native_dispatch(messages, model);
         let cache = self.cfg.cache_breakpoints(model);
         let mut body = crate::anthropic::body(model, messages, tools, cache, effort, true);
+        let requested_model = body["model"].clone();
         let mut notes = crate::anthropic::skipped_images(messages);
         let mut dropped_replayed_thinking = false;
         let mut attempt = 0;
         let mut auth = AuthRecovery::default();
         let mut shown = false;
         loop {
-            let (resp, recovered, model_used, permit) = tokio::select! {
+            body["model"] = requested_model.clone();
+            let (resp, recovered, model_used, used_fallback, permit) = tokio::select! {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
                 r = dispatch.post_provider_with_auth(&mut body, None, true, &mut auth) => r?,
             };
@@ -3947,6 +3969,7 @@ impl Provider {
                 thinking_blocks: f.thinking_blocks,
                 dropped_reasoning_effort: false,
                 model_used,
+                used_fallback,
                 truncated: f.truncated,
                 usage: Some(usage),
                 stop_reason: f.stop_reason.filter(|r| {
@@ -5352,7 +5375,7 @@ async fn probe_tool_call(p: &Provider, model: &str, tool: &Value, forced: bool) 
         if forced {
             b["tool_choice"] = json!({"type": "any"});
         }
-        let (resp, _, _, permit) = p.post_provider(&mut b, None, false).await?;
+        let (resp, _, _, _, permit) = p.post_provider(&mut b, None, false).await?;
         let v = completed_json(resp, permit, "parse probe response").await?;
         p.observe_probe_model(&v);
         return Ok(!crate::anthropic::response_parts(&v).1.is_empty());
@@ -5380,7 +5403,7 @@ async fn probe_tool_call(p: &Provider, model: &str, tool: &Value, forced: bool) 
         }
         b
     };
-    let (resp, _, _, permit) = p.post_provider(&mut body, None, false).await?;
+    let (resp, _, _, _, permit) = p.post_provider(&mut body, None, false).await?;
     let v = completed_json(resp, permit, "parse probe response").await?;
     p.observe_probe_model(&v);
     if p.cfg.responses() {

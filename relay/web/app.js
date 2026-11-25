@@ -5053,6 +5053,9 @@
     }
     return retained;
   }
+  function servedModelText(served) {
+    return served && served.name && served.via ? "via " + served.name + " (" + served.via + ")" : "";
+  }
   /** A sub-agent's transcript (GetSubagent) in a dialog. */
   async function showSubagent(id) {
     const r = await act({ type: "get_subagent", id });
@@ -5060,7 +5063,9 @@
     const a = r.subagent || {};
     const body = h("div", { class: "subagent-log" }, (r.messages || []).map((m) => {
       const text = m.tool_calls ? "calls " + m.tool_calls.map((c) => c.function.name + " " + summarizeArgs(c.function.arguments || "")).join(", ") : String(m.content || "");
-      return h("div", { class: "subagent-msg " + m.role }, h("span", { class: "muted" }, m.role), " ", text);
+      const served = m.meta && m.meta.model;
+      const via = servedModelText(served);
+      return h("div", { class: "subagent-msg " + m.role }, h("span", { class: "muted" }, m.role + (via ? " · " + via : "")), " ", text);
     }), a.result ? h("p", null, h("strong", null, "Result: "), a.result) : null);
     await ask({ title: "Sub-agent · " + truncate(a.task || "", 60), text: (a.status || "") + " · " + (a.steps || 0) + " step(s)" + (a.model ? " · " + a.model : ""), body, ok: "Close" });
   }
@@ -7183,6 +7188,13 @@
         h("ul", null, d.attention.map((r) => h("li", null, r)))));
     }
     box.append(metricsBlock(d.metrics));
+    const servedModels = (d.recent_calls || []).flatMap((call) =>
+      (call.served_models || []).map((served) => ({ call, served })));
+    if (servedModels.length) {
+      box.append(h("h3", null, "Recent invocation model use"),
+        h("ul", null, servedModels.map(({ call, served }) =>
+          h("li", null, call.status + " · " + relTime(call.created_at) + " · " + servedModelText(served)))));
+    }
     if (d.example) {
       // A real call: the latest successful Invocation, redacted (SPEC §10.4).
       const pretty = (s) => { try { return JSON.stringify(JSON.parse(s), null, 2); } catch (_) { return s; } };
@@ -9998,12 +10010,14 @@
         return;
       case "comparison_ready":
         if (here) {
+          const modelLabel = (r) => r.served_model && r.served_model.name !== r.model
+            ? r.model + " → " + r.served_model.name + " (via " + r.served_model.via + ")" : r.model;
           const cols = ev.results.map((r) => h("div", { class: "compare-col" },
-            h("h3", null, r.model),
+            h("h3", null, modelLabel(r)),
             h("div", { class: "muted" }, r.status + " · " + uiFixed(r.duration_ms / 1000, 1) + "s · " + r.tokens + " tokens · " + r.steps + " steps" + (r.cost != null ? " · " + uiMoney(r.cost, 4) : "")),
             h("div", { class: "compare-answer" }, markdown(r.answer || "(no answer)")),
             h("button", { class: "btn small", type: "button", onclick: (e) => { closeDialog(e.currentTarget.closest(".backdrop")); openSession(r.session_id); } }, "Continue in this Session")));
-          modal("Compare: " + ev.results.map((r) => r.model).join(" vs "), h("div", { class: "compare" }, cols));
+          modal("Compare: " + ev.results.map(modelLabel).join(" vs "), h("div", { class: "compare" }, cols));
         }
         break;
       case "step_pending":
@@ -10312,7 +10326,15 @@
         if (here) {
           note("sub-agent " + ev.subagent.status + " after " + ev.subagent.steps + " step(s) · click it to read its transcript", ev.subagent.status !== "completed");
           const node = S.liveTools.find((t) => t.subagent === ev.subagent.id);
-          if (node) { node.status = ev.subagent.status === "completed" ? "ok" : "failed"; node.elapsedMs = Date.now() - node.started; }
+          if (node) {
+            if (ev.subagent.model || ev.subagent.served_model) {
+              const served = ev.subagent.served_model;
+              const suffix = served ? " · via " + served.name + " (" + served.via + ")" : "";
+              node.name = "sub-agent (" + (ev.subagent.model || "") + suffix + "): " + truncate(ev.subagent.task, 60);
+            }
+            node.status = ev.subagent.status === "completed" ? "ok" : "failed";
+            node.elapsedMs = Date.now() - node.started;
+          }
           scheduleEventRender({ live: true });
         }
         break;
