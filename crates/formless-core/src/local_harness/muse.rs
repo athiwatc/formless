@@ -33,6 +33,8 @@ const MAX_FRAME: u64 = 4 * 1024 * 1024;
 const MAX_ANSWER_CHARS: usize = 500;
 const TRUST_ONCE: &str = "trust_once";
 const PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
+const NO_META_LOGIN: &str =
+    "No Meta account login detected. Run `muse login` to use a Meta account.";
 
 pub async fn probe(ctx: &ProbeContext) -> HarnessAvailability {
     let mut availability = availability(HarnessKind::Muse, Some(&ctx.executable));
@@ -62,6 +64,10 @@ pub async fn probe(ctx: &ProbeContext) -> HarnessAvailability {
     .await;
     availability.detail = match probe {
         Ok(Ok(())) => None,
+        Ok(Err(NO_META_LOGIN)) => {
+            availability.signed_in = Some(false);
+            Some(NO_META_LOGIN.into())
+        }
         Ok(Err(detail)) => Some(detail.into()),
         Err(_) => Some("probe timed out".into()),
     };
@@ -93,7 +99,7 @@ fn interpret_allowance(success: bool, stdout: &[u8], stderr: &[u8]) -> Result<()
             .split(|byte| *byte == b'\n')
             .any(|line| line.trim_ascii() == b"muse usage: not logged in: run `muse login` first")
         {
-            return Err("No Meta account login detected. Run `muse login` to use a Meta account.");
+            return Err(NO_META_LOGIN);
         }
         return Err("Muse Code did not confirm a Meta account login.");
     }

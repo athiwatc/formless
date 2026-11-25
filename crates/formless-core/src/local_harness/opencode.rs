@@ -67,6 +67,10 @@ const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(2);
 
+pub(crate) fn compatible_version(version: &str) -> bool {
+    acp::parse_version(version).is_some_and(|v| v.0 == 2 && v >= (2, 3, 2))
+}
+
 /// Queries only the CLI version: credential discovery initializes providers and
 /// performs network requests, so readiness must not run it.
 pub fn availability(
@@ -76,8 +80,7 @@ pub fn availability(
     let version = probe_version(executable, environment);
     let (installed, version, error) = match version {
         Ok(version) => {
-            let compatible =
-                acp::parse_version(&version).is_some_and(|v| v.0 == 2 && v >= (2, 3, 2));
+            let compatible = compatible_version(&version);
             (
                 true,
                 Some(version),

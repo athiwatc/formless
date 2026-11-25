@@ -38,6 +38,17 @@ fn supports_read_only(kind: HarnessKind, agent: Option<&str>) -> bool {
             .is_some_and(|spec| !spec.read_only_modes.is_empty())
 }
 
+fn supported_version(availability: &HarnessAvailability) -> bool {
+    if availability.kind == HarnessKind::Acp {
+        true
+    } else {
+        availability.version.as_deref().is_some_and(|version| {
+            availability.kind != HarnessKind::OpenCode
+                || local_harness::opencode::compatible_version(version)
+        })
+    }
+}
+
 pub(crate) fn harness_forecast(
     st: &Store,
     cfg: &Config,
@@ -133,7 +144,7 @@ pub(super) async fn ready_harness(backend: &MainChatBackend) -> Result<Option<Ma
     if !availability.installed
         || availability.signed_in == Some(false)
         || (*harness == HarnessKind::Acp && availability.signed_in != Some(true))
-        || (*harness != HarnessKind::Acp && availability.version.is_none())
+        || !supported_version(&availability)
     {
         return Err(readiness_error().into());
     }
@@ -473,6 +484,17 @@ impl Daemon {
             .await
             .into_iter()
             .filter(|harness| supports_read_only(harness.kind, harness.acp_agent.as_deref()))
+            .map(|mut harness| {
+                if !supported_version(&harness) {
+                    if let Some(version) = harness.version.take() {
+                        harness.detail = Some(format!(
+                            "Installed version {version}. {}",
+                            harness.detail.unwrap_or_default()
+                        ));
+                    }
+                }
+                harness
+            })
             .collect();
         Ok(MainChatBackends {
             selected: self.with_reader(Store::main_chat_backend)?,
