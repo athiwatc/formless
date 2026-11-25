@@ -437,6 +437,13 @@ without redesign.
   `pricing`, `context_length`, `architecture.input_modalities`,
   `supported_parameters`), else a built-in table for well-known families
   (GPT-5, o-series, GPT-4o/4.1, Claude, Gemini, reasoning-only models).
+  Built-in matches are anchored to family patterns and exclude known
+  text-only and embedding variants. Partial `supported_parameters` listings
+  add positive tool/reasoning facts only; absence does not downgrade a known
+  capability. Each model in the provider listing has a `source` (`endpoint`,
+  `builtin` or `mixed`) and an `inferred` list for guessed capability fields;
+  both pickers prefix guessed facts with `~`. `provider.model_meta` keyed by model id can
+  explicitly correct `vision`, `tools` or `efforts` after listing/table data.
   The TUI and web pickers show it on each row (`200k ctx · $3/$15 per M ·
   vision · tools`). TUI model prices retain the metadata's thousandths of
   USD per million tokens (0.075/0.007/0.001), trimming unused trailing zeros;
@@ -1219,8 +1226,9 @@ pasting paths.
   files retain credential classification. This convention does not certify their contents;
   credential ancestors, resolved secret targets, protected profile/key sources
   and configured sensitive-path rules still take precedence.
-- **Image capability guess.** With `provider.vision` unset, image-part
-  preparation and the TUI attachment warning share the model-name heuristic.
+- **Image capability guess.** `provider.model_meta[model].vision` overrides
+  `provider.vision`; if both are unset, image-part preparation and the TUI
+  attachment warning share the model-name heuristic.
   Full o1/o1-pro are included; o1-mini/preview, o3-mini, Gemma 3 270M/1B
   (including Ollama size tags), and Claude 1/2/Instant names are text-only
   exceptions before broad family matches. Explicit true/false overrides remain
@@ -1312,8 +1320,8 @@ pasting paths.
     File URLs preserve native drive/UNC paths and percent-encode reserved
     characters; dropping the URL resolves back to the same local file.
   - Attaching an image when the current model doesn't look vision-capable
-    (`provider.vision`, else a guess from the name) warns that it will get
-    a reference instead.
+    (`provider.model_meta[model].vision`, `provider.vision`, else a guess
+    from the name) warns that it will get a reference instead.
   The web composer has a 📎 file picker and accepts pasted images.
 - **`@` mentions:** typing `@` in the input opens a completion popup of
   files under the client's working directory (TUI) or the daemon's (web),
@@ -1492,9 +1500,10 @@ pasting paths.
 - **What the model sees:** each attachment adds a reference line to the
   message, `[attached: name (mime, bytes), artifact ID; read it with
   read_artifact]`. Images also go inline as `image_url` parts (8 MB max)
-  when the model accepts images: `provider.vision`, or a guess from the
-  model name when unset. This works on Chat Completions with native tool
-  calling; elsewhere the reference line alone is sent.
+  when the model accepts images: `provider.model_meta[model].vision`, then
+  `provider.vision`, or a guess from the model name when unset. This works on
+  Chat Completions with native tool calling; elsewhere the reference line
+  alone is sent.
 
 ### 5.7 What a Run changed
 
@@ -5678,9 +5687,9 @@ previous headless Run's Session.
     an unknown key exits 2.
   - `set KEY VALUE` goes through the settings API, so it's validated against
     the allow-list, audited and hot. VALUE is JSON when it parses (`5`,
-    `true`, `["a"]`), else text. The five exposed maps (`provider.prices`,
+    `true`, `["a"]`), else text. The six exposed maps (`provider.prices`,
     `provider.model_context_tokens`, `provider.model_audio_input`,
-    `provider.model_pdf_input`, `tui.colors`) use `MergeSetting` by default:
+    `provider.model_pdf_input`, `provider.model_meta`, `tui.colors`) use `MergeSetting` by default:
     supplied entries replace their whole value, null entries are removed,
     and siblings survive. `--replace` uses `SetSetting` for whole-map
     replacement; `--replace '{}'` clears. Lists remain replace-only.
@@ -6171,13 +6180,13 @@ during its snapshot fetch, deduplicated by message id.
   saving; close matches include a suggestion from this section's key set.
 - **Changing settings from a client:** clients never write the file.
   `SetSetting {key, value}` replaces one value. `MergeSetting {key, value}`
-  accepts a JSON object for one of the five exposed maps listed above,
+  accepts a JSON object for one of the six exposed maps listed above,
   merging or deleting entries atomically within the serialized edit.
   Merge is a separate request so an older daemon rejects it instead of
   ignoring an unfamiliar mode field and destructively replacing a map.
   Existing full-map editors continue to use replacement. After an exposed
   map root, the complete dotted suffix is one literal entry name (including
-  dots and slashes), e.g. `provider.model_context_tokens.vendor/qwen2.5`.
+  dots and slashes), e.g. `provider.model_meta.vendor/qwen2.5`.
   `SetSetting` with null removes that one entry; get, harness snapshot/undo,
   and setters use this same grammar. `models.set` admits entries only for
   its allow-listed model maps; prices remain `config.set`. The
@@ -6239,6 +6248,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.model` / `reasoning_effort` | — (wizard) | Daemon-wide defaults (§4.2) |
 | `provider.context_tokens` (per model) | 128000 | Compaction trigger basis (§4.2, §11) |
 | `provider.model_context_tokens` | {} | Context size per model id, overriding the endpoint-reported size and `context_tokens` for that model (§4.2, §11) |
+| `provider.model_meta` | {} | Per-model corrections to reported/inferred vision, tools and reasoning efforts (§4.2) |
 | `provider.auto_test_models` | false | Opt into background testing of untested or retry-eligible failed selected models; tests can spend paid tokens. Explicit Test actions remain available when off (§4.3) |
 | `provider.max_retries` | 5 | Bounded backoff attempts (§4.4) |
 | `provider.cache_control` | `auto` | Prompt-cache breakpoints (`cache_control`) on the system prompt and last stable message: `auto` for Claude models, `on`, `off`. Decided per model tried, so a fallback that isn't Claude gets plain content; applied to one-shot completions (compaction, `llm.complete`) too; a 400 naming `cache_control` resends once without them (§4.2) |
@@ -6260,7 +6270,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.routing_complex_chars` | 20000 | Character-equivalent threshold (÷4 tokens) for calibrated prompt complexity |
 | `provider.routing_window_days` | 30 | Recent event window used by call and role auto-routing; positive days (§4.6) |
 | `provider.routing_min_samples` / `provider.routing_quality_bar` | 5 / 0.8 | Main auto-model quality gate before USD-per-success ranking; role thresholds remain separate (§4.6) |
-| `provider.vision` | (by model name) | Send attached images as image parts (§5.6) |
+| `provider.vision` | (by model name) | Default vision setting when no `provider.model_meta[model].vision` override exists (§5.6) |
 | `provider.audio_input` / `provider.pdf_input` | known endpoint/model only | Permit native audio/PDF attachments (§5.6); unknown adapters/models retain references. API-style gates still apply. |
 | `provider.model_audio_input` / `provider.model_pdf_input` | {} | Boolean overrides by resolved model ID, before provider defaults. An explicit audio override asserts Chat WAV/MP3 support; Gemini's inferred default is WAV only. |
 | `provider.image_max_px` | 1568 | Longest side, in pixels, of an attached image sent to a vision model; bigger ones are scaled down once per Session and the encoded image kept for later steps (0: never scale). An image that can't be sent (gone, unreadable, over 8 MB) leaves a marker for the model and a note for the user (§4.2) |

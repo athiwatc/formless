@@ -4000,10 +4000,6 @@ impl Daemon {
                     .into_iter()
                     .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|m| (m.to_string(), v)))
                     .collect();
-                for m in &models {
-                    meta.entry(m.clone())
-                        .or_insert_with(|| crate::provider::known_model_meta(m));
-                }
                 let roles: Vec<_> = cfg
                     .roles
                     .iter()
@@ -4015,6 +4011,23 @@ impl Daemon {
                     .collect();
                 let sessions = self.with_reader(|st| st.list_sessions())?;
                 let recent = recent_session_models(&sessions);
+                for model in models
+                    .iter()
+                    .chain(&recent)
+                    .chain(cfg.provider.aliases.keys())
+                    .chain(cfg.provider.model_meta.keys())
+                {
+                    let resolved = cfg.provider.resolve_alias(model);
+                    let mut model_meta = meta
+                        .get(&resolved)
+                        .or_else(|| meta.get(model))
+                        .cloned()
+                        .unwrap_or_else(|| crate::provider::known_model_meta(&resolved));
+                    if let Some(override_cfg) = cfg.provider.model_meta.get(&resolved) {
+                        crate::provider::apply_model_meta_override(&mut model_meta, override_cfg);
+                    }
+                    meta.insert(model.clone(), model_meta);
+                }
                 Ok(json!({
                     "models": models,
                     "meta": meta,

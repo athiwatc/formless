@@ -282,6 +282,14 @@ pub fn documented_shape() -> Config {
     p.aliases.insert(s("*"), s("m"));
     p.query_params.insert(s("*"), s("1"));
     p.model_context_tokens.insert(s("*"), 8192);
+    p.model_meta.insert(
+        s("*"),
+        ModelMetaCfg {
+            vision: Some(true),
+            tools: Some(true),
+            efforts: Some(vec![s("low")]),
+        },
+    );
     p.fallback_models.push(s("m"));
     p.routing_models.push(s("m"));
     p.routing_fast_models.push(s("m"));
@@ -702,6 +710,15 @@ pub struct ModelPrice {
     pub retrieved_at: Option<String>,
 }
 
+/// Explicit per-model corrections for capability metadata.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ModelMetaCfg {
+    pub vision: Option<bool>,
+    pub tools: Option<bool>,
+    pub efforts: Option<Vec<String>>,
+}
+
 impl ModelPrice {
     /// USD for one request. `cached` and `cache_write` are parts of
     /// `prompt` (the provider layer normalises both reporting styles), so
@@ -791,6 +808,7 @@ pub const HARNESS_MODEL_KEYS: &[&str] = &[
     "provider.reasoning_effort",
     "provider.context_tokens",
     "provider.model_context_tokens",
+    "provider.model_meta",
     "provider.fallback_models",
     "provider.routing_models",
     "provider.routing_fast_models",
@@ -802,6 +820,7 @@ pub const HARNESS_MODEL_KEYS: &[&str] = &[
 pub const SETTING_MAPS: &[&str] = &[
     "provider.prices",
     "provider.model_context_tokens",
+    "provider.model_meta",
     "provider.model_audio_input",
     "provider.model_pdf_input",
     "tui.colors",
@@ -938,6 +957,7 @@ pub const SETTABLE: &[&str] = &[
     "provider.reasoning_effort",
     "provider.context_tokens",
     "provider.model_context_tokens",
+    "provider.model_meta",
     "provider.auto_test_models",
     "provider.max_retries",
     "provider.fallback_models",
@@ -1282,6 +1302,9 @@ pub struct ProviderCfg {
     pub reasoning_effort: Option<String>,
     pub context_tokens: u32,
     pub model_context_tokens: HashMap<String, u32>,
+    /// Per-model corrections to endpoint- and family-derived metadata.
+    #[serde(default)]
+    pub model_meta: Box<HashMap<String, ModelMetaCfg>>,
     pub max_retries: usize,
     /// "chat" (Chat Completions, default) or "responses" (Responses API).
     #[serde(default = "default_api_style")]
@@ -1436,6 +1459,7 @@ impl Default for ProviderCfg {
             reasoning_effort: None,
             context_tokens: 128_000,
             model_context_tokens: HashMap::new(),
+            model_meta: Box::new(HashMap::new()),
             max_retries: 5,
             api_style: default_api_style(),
             tool_mode: default_tool_mode(),
