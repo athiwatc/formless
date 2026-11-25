@@ -84,8 +84,7 @@ sandbox; the isolated worktree or directory is the boundary.
 
 Build from source with Rust stable, Cargo, and a C compiler. On Linux, also
 install `pkg-config` and the D-Bus development headers. See the
-[build requirements](https://github.com/athiwatc/formless/blob/main/CONTRIBUTING.md#local-checks)
-for details.
+[build requirements](docs/usage.md#requirements) for details.
 
 Install with `cargo install --git https://github.com/athiwatc/formless --locked formless-bin`,
 then run `formless` to start the daemon and open the setup wizard.
