@@ -310,7 +310,11 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
                     .into(),
                 ]);
             } else {
-                args.extend(["-c".into(), "mcp_servers={}".into()]);
+                args.extend([
+                    "--skip-git-repo-check".into(),
+                    "-c".into(),
+                    "mcp_servers={}".into(),
+                ]);
             }
             if let Some(model) = &request.model {
                 args.extend(["--model".into(), model.into()]);
