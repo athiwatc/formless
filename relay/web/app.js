@@ -203,6 +203,7 @@
     relayModule: null,
     relayMemory: null, // shared across reconnects; old async consumers stay charged
     relayLink: null,
+    relayActivityAt: null,
     relayLocalProof: false,
     relayRoomReady: false,
     relayReady: false,
@@ -713,7 +714,7 @@
 
   // ------------------------------------------------------------ transport
   /** Request with a response (rejects on daemon error or timeout). */
-  function request(req, timeoutMs) {
+  function request(req, timeoutMs, extendOnRelayActivity = false) {
     return new Promise((resolve, reject) => {
       if (!S.ws || S.ws.readyState !== 1) return reject(new Error("not connected to the relay"));
       if (!S.channel || (!S.local && !S.relayReady)) return reject(new Error("still connecting to the daemon"));
@@ -729,10 +730,21 @@
           lease = S.relayMemory.reserve(12 * bytes + 1024 * 1024 + 4 * S.relayModule.LIMITS.windowFrames * S.relayModule.LIMITS.wire + 4096);
         }
       } catch (error) { return reject(error); }
-      const timer = setTimeout(() => {
+      const timeout = timeoutMs || 30000;
+      const now = () => typeof performance !== "undefined" ? performance.now() : Date.now();
+      const startedAt = now();
+      let timer;
+      const onTimeout = () => {
+        const lastActivityAt = S.relayActivityAt ?? startedAt;
+        const remaining = timeout - (now() - lastActivityAt);
+        if (extendOnRelayActivity && remaining > 0) {
+          timer = setTimeout(onTimeout, Math.max(1, Math.ceil(remaining)));
+          return;
+        }
         S.pending.delete(id);
         reject(new Error("the daemon did not answer (is it online?)"));
-      }, timeoutMs || 30000);
+      };
+      timer = setTimeout(onTimeout, timeout);
       S.pending.set(id, {
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject: (e) => { clearTimeout(timer); reject(e); },
@@ -1088,7 +1100,8 @@
     return caps.map((c) => h("span", { class: "tag" + (isBroad(c) ? " broad" : ""), title: isBroad(c) ? "broad access: " + broadWhy(c) : null }, c));
   }
   function download(name, value) {
-    downloadBlob(name, new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
+    const serialized = JSON.stringify(value, null, 2);
+    downloadBlob(name, new Blob([serialized], { type: "application/json" }));
   }
   function downloadBlob(name, blob) {
     const a = h("a", { href: URL.createObjectURL(blob), download: name });
@@ -1486,7 +1499,7 @@
     navigator.serviceWorker.addEventListener("message", handleServiceWorkerMessage);
   }
   window.addEventListener("offline", () => renderAll());
-  window.addEventListener("online", () => { renderAll(); if (S.reconnect) retryNow(); });
+  window.addEventListener("online", () => { renderAll(); if (S.reconnect) retryNow(); else void resumeRelayAfterReturn(); });
 
   function renderView() {
     if (S.view === "tools") renderTools();
@@ -1503,6 +1516,7 @@
       cancelEventRender();
     }
     S.view = view;
+    renderWakeLock();
     prefs.set("view", view);
     if (view === "tools") { refreshTools(); refreshModules(); }
     if (view === "metrics") { refreshTools(); refreshModelStats(); refreshForecastMetrics(); }
@@ -4396,12 +4410,13 @@
   function modelDetail(m, t) {
     const parts = [];
     m = m || {};
+    const inferred = (field) => Array.isArray(m.inferred) && m.inferred.includes(field);
     const context = modelContextLabel(m.context);
     if (context !== null) parts.push(context);
     if (m.input_price != null && m.output_price != null) parts.push(uiMoney(m.input_price, null) + "/" + uiMoney(m.output_price, null) + " per M");
-    if (m.vision) parts.push("vision");
-    if (m.tools === true) parts.push("tools");
-    if (m.tools === false) parts.push("no tools");
+    if (typeof m.vision === "boolean") parts.push((inferred("vision") ? "~" : "") + (m.vision ? "vision" : "no vision"));
+    if (typeof m.tools === "boolean") parts.push((inferred("tools") ? "~" : "") + (m.tools ? "tools" : "no tools"));
+    if (inferred("efforts")) parts.push(Array.isArray(m.efforts) && m.efforts.length === 0 ? "~no effort effect" : "~effort choices");
     if (t) parts.push(t.ok ? "✓ tested" : t.transient === true ? "✗ temporary test failure (use Test to retry)" : "✗ test failed");
     return parts.join(" · ");
   }
@@ -4429,13 +4444,16 @@
       role: "combobox", "aria-autocomplete": "list", "aria-controls": list.id, "aria-expanded": "false" });
     const effort = h("select", { "aria-label": "Reasoning effort" },
       efforts.map((e) => h("option", { value: e }, e || "default (provider)")));
-    effort.value = (session && session.reasoning_effort) || "";
+    let preferredEffort = (session && session.reasoning_effort) || "";
+    effort.value = preferredEffort;
+    effort.onchange = () => { preferredEffort = effort.value; };
     const status = h("span", { class: "muted" }, "loading models…");
     const cancel = h("button", { class: "btn small", type: "button" }, "Cancel");
     const asDefault = h("button", { class: "btn small", type: "button", title: "Ctrl/⌘+Enter" }, "Set as default");
     const apply = h("button", { class: "btn small primary", type: "button", title: "Enter" }, selectionOnly ? "Retry" : "Use in this Session");
     const test = h("button", { class: "btn small", type: "button", title: "Latency, streaming, reasoning and tool calls" }, "Test");
     let meta = {}, tests = {};
+    let preferredEffortModel = model;
     const title = selectionOnly ? "Retry with a model" : "Model";
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": title },
       h("div", { class: "modal picker" },
@@ -4482,11 +4500,22 @@
         input.removeAttribute("aria-activedescendant");
       }
       // Only the efforts the highlighted model accepts (SPEC §4.2).
-      const accepted = (meta[choice()] || {}).efforts;
-      const offer = Array.isArray(accepted) ? [""].concat(["minimal", "low", "medium", "high"].filter((e) => accepted.includes(e))) : efforts;
-      const was = effort.value;
+      const selectedModel = choice();
+      if (selectedModel && selectedModel !== preferredEffortModel) {
+        preferredEffort = "";
+        preferredEffortModel = selectedModel;
+        effort.value = "";
+      }
+      const accepted = (meta[selectedModel] || {}).efforts;
+      const offer = Array.isArray(accepted)
+        ? [""].concat([...new Set(accepted.filter((e) => typeof e === "string" && e !== ""))])
+        : efforts.slice();
+      const was = effort.value || preferredEffort;
+      if (!Array.isArray(accepted) && selectedModel === model && was && !offer.includes(was)) offer.push(was);
       effort.replaceChildren(...offer.map((e) => h("option", { value: e }, e || "default (provider)")));
       effort.value = offer.includes(was) ? was : "";
+      if (Array.isArray(accepted) && !offer.includes(was)) preferredEffort = "";
+      else if (effort.value) preferredEffort = effort.value;
       effort.disabled = offer.length <= 1;
       effort.title = offer.length <= 1 ? "Effort has no effect for this model" : "";
       if (!items.length) return;
@@ -5028,6 +5057,9 @@
     }
     return retained;
   }
+  function servedModelText(served) {
+    return served && served.name && served.via ? "via " + served.name + " (" + served.via + ")" : "";
+  }
   /** A sub-agent's transcript (GetSubagent) in a dialog. */
   async function showSubagent(id) {
     const r = await act({ type: "get_subagent", id });
@@ -5035,7 +5067,9 @@
     const a = r.subagent || {};
     const body = h("div", { class: "subagent-log" }, (r.messages || []).map((m) => {
       const text = m.tool_calls ? "calls " + m.tool_calls.map((c) => c.function.name + " " + summarizeArgs(c.function.arguments || "")).join(", ") : String(m.content || "");
-      return h("div", { class: "subagent-msg " + m.role }, h("span", { class: "muted" }, m.role), " ", text);
+      const served = m.meta && m.meta.model;
+      const via = servedModelText(served);
+      return h("div", { class: "subagent-msg " + m.role }, h("span", { class: "muted" }, m.role + (via ? " · " + via : "")), " ", text);
     }), a.result ? h("p", null, h("strong", null, "Result: "), a.result) : null);
     await ask({ title: "Sub-agent · " + truncate(a.task || "", 60), text: (a.status || "") + " · " + (a.steps || 0) + " step(s)" + (a.model ? " · " + a.model : ""), body, ok: "Close" });
   }
@@ -5716,6 +5750,7 @@
     note(result.abandoned ? "This run has ended; it cannot be resumed." : "There is no paused run to abandon.");
   }
   function renderRunBanner() {
+    renderWakeLock();
     const box = $("run-banner");
     const u = S.unfinished;
     const resumable = u && ["paused", "interrupted"].includes(u.status);
@@ -5737,6 +5772,59 @@
       h("button", { class: "btn small", type: "button", onclick: () => abandonRun() }, tr("Abandon")));
   }
 
+  let wakeLockEnabled = false;
+  let wakeLockPending = null;
+  let screenWakeLock = null;
+  function releaseScreenWakeLock() {
+    wakeLockPending = null;
+    const lock = screenWakeLock;
+    screenWakeLock = null;
+    if (lock) {
+      try { Promise.resolve(lock.release()).catch(() => {}); } catch (_) {}
+    }
+  }
+  async function acquireScreenWakeLock() {
+    if (screenWakeLock || wakeLockPending) return;
+    const pending = wakeLockPending = {};
+    try {
+      const lock = await navigator.wakeLock.request("screen");
+      if (wakeLockPending !== pending || !wakeLockEnabled || document.hidden || S.view !== "chat" || !isRunning()) {
+        await lock.release();
+        return;
+      }
+      screenWakeLock = lock;
+      lock.addEventListener("release", () => {
+        if (screenWakeLock !== lock) return;
+        screenWakeLock = null;
+        if (wakeLockEnabled && !document.hidden && S.view === "chat" && isRunning()) void acquireScreenWakeLock();
+      }, { once: true });
+    } catch (error) {
+      if (wakeLockPending === pending) {
+        wakeLockEnabled = false;
+        note("Could not keep the screen awake: " + error.message, true);
+        renderWakeLock();
+      }
+    } finally {
+      if (wakeLockPending === pending) wakeLockPending = null;
+    }
+  }
+  function renderWakeLock() {
+    const button = $("keep-awake");
+    const supported = typeof navigator.wakeLock?.request === "function";
+    const watching = S.view === "chat" && !!S.current && isRunning();
+    button.hidden = !supported || !watching;
+    if (!watching) wakeLockEnabled = false;
+    button.setAttribute("aria-pressed", String(wakeLockEnabled));
+    button.textContent = wakeLockEnabled ? "Screen awake" : "Keep awake";
+    if (!supported || !wakeLockEnabled || !watching || document.hidden) releaseScreenWakeLock();
+    else void acquireScreenWakeLock();
+  }
+  $("keep-awake").onclick = () => {
+    if (S.view !== "chat" || !S.current || !isRunning()) return;
+    wakeLockEnabled = !wakeLockEnabled;
+    renderWakeLock();
+  };
+
   /** Step mode (SPEC §5.9): the call waiting for a decision. */
   function renderStep() {
     const box = $("step");
@@ -5744,18 +5832,26 @@
     box.classList.toggle("hidden", !st);
     if (!st) return box.replaceChildren();
     const decide = (action, args) => act({ type: "step_decision", step_id: st.step_id, action, arguments: args || null });
+    const canEdit = st.argumentsComplete !== false;
+    const editReason = tr("Full arguments are unavailable; this preview cannot be edited.");
     let pretty = st.arguments;
     try { pretty = JSON.stringify(JSON.parse(st.arguments), null, 2); } catch (_) {}
-    box.replaceChildren(
+    const content = [
       h("span", { class: "banner-text" }, "⏸ Step mode · about to call ", h("strong", null, st.tool_name), " (" + (st.index + 1) + " of " + st.count + ")",
         h("details", null, h("summary", null, "arguments"), h("pre", { class: "diff" }, pretty))),
       h("button", { class: "btn small primary", type: "button", onclick: () => decide("continue") }, tr("Run")),
-      h("button", { class: "btn small", type: "button", onclick: async () => {
+    ];
+    const edit = { class: "btn small", type: "button", onclick: async () => {
         const v = await ask({ title: "Edit the arguments for " + st.tool_name, inputKind: "machine", text: "JSON object", input: true, value: pretty });
         if (v != null) decide("edit", v);
-      } }, tr("Edit")),
+      } };
+    if (!canEdit) Object.assign(edit, { disabled: true, title: editReason });
+    content.push(h("button", edit, tr("Edit")));
+    if (!canEdit) content.push(h("span", { class: "muted step-edit-reason", role: "note" }, editReason));
+    content.push(
       h("button", { class: "btn small", type: "button", onclick: () => decide("skip") }, tr("Skip")),
       h("button", { class: "btn small", type: "button", onclick: () => { S.stepMode = false; decide("all"); } }, tr("Run the rest")));
+    box.replaceChildren(...content);
   }
 
   /** The agent's checklist (`update_plan`, SPEC §5.8), above the composer. */
@@ -6183,7 +6279,18 @@
       S.approvalHelpSeen = true;
     }
   }
+  function syncAppBadge() {
+    if (typeof navigator === "undefined") return;
+    const count = (S.approvals || []).length;
+    let result;
+    try {
+      if (count && typeof navigator.setAppBadge === "function") result = navigator.setAppBadge(count);
+      else if (!count && typeof navigator.clearAppBadge === "function") result = navigator.clearAppBadge();
+    } catch (_) { return; }
+    if (result && typeof result.catch === "function") result.catch(() => {});
+  }
   function renderApproval() {
+    syncAppBadge();
     const req = S.approvals[0];
     if (!req) S.approvalLater = false;
     const alert = $("modal-confirm");
@@ -7085,6 +7192,13 @@
         h("ul", null, d.attention.map((r) => h("li", null, r)))));
     }
     box.append(metricsBlock(d.metrics));
+    const servedModels = (d.recent_calls || []).flatMap((call) =>
+      (call.served_models || []).map((served) => ({ call, served })));
+    if (servedModels.length) {
+      box.append(h("h3", null, "Recent invocation model use"),
+        h("ul", null, servedModels.map(({ call, served }) =>
+          h("li", null, call.status + " · " + relTime(call.created_at) + " · " + servedModelText(served)))));
+    }
     if (d.example) {
       // A real call: the latest successful Invocation, redacted (SPEC §10.4).
       const pretty = (s) => { try { return JSON.stringify(JSON.parse(s), null, 2); } catch (_) { return s; } };
@@ -8617,6 +8731,7 @@
     S.activity = null;
     clearLiveText();
     S.liveTools = []; S.liveRun = null;
+    renderWakeLock();
     renderApproval();
   }
   function restoreSessionRunState(id, result, events) {
@@ -8699,6 +8814,8 @@
     if (S.view === "chat") renderHistory();
   }
   async function openSession(id, stay) {
+    const sameSession = S.current === id;
+    const editingMessageId = sameSession ? S.editMessageId : null;
     if (S.current && !S.editMessageId) saveDraft(S.current, $("input").value);
     S.topicFocus = null;
     if (S.current !== id) invalidateBranchSummary();
@@ -8712,8 +8829,10 @@
     S.sessionLoad = { id, status: "pending" };
     const snapshot = S.sessionSnapshot = { events: [] };
     S.messages = [];
-    clearLiveText();
-    S.liveTools = []; S.liveRun = null;
+    if (!sameSession) {
+      clearLiveText();
+      S.liveTools = []; S.liveRun = null;
+    }
     renderHistory();
     S.runTools = null;
     renderRunTools();
@@ -8732,7 +8851,7 @@
     const draft = Object.prototype.hasOwnProperty.call(attachmentDrafts, draftKey) ? attachmentDrafts[draftKey] : loadDraft(S.storageScope, id);
     S.drafts[id] = draft;
     delete attachmentDrafts[draftKey];
-    $("input").value = draft;
+    if (!editingMessageId) $("input").value = draft;
     saveDraft(id, draft);
     autosize();
     void refreshAttachmentInventory(id);
@@ -8747,10 +8866,10 @@
         renderStatus();
       }).catch(() => {});
     prefs.set(sessionStorageKey(S.storageScope), id);
-    S.editMessageId = null;
+    S.editMessageId = editingMessageId || null;
     S.queued = []; renderQueue();
     S.plan = []; S.planState = null; renderPlan();
-    S.step = null; renderStep();
+    if (!sameSession) { S.step = null; renderStep(); }
     S.recap = null; S.recapRunId = null;
     const r = await act({ type: "get_session", id });
     if (seq !== sessionSeq || S.current !== id) return;
@@ -8773,6 +8892,26 @@
       }
       renderPlan();
       S.stepMode = !!r.step_mode;
+      if (r.pending_steps && Array.isArray(r.pending_steps.prompts)) {
+        const prompt = r.pending_steps.prompts[0];
+        const preview = prompt && typeof prompt.arguments_preview === "string" ? prompt.arguments_preview : "";
+        const sameStep = prompt && S.step && S.step.session_id === prompt.session_id && S.step.run_id === prompt.run_id &&
+          S.step.step_id === prompt.step_id && typeof S.step.arguments === "string" && S.step.argumentsComplete !== false;
+        const previewComplete = prompt && Number.isSafeInteger(prompt.arguments_bytes) &&
+          new TextEncoder().encode(preview).length === prompt.arguments_bytes;
+        let step = prompt ? {
+          ...prompt,
+          arguments: sameStep ? S.step.arguments : preview,
+          argumentsComplete: !!sameStep || !!previewComplete,
+        } : null;
+        for (const ev of snapshot.events) {
+          if (ev.session_id !== id) continue;
+          if (ev.type === "step_pending") step = ev;
+          else if (ev.type === "step_resolved" && step && step.step_id === ev.step_id) step = null;
+        }
+        S.step = step;
+        renderStep();
+      }
       const i = S.sessions.findIndex((s) => s.id === id);
       if (i >= 0 && r.session) S.sessions[i] = r.session;
     }
@@ -9766,7 +9905,11 @@
   }
   document.addEventListener("visibilitychange", () => {
     syncRunningExposure();
-    if (!document.hidden) { unseen = 0; document.title = baseTitle; }
+    renderWakeLock();
+    if (!document.hidden) {
+      unseen = 0; document.title = baseTitle;
+      void resumeRelayAfterReturn();
+    }
   });
   function sessionName(id) {
     const s = S.sessions.find((x) => x.id === id);
@@ -9826,7 +9969,7 @@
       forecastRevision++;
       scheduleForecast();
     }
-    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "run_recap", "plan_updated", "approval_requested", "approval_answered", "approval_closed", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed", "harness_permission_requested", "harness_permission_closed"].includes(ev.type)) {
+    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "run_recap", "plan_updated", "step_pending", "step_resolved", "approval_requested", "approval_answered", "approval_closed", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed", "harness_permission_requested", "harness_permission_closed"].includes(ev.type)) {
       S.sessionSnapshot.events.push(ev);
     }
     notifyFor(ev);
@@ -9882,12 +10025,14 @@
         return;
       case "comparison_ready":
         if (here) {
+          const modelLabel = (r) => r.served_model && r.served_model.name !== r.model
+            ? r.model + " → " + r.served_model.name + " (via " + r.served_model.via + ")" : r.model;
           const cols = ev.results.map((r) => h("div", { class: "compare-col" },
-            h("h3", null, r.model),
+            h("h3", null, modelLabel(r)),
             h("div", { class: "muted" }, r.status + " · " + uiFixed(r.duration_ms / 1000, 1) + "s · " + r.tokens + " tokens · " + r.steps + " steps" + (r.cost != null ? " · " + uiMoney(r.cost, 4) : "")),
             h("div", { class: "compare-answer" }, markdown(r.answer || "(no answer)")),
             h("button", { class: "btn small", type: "button", onclick: (e) => { closeDialog(e.currentTarget.closest(".backdrop")); openSession(r.session_id); } }, "Continue in this Session")));
-          modal("Compare: " + ev.results.map((r) => r.model).join(" vs "), h("div", { class: "compare" }, cols));
+          modal("Compare: " + ev.results.map(modelLabel).join(" vs "), h("div", { class: "compare" }, cols));
         }
         break;
       case "step_pending":
@@ -10196,7 +10341,15 @@
         if (here) {
           note("sub-agent " + ev.subagent.status + " after " + ev.subagent.steps + " step(s) · click it to read its transcript", ev.subagent.status !== "completed");
           const node = S.liveTools.find((t) => t.subagent === ev.subagent.id);
-          if (node) { node.status = ev.subagent.status === "completed" ? "ok" : "failed"; node.elapsedMs = Date.now() - node.started; }
+          if (node) {
+            if (ev.subagent.model || ev.subagent.served_model) {
+              const served = ev.subagent.served_model;
+              const suffix = served ? " · via " + served.name + " (" + served.via + ")" : "";
+              node.name = "sub-agent (" + (ev.subagent.model || "") + suffix + "): " + truncate(ev.subagent.task, 60);
+            }
+            node.status = ev.subagent.status === "completed" ? "ok" : "failed";
+            node.elapsedMs = Date.now() - node.started;
+          }
           scheduleEventRender({ live: true });
         }
         break;
@@ -10589,12 +10742,33 @@
     void flushOutbox();
     loadAll();
   }
+  function resetRelayConnection(ws, reason, disposeTransport = false) {
+    if (ws && S.ws !== ws) return false;
+    S.daemonOnline = false;
+    S.channel = null;
+    S.relayActivityAt = null;
+    clearTimeout(S.handshakeTimer);
+    if (disposeTransport) {
+      S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
+      if (S.relayLink && (!ws || S.relayLink.ws === ws)) {
+        S.relayLink.endpoint.dispose();
+        S.relayLink = null;
+      }
+    }
+    clearLiveState();
+    for (const p of S.pending.values()) p.reject(new Error(reason));
+    S.pending.clear();
+    return true;
+  }
   function openRelay() {
     S.local = false;
-    if (S.relayLink) S.relayLink.endpoint.dispose();
-    S.relayLink = null;
-    S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
-    S.channel = null;
+    if (S.ws || S.channel || S.relayLink || S.pending.size || S.daemonOnline) {
+      resetRelayConnection(S.ws, "relay connection replaced", true);
+    } else {
+      S.daemonOnline = false;
+      S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
+      S.channel = null;
+    }
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(proto + "//" + location.host + "/relay/" + S.room + "?role=client&transport=1");
     S.ws = ws;
@@ -10642,7 +10816,9 @@
           });
           S.relayLink = { ws, endpoint };
         }
-        S.relayLink.endpoint.receive(frame);
+        const endpoint = S.relayLink.endpoint;
+        endpoint.receive(frame);
+        if (!endpoint.closed) S.relayActivityAt = typeof performance !== "undefined" ? performance.now() : Date.now();
       } catch (_) { try { ws.close(1008, "relay transport failed"); } catch (_) {} }
     };
     async function onFrame(ws, frame) {
@@ -10653,11 +10829,7 @@
         S.daemonOnline = online;
         if (online && !was) startHandshake();
         if (!online && was) {
-          S.channel = null;
-          clearTimeout(S.handshakeTimer);
-          clearLiveState();
-          for (const p of S.pending.values()) p.reject(new Error("daemon went offline"));
-          S.pending.clear();
+          resetRelayConnection(ws, "daemon went offline");
           note("daemon went offline", true);
         }
         renderChrome();
@@ -10718,13 +10890,7 @@
         $("pair-error").textContent = "This browser was disconnected by the daemon. Connect again to rejoin.";
         showPair();
       }
-      S.daemonOnline = false;
-      S.channel = null;
-      S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
-      if (S.relayLink && S.relayLink.ws === ws) S.relayLink.endpoint.dispose();
-      clearLiveState();
-      for (const p of S.pending.values()) p.reject(new Error("relay connection closed"));
-      S.pending.clear();
+      resetRelayConnection(ws, "relay connection closed", true);
       if (!$("app").classList.contains("hidden")) renderAll();
       if (S.userClosed) return;
       // Reconnect with backoff; the relay and daemon are both stateless here.
@@ -10833,9 +10999,50 @@
     renderChrome();
   }
   setInterval(() => { if (S.reconnect) renderChrome(); }, 1000);
-  // A heartbeat, so the daemon can tell a vanished browser from an idle
-  // one and drop it from its device list (#910).
-  setInterval(() => { if (S.channel && !S.local) request({ type: "ping" }, 20000).catch(() => {}); }, 60000);
+  const RELAY_PROBE_INTERVAL_MS = 10000;
+  const RELAY_PROBE_TIMEOUT_MS = 15000;
+  let relayProbe = null;
+  let relayResume = null;
+  function probeRelay() {
+    if (!S.channel || S.local || !S.relayReady || S.userClosed || S.ws?.readyState !== 1 || navigator.onLine === false) return Promise.resolve(false);
+    if (relayProbe) return relayProbe;
+    const ws = S.ws, channel = S.channel;
+    relayProbe = request({ type: "ping" }, RELAY_PROBE_TIMEOUT_MS, true)
+      .then(() => S.ws === ws && S.channel === channel)
+      .catch(() => {
+        if (S.ws !== ws || S.channel !== channel) return false;
+        note("relay probe failed; reconnecting", true);
+        try { openRelay(); }
+        catch (error) {
+          note("Could not replace the relay connection: " + error.message, true);
+          if (S.ws === ws && !S.reconnect) scheduleReconnect(() => {
+            if (!S.userClosed && S.ws === ws) openRelay();
+          });
+        }
+        try { if (ws.readyState === 1) ws.close(4003, "heartbeat timeout"); } catch (_) {}
+        return false;
+      })
+      .finally(() => { relayProbe = null; });
+    return relayProbe;
+  }
+  function resumeRelayAfterReturn() {
+    if (relayResume) return relayResume;
+    relayResume = (async () => {
+      if (document.hidden || S.local || S.userClosed || navigator.onLine === false) return;
+      if (S.reconnect) { retryNow(); return; }
+      if (S.key && (!S.ws || S.ws.readyState === 3)) { openRelay(); return; }
+      const ws = S.ws, channel = S.channel, session = S.current;
+      if (!await probeRelay() || S.ws !== ws || S.channel !== channel || document.hidden || S.current !== session) return;
+      if (session) await openSession(session, true);
+      else await loadAll();
+    })()
+      .catch(error => { note("Could not refresh the Session after returning: " + error.message, true); })
+      .finally(() => { relayResume = null; });
+    return relayResume;
+  }
+  setInterval(() => {
+    if (!document.hidden && S.channel && !S.local && S.relayReady) void probeRelay();
+  }, RELAY_PROBE_INTERVAL_MS);
 
   function showPair() {
     $("app").classList.add("hidden");

@@ -210,6 +210,7 @@ pub fn run_forecast(
     use formless_protocol::{ForecastBasis, ForecastRange, RunForecast};
     RunForecast {
         fingerprint: "fixture-fingerprint".into(),
+        routing_pick: None,
         basis: ForecastBasis {
             provider_key: "fixture-provider".into(),
             model: "fixture-model".into(),

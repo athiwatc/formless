@@ -37,6 +37,7 @@ struct Reply {
     text: String,
     usage: bool,
     hold: bool,
+    not_found: bool,
     cost: f64,
     stop_reason: &'static str,
 }
@@ -46,6 +47,7 @@ impl Reply {
             text: text.into(),
             usage: true,
             hold: false,
+            not_found: false,
             cost: 0.02,
             stop_reason: "stop",
         }
@@ -81,6 +83,7 @@ impl Fixture {
                 async move {
                     seen.locked().push(body.clone()); entered.notify_one();
                     let Some(reply)=replies.locked().pop_front() else { return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,"unexpected private fixture request").into_response(); };
+                    if reply.not_found { return (axum::http::StatusCode::NOT_FOUND, axum::Json(json!({"error":{"code":"model_not_found","message":"model not found"}}))).into_response(); }
                     if reply.hold { let Ok(permit)=release.acquire().await else { return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(); }; permit.forget(); }
                     let usage=if reply.usage { json!({"prompt_tokens":9,"completion_tokens":3,"cost":reply.cost}) } else { Value::Null };
                     if body["stream"] == true {
@@ -416,6 +419,50 @@ async fn pipeline_repairs_once_accounts_both_calls_and_keeps_system_out_of_sessi
         .as_str()
         .unwrap()
         .contains("one-Run-only"));
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn pipeline_schema_repair_preserves_fallback_provenance() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env).await;
+    f.cfg(|cfg| cfg.provider.fallback_models = vec!["backup".into()]);
+    f.queue(Reply::text("not json"));
+    f.queue(Reply {
+        not_found: true,
+        ..Reply::text("")
+    });
+    f.queue(Reply::text(r#"{"n":7}"#));
+
+    let mut options = schema_options();
+    options.max_usd = None;
+    let run = f.start(options, "repair-fallback").await;
+    let status = f.settled(&run).await;
+    assert_eq!(
+        status,
+        "completed",
+        "error={:?}, requests={:?}",
+        f.d().with_reader(|st| st.run_error(&run)).unwrap(),
+        f.seen.locked()
+    );
+    let seen = f.seen.locked().clone();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[0]["model"], "model");
+    assert_eq!(seen[1]["model"], "model");
+    assert_eq!(seen[2]["model"], "backup");
+    let answer = f
+        .d()
+        .with_reader(|st| st.list_messages(&f.session))
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|message| message.role == "assistant" && !message.content.is_empty())
+        .unwrap();
+    assert_eq!(answer.content, r#"{"n":7}"#);
+    let metadata: Value = serde_json::from_str(answer.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(metadata["model"]["name"], "backup");
+    assert_eq!(metadata["model"]["via"], "fallback");
+    assert_eq!(metadata["model"]["requested"], "model");
     f.shutdown().await;
 }
 #[tokio::test]

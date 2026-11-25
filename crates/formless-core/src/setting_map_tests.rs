@@ -60,6 +60,23 @@ async fn dotted_map_entry_snapshot_and_model_domain_match_the_writer() {
         d.harness_snapshot("config.set", &prices).unwrap(),
         Value::Null
     );
+    let meta = json!({
+        "key":"provider.model_meta.vendor/qwen2.5",
+        "value":{"vision":false,"tools":true,"efforts":["low","high"]}
+    });
+    d.harness_apply("models.set", &meta).await.unwrap();
+    assert_eq!(
+        d.harness_snapshot("models.set", &meta).unwrap(),
+        meta["value"]
+    );
+    assert_eq!(
+        Config::load_file_only(&paths).unwrap().provider.model_meta["vendor/qwen2.5"],
+        crate::config::ModelMetaCfg {
+            vision: Some(false),
+            tools: Some(true),
+            efforts: Some(vec!["low".into(), "high".into()]),
+        }
+    );
     assert!(d
         .harness_apply(
             "models.set",

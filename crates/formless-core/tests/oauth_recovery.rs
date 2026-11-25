@@ -152,8 +152,9 @@ fn endpoint_spelling_reuses_versioned_login_without_adopting_legacy_labels() {
         file.exists(),
         "diagnostics/compatibility lookup never rewrite or delete evidence"
     );
-    auth::save_oauth_tokens(&f.paths, &old.auth, &tokens()).unwrap();
-    assert_eq!(auth::load_oauth_tokens(&f.paths, &new.auth), Some(tokens()));
+    let saved = tokens();
+    auth::save_oauth_tokens(&f.paths, &old.auth, &saved).unwrap();
+    assert_eq!(auth::load_oauth_tokens(&f.paths, &new.auth), Some(saved));
     assert_eq!(
         auth::oauth_tokens_file(&f.paths, &old.auth),
         auth::oauth_tokens_file(&f.paths, &new.auth)
@@ -1157,7 +1158,8 @@ fn finite_raw_keyring_alias_recovery_requires_independent_versioned_endpoint_evi
     let f = Fixture::new(&env);
     let mut old = config("https://example.com");
     old.auth.token_url = "https://example.com/token/?binding=fixture".into();
-    auth::save_oauth_tokens(&f.paths, &old.auth, &tokens()).unwrap();
+    let saved = tokens();
+    auth::save_oauth_tokens(&f.paths, &old.auth, &saved).unwrap();
     let canonical_file = auth::oauth_tokens_file(&f.paths, &old.auth);
     let record: Value = serde_json::from_slice(&std::fs::read(&canonical_file).unwrap()).unwrap();
     let hash = Sha256::digest(format!("{}\n{}", old.auth.token_url, old.auth.client_id));
@@ -1185,7 +1187,7 @@ fn finite_raw_keyring_alias_recovery_requires_independent_versioned_endpoint_evi
     changed.auth.token_url = "https://example.com/token?binding=fixture".into();
     assert_eq!(
         auth::load_oauth_tokens(&f.paths, &changed.auth),
-        Some(tokens())
+        Some(saved)
     );
     assert_eq!(entry.get_password().unwrap(), before);
     assert!(

@@ -24,6 +24,7 @@ mod cli_session_org;
 mod cli_session_report;
 mod cli_session_templates;
 mod cli_session_usage;
+mod cli_setup;
 mod cli_subagents;
 mod cli_tool_detail;
 mod cli_tool_diff;
@@ -483,6 +484,9 @@ enum Cmd {
         #[command(subcommand)]
         action: SessionsAction,
     },
+    /// Accessible line-mode first-time provider setup
+    #[command(after_help = "Examples:\n  formless setup\n  formless --profile work setup")]
+    Setup,
     /// Skills: SKILL.md know-how the agent loads on demand (SPEC §7.10)
     #[command(
         after_help = "Examples:\n  formless skills list\n  formless skills show example-skill"
@@ -2613,6 +2617,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Providers { action }) => providers_cmd(paths, action),
+        Some(Cmd::Setup) => cli_setup::run(&paths),
         Some(Cmd::Prices { action }) => match action {
             PricesAction::Import {
                 provider,
@@ -2749,6 +2754,21 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             println!(
                 "config:    {} providers, {} Roles, {} MCP servers added",
                 r["providers"], r["roles"], r["mcp_servers"]
+            );
+            println!(
+                "skipped:   {} Tools, {} modules, {} Skills, {} memories, {} jobs, {} Sessions",
+                r["skipped_existing"]["tools"],
+                r["skipped_existing"]["modules"],
+                r["skipped_existing"]["skills"],
+                r["skipped_existing"]["memories"],
+                r["skipped_existing"]["jobs"],
+                r["skipped_existing"]["sessions"]
+            );
+            println!(
+                "config skipped: {} providers, {} Roles, {} MCP servers",
+                r["skipped_existing"]["providers"],
+                r["skipped_existing"]["roles"],
+                r["skipped_existing"]["mcp_servers"]
             );
             println!("review:    MCP servers are disabled and untrusted; inspect commands before enabling.");
             for server in r["mcp_review"].as_array().into_iter().flatten() {
@@ -3675,6 +3695,13 @@ enum Fix {
 /// The daemon and file checks `--fix` can act on.
 fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
     let mut out = Vec::new();
+    if let Ok(unknown) = formless_core::config::unknown_keys_from_file(&paths.config_file()) {
+        out.extend(unknown.into_iter().map(|key| Problem {
+            what: format!("{}: {key}", paths.config_file().display()),
+            next: Some(format!("review {}", paths.config_file().display())),
+            fix: None,
+        }));
+    }
     // Jobs that will not fire on schedule (SPEC §9.7).
     if let (Ok(cfg), true) = (Config::load(paths), paths.db_file().exists()) {
         let active = formless_core::Store::open(&paths.db_file())
@@ -4703,7 +4730,7 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
                 next: Some(if cfg.provider.oauth() {
                     "formless auth login".into()
                 } else {
-                    "formless (the wizard stores the key), or set FORMLESS_API_KEY".into()
+                    "formless setup, or set FORMLESS_API_KEY".into()
                 }),
                 fix: None,
             });
@@ -5310,6 +5337,13 @@ fn run_headless(
                                     }
                                 }
                             }
+                            summary.served_model = message
+                                .meta
+                                .as_deref()
+                                .and_then(|meta| serde_json::from_str::<Value>(meta).ok())
+                                .and_then(|meta| {
+                                    serde_json::from_value(meta["model"].clone()).ok()
+                                });
                             final_answer = Some(message.content);
                         }
                     }
@@ -5497,6 +5531,11 @@ fn run_headless(
             summary.line(&status.replace('_', " "), started.elapsed())
         );
     }
+    if !quiet && !matches!(output, RunOutput::Json | RunOutput::JsonlEvents) {
+        if let Some(served) = &summary.served_model {
+            eprintln!("via {} ({})", served.name, served.via);
+        }
+    }
     if policy.has_schema() && code != 0 {
         final_answer = None;
         validated_result = None;
@@ -5562,6 +5601,7 @@ fn run_headless(
                     final_answer.as_deref(),
                     validated_result.as_ref(),
                     run_error.as_deref(),
+                    summary.served_model.as_ref(),
                 )?
             };
             let receipt = formless_core::pipeline::write_result_file(&path, &bytes)?;
@@ -5581,6 +5621,7 @@ fn run_headless(
                 final_answer.as_deref(),
                 validated_result.as_ref(),
                 run_error.as_deref(),
+                summary.served_model.as_ref(),
             )?;
             std::io::stdout().write_all(&bytes)?;
         }
@@ -5625,6 +5666,7 @@ fn headless_preview_request(
 #[derive(Default)]
 struct RunSummary {
     usage: formless_protocol::UsageInfo,
+    served_model: Option<formless_protocol::ServedModelInfo>,
     tools_created: usize,
     tools_used: std::collections::BTreeSet<String>,
 }
@@ -6948,6 +6990,9 @@ fn config_edit(paths: &Paths) -> Result<()> {
                 .map(|(_, unmarked_auto_download)| (text, unmarked_auto_download))
         }) {
             Ok((text, unmarked_auto_download)) => {
+                for key in formless_core::config::unknown_keys_from_text(&text)? {
+                    eprintln!("warning: {}: {key}", file.display());
+                }
                 formless_core::config::write_atomic(&file, text.as_bytes())?;
                 if unmarked_auto_download {
                     eprintln!("warning: unmarked naming.auto_download = true is treated as false; use `formless config set naming.auto_download true` to opt in");
