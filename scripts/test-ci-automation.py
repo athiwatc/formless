@@ -45,7 +45,7 @@ class AutomationTests(unittest.TestCase):
         self.status = {"total_count": 0, "state": "pending"}
         self.jobs = {
             run["id"]: [
-                {"name": name, "conclusion": "success"}
+                {"name": name, "conclusion": "success", "run_attempt": 1}
                 for name in automation.REQUIRED_JOBS[run["path"]]
             ]
             for run in (self.run, self.desktop)
@@ -80,6 +80,7 @@ class AutomationTests(unittest.TestCase):
         if path == f"commits/{SHA}/status":
             return self.status
         if path in {"actions/runs/17/jobs", "actions/runs/18/jobs"}:
+            self.assertEqual(kwargs["filter"], "all")
             return [{"jobs": [job]} for job in self.jobs[int(path.split("/")[2])]]
         return self.payloads[path]
 
@@ -134,6 +135,21 @@ class AutomationTests(unittest.TestCase):
         self.payloads["actions/workflows/ci.yml/runs"]["workflow_runs"].pop()
 
         self.jobs[17].pop()
+        automation.merge(REPO, self.run)
+        self.gh.assert_not_called()
+
+    def test_partial_rerun_uses_most_recent_result_of_each_job(self):
+        self.run["run_attempt"] = 2
+        previous = self.jobs[17][0]
+        previous["conclusion"] = "failure"
+        rerun = {**previous, "run_attempt": 2, "conclusion": "success"}
+        self.jobs[17].insert(0, rerun)
+        automation.merge(REPO, self.run)
+        self.assert_merge()
+
+        self.gh.reset_mock()
+        rerun["conclusion"] = "failure"
+        previous["conclusion"] = "success"
         automation.merge(REPO, self.run)
         self.gh.assert_not_called()
 

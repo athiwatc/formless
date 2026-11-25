@@ -96,9 +96,16 @@ def successful_workflow(repo, workflow, pr, sha, branch):
     latest = max(runs, key=lambda run: run["run_number"])
     if latest["status"] != "completed" or latest["conclusion"] != "success":
         return False
-    pages = api(f"repos/{repo}/actions/runs/{latest['id']}/jobs", True, per_page=100)
-    jobs = {job["name"]: job["conclusion"] for page in pages for job in page["jobs"]}
-    return all(jobs.get(name) == "success" for name in REQUIRED_JOBS[workflow])
+    pages = api(
+        f"repos/{repo}/actions/runs/{latest['id']}/jobs", True, filter="all", per_page=100
+    )
+    jobs = {}
+    for page in pages:
+        for job in page["jobs"]:
+            previous = jobs.get(job["name"])
+            if previous is None or job["run_attempt"] > previous["run_attempt"]:
+                jobs[job["name"]] = job
+    return all(jobs.get(name, {}).get("conclusion") == "success" for name in REQUIRED_JOBS[workflow])
 
 
 def successful_checks(repo, sha):
