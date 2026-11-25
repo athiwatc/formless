@@ -1614,6 +1614,7 @@
    * Keep typography and the main layout width native; only the keyboard's
    * available height and floating controls follow the visible rectangle. */
   let viewportFrame = 0;
+  let viewportGeometryPending = false;
   let composerInputWidth = 0;
   let viewportPrinting = false;
   function viewportBounds() {
@@ -1718,6 +1719,8 @@
   function syncViewport() {
     viewportFrame = 0;
     if (viewportPrinting || document.hidden || matchMedia("print").matches) return;
+    const geometryChanged = viewportGeometryPending;
+    viewportGeometryPending = false;
     const viewport = viewportBounds(), root = document.documentElement;
     const fontSize = parseFloat(getComputedStyle(root).fontSize) || 16;
     const zoomed = Math.abs(viewport.scale - 1) > .01;
@@ -1779,16 +1782,21 @@
         const chrome = focused?.closest(".topbar, .statusbar");
         if (chrome) revealViewportControl(focused, chrome, safeViewportBounds(), { partial: true });
       }
-    }, { newContent: false });
+    }, { newContent: false, geometryChanged });
     // A viewport pan changes which block the user is looking at. Adopt that
     // new visible block rather than compensating away the user's pinch/pan.
-    if (!S.follow && readingVisible()) reading.anchor = captureReadingAnchor();
+    if (!S.follow && readingVisible()) reading.anchor = captureReadingAnchor() || reading.anchor;
   }
   function scheduleViewportSync() {
     if (!viewportFrame) viewportFrame = requestAnimationFrame(syncViewport);
   }
-  window.addEventListener("resize", scheduleViewportSync);
-  window.visualViewport?.addEventListener("resize", scheduleViewportSync);
+  function scheduleViewportGeometrySync() {
+    viewportGeometryPending = true;
+    invalidateReadingRoots();
+    scheduleViewportSync();
+  }
+  window.addEventListener("resize", scheduleViewportGeometrySync);
+  window.visualViewport?.addEventListener("resize", scheduleViewportGeometrySync);
   window.visualViewport?.addEventListener("scroll", scheduleViewportSync);
   document.addEventListener("focusin", scheduleViewportSync);
   document.addEventListener("focusout", scheduleViewportSync);
@@ -3809,7 +3817,7 @@
         img.addEventListener("load", () => {
           // The decoded image may already have resized. Keep the reading
           // anchor captured before that reflow, even after a recent scroll.
-          if (current() && $("transcript").contains(img)) settleReadingLayout();
+          readingDiagramLoaded(img, current);
         }, { once: true });
         update(() => {
           view.replaceChildren(img);
@@ -5386,7 +5394,8 @@
   // Keep the last committed reading block, not geometry captured after reflow.
   const reading = { session: null, saved: new Map(), anchor: null, unseen: new Map(), unseenIds: new Set(), deferred: new Map(), pendingContent: false, pendingLive: false, afterSeq: -1,
     depth: 0, changed: false, adjustment: 0, intentUntil: 0, direction: 0, writeTop: null,
-    writeUntil: 0, inputFrame: 0, pointer: null, observed: new Set() };
+    writeUntil: 0, inputFrame: 0, pointer: null, observed: new Set(),
+    roots: null, rootTree: null, rootTreeSize: 0 };
   const printMedia = window.matchMedia("print");
   const anchorBlocks = "p, pre, summary, li, h1, h2, h3, h4, .bubble, .diagram-view, .stream-tail";
   function visibleReadingBounds() {
@@ -5407,19 +5416,121 @@
     const bounds = visibleReadingBounds();
     return bounds.height > 0 && bounds.width > 0;
   }
+  function invalidateReadingRoots() {
+    reading.roots = null;
+    reading.rootTree = null;
+    reading.rootTreeSize = 0;
+  }
+  function setReadingRootMaximum(index, value) {
+    let position = reading.rootTreeSize + index;
+    reading.rootTree[position] = value;
+    for (position >>= 1; position > 0; position >>= 1) {
+      reading.rootTree[position] = Math.max(reading.rootTree[position * 2], reading.rootTree[position * 2 + 1]);
+    }
+  }
+  function markReadingRootDirty(index) {
+    if (!reading.roots?.[index] || !reading.rootTree) return false;
+    reading.roots[index].dirty = true;
+    // Unknown geometry stays searchable; traversal refreshes this leaf only
+    // if it could be one of the next four candidates.
+    setReadingRootMaximum(index, Infinity);
+    return true;
+  }
+  function markLiveReadingRootDirty(records) {
+    if (!reading.roots?.length || !reading.rootTree || !records.length) return false;
+    const index = reading.roots.length - 1, root = reading.roots[index].node;
+    if (!root.hasAttribute("data-live-root")) return false;
+    const selector = "[data-message-id], [data-live-root]";
+    const local = records.every(record => {
+      const target = record.type === "characterData" ? record.target.parentElement : record.target;
+      if (!["attributes", "characterData", "childList"].includes(record.type)
+        || !target?.closest?.(selector) || target.closest(selector) !== root) return false;
+      if (record.type === "attributes" && ["data-message-id", "data-live-root"].includes(record.attributeName)) return false;
+      if (record.type === "childList" && [...record.addedNodes, ...record.removedNodes].some(node =>
+        node.matches?.(selector) || node.querySelector?.(selector))) return false;
+      return true;
+    });
+    return local && markReadingRootDirty(index);
+  }
+  function readingGeometryChanged(records) {
+    const box = $("transcript");
+    const changed = records.filter(record => record.type !== "attributes" || record.target !== box || record.attributeName !== "style");
+    if (!changed.length) return false;
+    if (!markLiveReadingRootDirty(changed)) invalidateReadingRoots();
+    return true;
+  }
+  function readingDiagramLoaded(img, isCurrent) {
+    if (!isCurrent() || !$("transcript").contains(img)) return;
+    invalidateReadingRoots();
+    settleReadingLayout();
+  }
+  function readingDetailsWillToggle(event) {
+    if (event.target?.closest?.("summary")?.closest("details")) invalidateReadingRoots();
+  }
+  function watchReadingDetails(box) {
+    box.addEventListener("click", readingDetailsWillToggle, true);
+    box.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") readingDetailsWillToggle(event);
+    }, true);
+  }
+  function readingRoots(box, origin) {
+    if (!reading.roots) {
+      const scrollTop = box.scrollTop, adjustment = reading.adjustment;
+      // Normalize bottoms into transcript content space so scrollTop and the
+      // reading-offset translation only change the query threshold.
+      reading.roots = [...box.querySelectorAll("[data-message-id], [data-live-root]")].map(node => {
+        const rect = node.getBoundingClientRect();
+        return { node, height: rect.height, bottom: rect.bottom - origin + scrollTop - adjustment, dirty: false };
+      });
+      reading.rootTreeSize = 1;
+      while (reading.rootTreeSize < reading.roots.length) reading.rootTreeSize *= 2;
+      reading.rootTree = Array(reading.rootTreeSize * 2).fill(-Infinity);
+      for (let index = 0; index < reading.roots.length; index++) {
+        if (reading.roots[index].dirty) reading.rootTree[reading.rootTreeSize + index] = Infinity;
+        else if (reading.roots[index].height > 0) reading.rootTree[reading.rootTreeSize + index] = reading.roots[index].bottom;
+      }
+      // Range maxima preserve selector order without assuming DOM order is
+      // geometric order, and skip whole ranges that cannot qualify.
+      for (let index = reading.rootTreeSize - 1; index > 0; index--) {
+        reading.rootTree[index] = Math.max(reading.rootTree[index * 2], reading.rootTree[index * 2 + 1]);
+      }
+    }
+    return reading.roots;
+  }
+  function refreshReadingRoot(index, box, origin) {
+    const root = reading.roots[index], rect = root.node.getBoundingClientRect();
+    root.height = rect.height;
+    root.bottom = rect.bottom - origin + box.scrollTop - reading.adjustment;
+    root.dirty = false;
+    setReadingRootMaximum(index, root.height > 0 ? root.bottom : -Infinity);
+  }
+  function firstReadingRoot(start, threshold, left, right, index) {
+    if (right <= start || reading.rootTree[index] <= threshold) return -1;
+    if (right - left === 1) return left < reading.roots.length ? left : -1;
+    const middle = (left + right) >> 1;
+    const found = firstReadingRoot(start, threshold, left, middle, index * 2);
+    return found >= 0 ? found : firstReadingRoot(start, threshold, middle, right, index * 2 + 1);
+  }
   function captureReadingAnchor() {
     if (!readingVisible()) return null;
+    if (S.sessionLoad?.id === S.current && S.sessionLoad.status === "pending" && !S.messages.length) return null;
+    // Take pending records before using the index; observer callbacks may not
+    // have run yet for mutations in this task.
+    readingGeometryChanged(readingRootChanges.takeRecords());
     const box = $("transcript"), bounds = visibleReadingBounds();
     const origin = box.getBoundingClientRect().top;
-    // These are the first four eligible roots in DOM order, not necessarily
-    // inside the viewport. Skip the remaining rectangle reads, but keep the
-    // same lower bound and do not assume the roots are sorted by geometry.
+    const roots = readingRoots(box, origin);
+    const threshold = bounds.top - origin + box.scrollTop - reading.adjustment + 1;
     const messages = [];
-    for (const node of box.querySelectorAll("[data-message-id], [data-live-root]")) {
-      const r = node.getBoundingClientRect();
-      if (!(r.height && r.bottom > bounds.top + 1)) continue;
-      messages.push(node);
-      if (messages.length === 4) break;
+    for (let start = 0; messages.length < 4;) {
+      const index = firstReadingRoot(start, threshold, 0, reading.rootTreeSize, 1);
+      if (index < 0) break;
+      if (roots[index].dirty) {
+        refreshReadingRoot(index, box, origin);
+        continue;
+      }
+      messages.push(roots[index].node);
+      start = index + 1;
     }
     const candidates = [];
     for (const message of messages) {
@@ -5512,7 +5623,7 @@
         const whole = Math.trunc(adjustment);
         setReadingAdjustment(adjustment - whole);
         if (whole) writeReadingTop(box.scrollTop - whole);
-      } else if (Math.abs(residual) >= 1) reading.anchor = captureReadingAnchor();
+      } else if (Math.abs(residual) >= 1) reading.anchor = captureReadingAnchor() || reading.anchor;
       return true;
     }
     // During a Session snapshot load, retain the anchor until its message exists.
@@ -5522,7 +5633,9 @@
   function resetReadingSession(id) {
     if (reading.session === id) return;
     if (reading.session != null) {
-      const anchor = reading.anchor || (!S.follow && captureReadingAnchor());
+      const refreshAnchor = !S.follow && (reading.inputFrame || !reading.anchor);
+      if (refreshAnchor) invalidateReadingRoots();
+      const anchor = refreshAnchor ? captureReadingAnchor() || reading.anchor : reading.anchor;
       const unseenIds = [...reading.unseenIds, ...[...reading.unseen.keys(), ...reading.deferred.keys()].map(node =>
         (node.nodeType === Node.TEXT_NODE ? node.parentElement : node)?.closest("[data-message-id]")?.dataset.messageId).filter(Boolean)];
       const unseenLive = reading.pendingLive || [...reading.unseen.keys(), ...reading.deferred.keys()].some(node =>
@@ -5535,6 +5648,7 @@
       // Reading bookmarks retain IDs/offsets rather than detached transcript DOM.
       if (reading.saved.size > 32) reading.saved.delete(reading.saved.keys().next().value);
     }
+    invalidateReadingRoots();
     const saved = reading.saved.get(id);
     reading.session = id;
     reading.anchor = saved?.anchor || null;
@@ -5615,6 +5729,8 @@
     $("jump").classList.toggle("hidden", S.follow || !reading.unseen.size);
   }
   function observeReadingNodes(records) {
+    const changed = readingGeometryChanged(records);
+    const pending = readingGeometryChanged(readingRootChanges.takeRecords());
     for (const record of records) if (record.type === "childList") {
       for (const root of record.addedNodes) if (root instanceof Element) {
         const nodes = root.matches("[data-message-id], [data-live-root]") ? [root] : [...root.querySelectorAll("[data-message-id], [data-live-root]")];
@@ -5625,6 +5741,7 @@
         for (const node of nodes) if (!$("transcript").contains(node)) { reading.observed.delete(node); readingResize.unobserve(node); }
       }
     }
+    return changed || pending;
   }
   function settleReadingLayout() {
     if (!readingVisible() || reading.depth || reading.inputFrame) return;
@@ -5633,7 +5750,7 @@
     else if (!reading.anchor) reading.anchor = captureReadingAnchor();
     updateReadingPill();
   }
-  function withTranscriptLayout(update, { newContent = false } = {}) {
+  function withTranscriptLayout(update, { newContent = false, geometryChanged = false } = {}) {
     resetReadingSession(S.current);
     const outer = !reading.depth++;
     if (outer) {
@@ -5648,6 +5765,7 @@
       if (outer) {
         const records = readingChanges.takeRecords();
         observeReadingNodes(records);
+        if (geometryChanged) invalidateReadingRoots();
         restoreReadingAnchor();
         if (reading.changed) markNewOutput(records);
         if (S.follow) reading.anchor = null;
@@ -5657,13 +5775,24 @@
     }
   }
   const readingChanges = new MutationObserver(records => {
-    observeReadingNodes(records);
-    settleReadingLayout();
+    if (observeReadingNodes(records)) settleReadingLayout();
   });
-  readingChanges.observe($("transcript"), { childList: true, subtree: true,
-    characterData: true, characterDataOldValue: true, attributes: true, attributeFilter: ["open", "class"] });
-  const readingResize = new ResizeObserver(settleReadingLayout);
+  const readingRootChanges = new MutationObserver(readingGeometryChanged);
+  const readingMutationOptions = { childList: true, subtree: true,
+    characterData: true, characterDataOldValue: true, attributes: true,
+    attributeFilter: ["open", "class", "style", "hidden", "data-message-id", "data-live-root"] };
+  readingChanges.observe($("transcript"), readingMutationOptions);
+  readingRootChanges.observe($("transcript"), readingMutationOptions);
+  function readingResizeChanged(entries = []) {
+    const last = reading.roots?.at(-1);
+    if (entries.length && last?.node.hasAttribute("data-live-root") && entries.every(entry => entry.target === last.node)) {
+      markReadingRootDirty(reading.roots.length - 1);
+    } else invalidateReadingRoots();
+    settleReadingLayout();
+  }
+  const readingResize = new ResizeObserver(readingResizeChanged);
   readingResize.observe($("transcript"));
+  watchReadingDetails($("transcript"));
   function resumeReadingFollow() {
     S.follow = true;
     reading.unseen.clear(); reading.unseenIds.clear(); reading.deferred.clear();
@@ -5676,6 +5805,7 @@
     settleReadingLayout();
   }
   function readingInput(direction, duration = 1200) {
+    if (S.sessionLoad?.id === S.current && S.sessionLoad.status === "pending" && !S.messages.length) return;
     reading.writeTop = null;
     reading.intentUntil = performance.now() + duration;
     reading.direction = direction;
@@ -5687,7 +5817,7 @@
       if (S.current !== session || !readingVisible()) return;
       const box = $("transcript"), bottom = box.scrollHeight - box.clientHeight - box.scrollTop <= 1;
       if (direction > 0 && bottom) resumeReadingFollow();
-      reading.anchor = captureReadingAnchor();
+      reading.anchor = captureReadingAnchor() || reading.anchor;
       updateReadingPill();
     });
   }
@@ -5720,11 +5850,11 @@
     if (now < reading.intentUntil) {
       if (!bottom) S.follow = false;
       else if (reading.direction >= 0) resumeReadingFollow();
-      reading.anchor = captureReadingAnchor();
+      reading.anchor = captureReadingAnchor() || reading.anchor;
       updateReadingPill();
     } else if (S.follow && !bottom) {
       S.follow = false;
-      reading.anchor = captureReadingAnchor();
+      reading.anchor = captureReadingAnchor() || reading.anchor;
     } else settleReadingLayout();
   });
   printMedia.addEventListener("change", () => { if (!printMedia.matches) requestAnimationFrame(settleReadingLayout); });
@@ -8807,9 +8937,7 @@
     resetReadingSession(id);
     const seq = ++sessionSeq;
     closeSidebar();
-    if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
-    renderSessions();
     S.sessionLoad = { id, status: "pending" };
     const snapshot = S.sessionSnapshot = { events: [] };
     S.messages = [];
@@ -8817,6 +8945,8 @@
       clearLiveText();
       S.liveTools = []; S.liveRun = null;
     }
+    if (!stay && S.view !== "chat") setView("chat");
+    renderSessions();
     renderHistory();
     S.runTools = null;
     renderRunTools();
