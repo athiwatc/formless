@@ -57,6 +57,13 @@ pub trait InteractionHandler: Send + Sync {
         questions: Vec<formless_protocol::Question>,
         cancel: &'a tokio_util::sync::CancellationToken,
     ) -> InteractionFuture<'a, Option<Vec<formless_protocol::QuestionAnswer>>>;
+    fn question_accepted(
+        &self,
+        _question: &str,
+        _answers: &[formless_protocol::QuestionAnswer],
+    ) -> Result<()> {
+        Ok(())
+    }
     fn on_update(&self, update: HarnessUpdate) -> Result<()>;
     fn finish(&self) -> Result<()> {
         Ok(())

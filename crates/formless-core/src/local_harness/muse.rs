@@ -514,7 +514,7 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                 None => self.receive().await?,
             };
             if event.get("method").is_none() {
-                confirm_decision(event, &mut pending)?;
+                confirm_decision(event, &mut pending, handler)?;
                 continue;
             }
             let method = event["method"]
@@ -528,7 +528,7 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                 {
                     bail!("Muse Code sent a request for an unexpected turn");
                 }
-                let (command, request) = match method {
+                let (command, request, clarification) = match method {
                     "approval/request" => {
                         let approval: Approval = decode(params, "approval request")?;
                         let mut seen = BTreeSet::new();
@@ -561,6 +561,7 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                         (
                             "approval/decide",
                             approval.decide(session, &choice.choice_id),
+                            None,
                         )
                     }
                     "userInput/request" => {
@@ -581,7 +582,7 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                     _ => bail!("Muse Code sent an unsupported server request"),
                 };
                 let id = self.send_request(command, request).await?;
-                pending.insert(id, command);
+                pending.insert(id, (command, clarification));
                 continue;
             }
             if params["sessionId"] != session {
@@ -593,7 +594,7 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                     while !pending.is_empty() {
                         let event = self.receive().await?;
                         if event.get("method").is_none() {
-                            confirm_decision(event, &mut pending)?;
+                            confirm_decision(event, &mut pending, handler)?;
                         } else if event.get("id").is_some() {
                             bail!("Muse Code presented another request after the turn ended");
                         }
@@ -613,8 +614,15 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
     }
 }
 
-fn confirm_decision(event: Value, pending: &mut BTreeMap<u64, &str>) -> Result<()> {
-    let method = event["id"]
+type Clarification = (String, Vec<QuestionAnswer>);
+type Decision = (&'static str, Option<Clarification>);
+
+fn confirm_decision(
+    event: Value,
+    pending: &mut BTreeMap<u64, Decision>,
+    handler: &dyn InteractionHandler,
+) -> Result<()> {
+    let (method, clarification) = event["id"]
         .as_u64()
         .and_then(|id| pending.remove(&id))
         .context("Muse Code sent an unexpected MSP response")?;
@@ -622,6 +630,9 @@ fn confirm_decision(event: Value, pending: &mut BTreeMap<u64, &str>) -> Result<(
         response_result(event, method)?["status"] == "accepted",
         "Muse Code did not accept {method}"
     );
+    if let Some((question, answers)) = clarification {
+        handler.question_accepted(&question, &answers)?;
+    }
     Ok(())
 }
 
@@ -773,7 +784,7 @@ impl Questions {
         session: &str,
         handler: &dyn InteractionHandler,
         cancel: &CancellationToken,
-    ) -> (&'static str, Value) {
+    ) -> (&'static str, Value, Option<Clarification>) {
         let mut feedback = None;
         while !cancel.is_cancelled() {
             let Some(answers) = handler
@@ -783,11 +794,19 @@ impl Questions {
                 break;
             };
             match self.answer(session, &answers) {
-                Ok(params) => return ("userInput/answer", params),
+                Ok(params) => {
+                    let question = self
+                        .questions
+                        .iter()
+                        .map(|q| q.question.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return ("userInput/answer", params, Some((question, answers)));
+                }
                 Err(reason) => feedback = Some(reason),
             }
         }
-        ("userInput/cancel", self.cancel(session))
+        ("userInput/cancel", self.cancel(session), None)
     }
 
     fn for_formless(&self, feedback: Option<&str>) -> Vec<Question> {
@@ -1071,6 +1090,7 @@ mod tests {
         trust: Option<&'static str>,
         trust_path: std::sync::Mutex<Option<Value>>,
         question_count: std::sync::atomic::AtomicUsize,
+        accepted: std::sync::Mutex<Vec<String>>,
     }
 
     impl InteractionHandler for Hooks {
@@ -1134,6 +1154,15 @@ mod tests {
                     text: None,
                 }])
             })
+        }
+
+        fn question_accepted(&self, question: &str, answers: &[QuestionAnswer]) -> Result<()> {
+            assert_eq!(question, "Which format?");
+            self.accepted
+                .lock()
+                .unwrap()
+                .push(QuestionAnswer::summary_of(answers));
+            Ok(())
         }
 
         fn on_update(&self, update: HarnessUpdate) -> Result<()> {
@@ -1354,6 +1383,7 @@ fi
         .unwrap();
         assert_eq!(result.unwrap(), "Fixture done");
         assert_eq!(*hooks.stream.lock().unwrap(), ["Fixture done"]);
+        assert_eq!(*hooks.accepted.lock().unwrap(), ["CSV"]);
         assert_eq!(
             hooks
                 .question_count

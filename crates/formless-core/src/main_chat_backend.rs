@@ -78,7 +78,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply, json!({"answered": true}));
-        assert_eq!(answered.await.unwrap()[0].text.as_deref(), Some("Bangkok"));
+        let answers = answered.await.unwrap();
+        assert_eq!(answers[0].text.as_deref(), Some("Bangkok"));
+        assert!(daemon
+            .with_reader(|st| st.main_harness_turns(&session_id, TRANSCRIPT_BYTES))
+            .unwrap()
+            .is_empty());
+        handler.question_accepted("Which city?", &answers).unwrap();
         assert_eq!(
             daemon
                 .with_reader(|st| st.main_harness_turns(&session_id, TRANSCRIPT_BYTES))
@@ -370,40 +376,44 @@ impl InteractionHandler for MainInteraction {
             } else {
                 answers
             };
-            let summary = QuestionAnswer::summary_of(&answers);
-            if !summary.trim().is_empty() {
-                let stored = self.daemon.with_store(|st| {
-                    st.transaction(|st| {
-                        let question = st.append_message(
-                            &self.session_id,
-                            "assistant",
-                            &crate::secrets::redact(&question).0,
-                        )?;
-                        let answer = st.append_message(
-                            &self.session_id,
-                            "user",
-                            &crate::secrets::redact(&summary).0,
-                        )?;
-                        Ok([question, answer])
-                    })
-                });
-                match stored {
-                    Ok(messages) => {
-                        for message in messages {
-                            self.daemon.broadcast(Event::MessageAppended {
-                                session_id: self.session_id.clone(),
-                                message,
-                            });
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!("could not save Main Chat clarification: {error}");
-                        return None;
-                    }
-                }
+            if self.harness.kind == HarnessKind::Muse {
+                return Some(answers);
+            }
+            if let Err(error) = self.question_accepted(&question, &answers) {
+                tracing::warn!("could not save Main Chat clarification: {error}");
+                return None;
             }
             Some(answers)
         })
+    }
+
+    fn question_accepted(&self, question: &str, answers: &[QuestionAnswer]) -> Result<()> {
+        let summary = QuestionAnswer::summary_of(answers);
+        if summary.trim().is_empty() {
+            return Ok(());
+        }
+        let messages = self.daemon.with_store(|st| {
+            st.transaction(|st| {
+                let question = st.append_message(
+                    &self.session_id,
+                    "assistant",
+                    &crate::secrets::redact(question).0,
+                )?;
+                let answer = st.append_message(
+                    &self.session_id,
+                    "user",
+                    &crate::secrets::redact(&summary).0,
+                )?;
+                Ok([question, answer])
+            })
+        })?;
+        for message in messages {
+            self.daemon.broadcast(Event::MessageAppended {
+                session_id: self.session_id.clone(),
+                message,
+            });
+        }
+        Ok(())
     }
 
     fn on_update(&self, _: HarnessUpdate) -> Result<()> {
