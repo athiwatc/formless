@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use formless_core::{config, presets, Config, Paths};
+use formless_core::{presets, Config, Paths};
 use std::io::{self, BufRead, IsTerminal, Write};
 
 pub(super) fn run(paths: &Paths) -> Result<()> {
@@ -297,6 +297,7 @@ fn select_model(input: &str, models: &[String], default: &str) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use formless_core::config;
     use formless_core::provider::ProbeResult;
     use std::sync::atomic::{AtomicBool, Ordering};
 
