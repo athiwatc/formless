@@ -543,16 +543,11 @@ def run():
             page.wait_for_function("typeof window.__resolveFocusCopy === 'function'")
             check(page.locator('#toasts .toast').count()==0,'copy notification waits for clipboard completion')
             page.evaluate('window.__resolveFocusCopy()')
-            page.wait_for_function('''() => {
-                const text=document.querySelector('#toasts .toast:last-of-type .toast-message')?.textContent || '';
-                return text.startsWith('Copied:') || text === 'Copy failed';
-            }''')
-            copy_toast=page.locator('#toasts .toast').last
+            copy_toast=page.get_by_role('status').filter(has_text='Copied: opens')
+            copy_toast.wait_for(state='visible')
             copy_toast.get_by_role('button',name='Dismiss notification').click()
             copy_toast.wait_for(state='detached')
-            if not page.locator('#sidebar').evaluate('(e)=>e.classList.contains("open")'):
-                page.locator('#menu-btn').click()
-            check(page.locator('#sidebar').evaluate('(e)=>e.classList.contains("open")'),'mobile sidebar is available for subsequent checks')
+            check(page.locator('#sidebar').evaluate('(e)=>e.classList.contains("open")'),'mobile toast dismissal preserves the Session drawer')
             # Pointer dismissal of an overlay is not an outside click on the
             # drawer behind it, including when a close button removes the modal.
             page.locator(session_trigger).click()

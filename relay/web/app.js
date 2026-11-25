@@ -11033,9 +11033,10 @@
   });
   document.addEventListener("click", (e) => {
     if (popover && !popover.contains(e.target)) closePopover();
-    // A modal click belongs to that layer, including a button that removed
-    // its dialog before this event bubbled. Do not dismiss background drawers.
-    if (e.composedPath().some((node) => node instanceof Element && node.classList.contains("backdrop"))) return;
+    // Modal and notification clicks belong to their own layers, including a
+    // button that removes its layer before bubbling. Leave the drawer alone.
+    if (e.composedPath().some((node) => node instanceof Element &&
+        (node.classList.contains("backdrop") || node.id === "toasts"))) return;
     const sb = $("sidebar");
     if (sb.classList.contains("open") && !sb.contains(e.target) && e.target !== $("menu-btn")) closeSidebar();
   });
