@@ -266,6 +266,14 @@ enum Cmd {
         #[arg(long, conflicts_with = "follow")]
         jsonl: bool,
     },
+    /// Configure the backend for the profile's canonical Main Chat
+    #[command(
+        after_help = "Examples:\n  formless main backend show\n  formless main backend set inherit"
+    )]
+    Main {
+        #[command(subcommand)]
+        action: cli_main_chat::Action,
+    },
     /// Print the man page (roff), for packaging: `formless man > formless.1`
     #[command(hide = true)]
     Man,
@@ -302,14 +310,6 @@ enum Cmd {
     Models {
         #[command(subcommand)]
         action: cli_models::Action,
-    },
-    /// Configure the backend for the profile's canonical Main Chat
-    #[command(
-        after_help = "Examples:\n  formless main backend show\n  formless main backend set inherit"
-    )]
-    Main {
-        #[command(subcommand)]
-        action: cli_main_chat::Action,
     },
     /// Read the module inventory, metadata and stored source versions
     #[command(
