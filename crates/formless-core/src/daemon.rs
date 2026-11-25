@@ -8629,30 +8629,55 @@ impl Daemon {
     /// one. Edited arguments replace the call's; returns the ids of the
     /// calls to skip. Without a connected client it does not wait.
     fn validate_step_edit(&self, step_id: &str, input: &mut Value) -> Result<()> {
-        let tool_name = self
+        let (session_id, tool_name) = self
             .step_waiters
             .lock()
             .unwrap()
             .get(step_id)
-            .map(|waiter| waiter.prompt.tool_name.clone())
+            .map(|waiter| {
+                (
+                    waiter.prompt.session_id.clone(),
+                    waiter.prompt.tool_name.clone(),
+                )
+            })
             .context(RequestFailure::not_found("that step is no longer waiting"))?;
-        let schema = match toolreg::builtin_schema(&tool_name) {
-            Some(schema) => Some(schema),
-            None => self
-                .with_store(|store| store.get_tool_by_name(&tool_name))?
-                .map(|(_, version)| {
-                    serde_json::from_str(&version.input_schema).unwrap_or(json!({"type": "object"}))
-                }),
+        let (schema, caps) = match toolreg::builtin_schema(&tool_name) {
+            Some(schema) => (schema, None),
+            None => {
+                let Some((_, version)) =
+                    self.with_store(|store| store.get_tool_by_name(&tool_name))?
+                else {
+                    return Err(anyhow::Error::new(RequestFailure::invalid(format!(
+                        "tool '{tool_name}' no longer exists"
+                    ))));
+                };
+                let schema = serde_json::from_str(&version.input_schema).map_err(|error| {
+                    RequestFailure::invalid(format!("tool has invalid input schema: {error}"))
+                })?;
+                let caps = Capabilities::parse(&version.capabilities).map_err(|error| {
+                    RequestFailure::invalid(format!("tool has invalid capabilities: {error}"))
+                })?;
+                (schema, Some(caps))
+            }
         };
-        if let Some(schema) = schema {
-            toolreg::coerce_json_strings(&schema, input);
-            let validator = toolreg::compile_schema(&schema).map_err(|error| {
-                RequestFailure::invalid(format!("tool has invalid input schema: {error}"))
-            })?;
-            toolreg::validate_against(&validator, input).map_err(|error| {
-                RequestFailure::invalid(format!("input failed schema validation: {error}"))
-            })?;
+        let validator = toolreg::compile_schema(&schema).map_err(|error| {
+            RequestFailure::invalid(format!("tool has invalid input schema: {error}"))
+        })?;
+        toolreg::coerce_json_strings(&schema, input);
+        if let Some(caps) = caps {
+            let cwd = self
+                .session_cwd(&session_id)
+                .map(std::path::PathBuf::from)
+                .map(Ok)
+                .unwrap_or_else(std::env::current_dir)?;
+            let mut normalized = input.clone();
+            if caps.absolutize_inputs(&mut normalized, &cwd).is_ok() {
+                *input = normalized;
+            }
         }
+        toolreg::validate_against(&validator, input).map_err(|error| {
+            RequestFailure::invalid(format!("input failed schema validation: {error}"))
+        })?;
         Ok(())
     }
 
