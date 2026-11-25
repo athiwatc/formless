@@ -6768,8 +6768,13 @@ impl Daemon {
         let producer = crate::routing_task_observation::Producer(task.clone());
         crate::routing_task_observation::scope(
             task,
-            self.clone()
-                .run_loop_inner(session_id, run_id, cancel, cancel_flag, steer_rx),
+            Box::pin(self.clone().run_loop_inner(
+                session_id,
+                run_id,
+                cancel,
+                cancel_flag,
+                steer_rx,
+            )),
         )
         .await;
         drop(producer);
