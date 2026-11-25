@@ -68,7 +68,7 @@ test('Main Chat picker shows readiness and saves the listed provider and overrid
 test('Main Chat backend change from another client updates the open web label', () => {
   let renders = 0;
   const c = setup(['onEvent'], {
-    forecastRevision: 0, branchSummaryEvent() {}, scheduleForecast() {}, notifyFor() {},
+    forecastRevision: 0, branchSummaryEvent() {}, scheduleForecast() {}, scheduleEventRender() {}, notifyFor() {},
     renderTopicContext() { renders++; },
   });
   c.S.mainBackend = { kind: 'provider', name: 'alternate' };
