@@ -2,6 +2,54 @@
 use super::*;
 
 #[tokio::test]
+async fn capped_message_search_maintenance_resumes_before_starting_another_merge() {
+    use crate::storage::MessageSearchIndex;
+
+    let _env = crate::credential_env::EnvGuard::isolated();
+    let root = std::env::temp_dir().join(format!("fl-merge-search-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+    Config::default().save(&paths).unwrap();
+    let daemon = Arc::new(Daemon::new(paths).unwrap());
+    let body = (0..80_000)
+        .map(|i| format!("term{i:05} "))
+        .collect::<String>();
+    let session = daemon
+        .with_store(|store| {
+            let session = store.create_session(None)?;
+            for _ in 0..2 {
+                store.append_message(&session.id, "user", &body)?;
+            }
+            Ok(session)
+        })
+        .unwrap();
+    let mut start = true;
+    let index = MessageSearchIndex::Words;
+    assert!(
+        !daemon
+            .optimize_message_search_pass(index, &mut start, 1)
+            .await
+    );
+    assert!(!start);
+    daemon
+        .with_store(|store| store.append_message(&session.id, "user", "new segment"))
+        .unwrap();
+    assert!(
+        !daemon
+            .optimize_message_search_pass(index, &mut start, 1)
+            .await
+    );
+    assert!(!start);
+    assert!(
+        daemon
+            .optimize_message_search_pass(index, &mut start, 128)
+            .await
+    );
+    assert!(start);
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn scoped_session_search_handler_preserves_legacy_results_and_reports_empty_cutoff() {
     let _env = crate::credential_env::EnvGuard::isolated();
     let root = std::env::temp_dir().join(format!("fl-scoped-search-{}", uuid::Uuid::new_v4()));
