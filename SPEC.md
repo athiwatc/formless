@@ -1076,6 +1076,8 @@ automatically.
   asked now and how each earlier one was answered. Each call is still
   answered on its own, so some can be approved and others denied. A call
   that an earlier "always" in the same batch already covers isn't asked.
+  Calls skipped in step mode are omitted from this pre-pass; every call left
+  to execute still goes through its approval checks.
 - **Building Tools instead of refusing** (`provider.tool_use_nudge`, on by
   default). The system prompt tells the agent that it has no abilities
   beyond its Tools and can always build one, and that it should never say
@@ -1789,8 +1791,11 @@ pasting paths.
   `StepPending {step_id, tool_name, arguments, index, count}` and waits
   for `StepDecision {step_id, action, arguments?}`: `continue` runs it,
   `edit` runs it with new arguments (a JSON object, also stored on the
-  call), `skip` answers the model that the user chose not to run it, and
-  `all` runs it and the rest of the Run without stopping (step mode off).
+  call) after they pass the Tool's input schema. An invalid edit is returned
+  to the deciding client and leaves the step waiting, without persisting or
+  dispatching the edit. `skip` answers the model that the user chose not to
+  run it, and `all` runs it and the rest of the Run without stopping (step
+  mode off).
   `StepResolved` tells every client the step was decided. Esc interrupts
   the Run as usual; with no client connected the Run does not wait.
 - The TUI shows the call and its arguments at the end of the chat: Enter
