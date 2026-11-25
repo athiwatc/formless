@@ -70,22 +70,22 @@ where
         }
         let runtime_override = runtime_api_key_override();
         let key = if !entered.is_empty() {
-            if let Some((source, override_key)) = &runtime_override {
-                if override_key != &entered {
-                    writeln!(
-                        output,
-                        "Note: {source} is set in your environment and overrides the saved key at runtime until unset."
-                    )?;
-                }
-            }
             (entered.clone(), Some(entered))
-        } else if let Some((_, key)) = runtime_override {
-            (key, None)
         } else if let Some((_, key)) = presets::env_key(preset) {
             (key.clone(), Some(key))
+        } else if let Some((_, key)) = &runtime_override {
+            (key.clone(), None)
         } else {
             (String::new(), None)
         };
+        if let (Some((source, override_key)), Some(saved)) = (&runtime_override, &key.1) {
+            if override_key != saved {
+                writeln!(
+                    output,
+                    "Note: {source} is set in your environment and overrides the saved key at runtime until unset."
+                )?;
+            }
+        }
         if key.0.is_empty() {
             bail!(
                 "an API key is required for {}; setup was not saved",
