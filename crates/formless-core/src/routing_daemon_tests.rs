@@ -284,6 +284,40 @@ async fn main_chat_backend_selected_provider_survives_restart_and_does_not_redir
         daemon.handle(Request::GetMainChatBackend).await.unwrap(),
         json!(backend)
     );
+    let quote = daemon
+        .handle(Request::ForecastRun {
+            input: ForecastInput {
+                session_id: Some(main.id.clone()),
+                draft: "A Main Chat turn".into(),
+                ..Default::default()
+            },
+            for_send: true,
+        })
+        .await
+        .unwrap();
+    let confirmation = quote["confirmation_id"].as_str().unwrap().to_owned();
+    daemon
+        .handle(Request::SetMainChatBackend {
+            backend: MainChatBackend::Provider {
+                name: "alternate".into(),
+                model: Some("another-model".into()),
+                effort: Some("high".into()),
+            },
+        })
+        .await
+        .unwrap();
+    let error = daemon
+        .handle(Request::ConfirmForecast { id: confirmation })
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("forecast inputs changed"),
+        "{error:#}"
+    );
+    daemon
+        .handle(Request::SetMainChatBackend { backend })
+        .await
+        .unwrap();
     send_main_backend_fixture(daemon, &main.id, "A Main Chat turn").await;
     send_main_backend_fixture(daemon, &topic_session, "A Topic Chat turn").await;
     let received_main = received

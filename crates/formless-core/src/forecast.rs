@@ -723,6 +723,7 @@ pub(crate) fn estimate_store_with_window_and_pending_attachments(
         session
             .as_ref()
             .map(|s| (&s.model, &s.reasoning_effort, &s.cwd, &s.instructions)),
+        st.session_main_chat_backend(input.session_id.as_deref())?,
         &logical,
         &fingerprint_cfg,
         ratio,
