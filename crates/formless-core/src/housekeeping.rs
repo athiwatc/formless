@@ -150,6 +150,38 @@ fn disk_bytes(paths: &Paths, mut measure: impl FnMut(&Path) -> u64) -> DiskBytes
 /// Disk use by kind: the database (and roughly what fills it), artifacts,
 /// logs, skills and backups.
 pub fn usage(paths: &Paths, store: &Store) -> Result<Value> {
+    usage_report(paths, store, || {
+        storage_backup_listing(paths, |directory| std::fs::read_dir(directory), false)
+    })
+    .map(|(report, _)| report)
+}
+
+pub(crate) fn storage_usage(paths: &Paths, store: &Store) -> Result<Value> {
+    storage_usage_with_reader(paths, store, |directory| std::fs::read_dir(directory))
+}
+
+fn storage_usage_with_reader(
+    paths: &Paths,
+    store: &Store,
+    read_dir: impl FnOnce(&Path) -> std::io::Result<std::fs::ReadDir>,
+) -> Result<Value> {
+    let (mut report, last_daily) = usage_report(paths, store, || {
+        storage_backup_listing(paths, read_dir, true)
+    })?;
+    report["last_backup"] = json!(last_daily.and_then(|path| {
+        std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .map(|_| path.display().to_string())
+    }));
+    Ok(report)
+}
+
+fn usage_report(
+    paths: &Paths,
+    store: &Store,
+    backup_listing: impl FnOnce() -> StorageBackupListing,
+) -> Result<(Value, Option<PathBuf>)> {
     let (artifact_count, artifact_bytes) = crate::artifacts::usage(store)?;
     let inside = store.content_bytes()?;
     let snapshots = store.run_file_usage()?;
@@ -160,6 +192,10 @@ pub fn usage(paths: &Paths, store: &Store) -> Result<Value> {
         format!("daemon and MCP server logs ({oversized_mcp_logs} MCP logs over 2 MB)")
     };
     let disk = disk_bytes(paths, path_bytes);
+    let StorageBackupListing {
+        before_restore,
+        last_daily,
+    } = backup_listing();
     let rows = vec![
         json!({"kind": "database", "bytes": disk.database, "detail": "formless.db (with its WAL)"}),
         json!({"kind": "sessions", "bytes": inside["messages"], "detail": "messages, inside the database", "inside_db": true}),
@@ -169,11 +205,12 @@ pub fn usage(paths: &Paths, store: &Store) -> Result<Value> {
         json!({"kind": "artifacts", "bytes": artifact_bytes, "detail": format!("{artifact_count} stored outputs")}),
         json!({"kind": "logs", "bytes": crate::logs::log_usage(paths) + disk.mcp_logs, "detail": log_detail, "oversized_mcp_logs": oversized_mcp_logs}),
         json!({"kind": "skills", "bytes": disk.skills, "detail": "installed skill files"}),
-        json!({"kind": "backups", "bytes": disk.backups, "detail": "daily, pre-migration and before-restore database copies", "before_restore": list_restore_backups(paths), "before_restore_keep": RESTORE_BACKUPS_KEEP}),
+        json!({"kind": "backups", "bytes": disk.backups, "detail": "daily, pre-migration and before-restore database copies", "before_restore": before_restore, "before_restore_keep": RESTORE_BACKUPS_KEEP}),
     ];
-    Ok(
+    Ok((
         json!({"data_dir": paths.data_dir.display().to_string(), "total_bytes": disk.total, "kinds": rows}),
-    )
+        last_daily,
+    ))
 }
 
 /// What `gc` would free (dry run) or freed: one row per kind.
@@ -370,8 +407,84 @@ pub fn list_backups(paths: &Paths) -> Vec<PathBuf> {
 
 /// Before-restore recovery points, oldest first.
 pub fn list_restore_backups(paths: &Paths) -> Vec<PathBuf> {
-    let mut copies = list_copies(paths, "before-restore-", ".db");
-    copies.extend(list_copies(paths, "formless.db.pre-restore-", ""));
+    storage_backup_listing(paths, |directory| std::fs::read_dir(directory), false).before_restore
+}
+
+#[derive(Debug, Default)]
+struct StorageBackupListing {
+    before_restore: Vec<PathBuf>,
+    last_daily: Option<PathBuf>,
+}
+
+fn storage_backup_listing(
+    paths: &Paths,
+    read_dir: impl FnOnce(&Path) -> std::io::Result<std::fs::ReadDir>,
+    include_last_daily: bool,
+) -> StorageBackupListing {
+    let mut before_restore = Vec::new();
+    let mut daily = Vec::new();
+    for entry in read_dir(&backup_dir(paths)).into_iter().flatten().flatten() {
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if include_last_daily && copy_name_matches(&path, "formless-", ".db") {
+            daily.push(path.clone());
+        }
+        if copy_name_matches(&path, "before-restore-", ".db")
+            || copy_name_matches(&path, "formless.db.pre-restore-", "")
+        {
+            before_restore.push(path);
+        }
+    }
+    sort_restore_copies(&mut before_restore);
+    sort_copy_paths(&mut daily, "formless-", ".db");
+    StorageBackupListing {
+        before_restore,
+        last_daily: if include_last_daily {
+            daily.pop()
+        } else {
+            None
+        },
+    }
+}
+
+// New names have no extension, so require the *entire* generated stamp. A
+// prefix match alone would mistake a selected snapshot's WAL/SHM for backups.
+fn valid_recovery_stamp(stamp: &str) -> bool {
+    let Some((timestamp, id)) = stamp.split_once('-') else {
+        return false;
+    };
+    parse_backup_stamp(timestamp).is_some() && id.len() == 36 && uuid::Uuid::parse_str(id).is_ok()
+}
+
+fn copy_name_matches(path: &Path, prefix: &str, suffix: &str) -> bool {
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        n.starts_with(prefix)
+            && n.ends_with(suffix)
+            && (suffix != "" || n.strip_prefix(prefix).is_some_and(valid_recovery_stamp))
+    })
+}
+
+fn copy_sort_key(
+    path: &Path,
+    prefix: &str,
+    suffix: &str,
+) -> (Option<chrono::NaiveDateTime>, PathBuf) {
+    let at = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix(prefix))
+        .and_then(|n| n.strip_suffix(suffix))
+        .and_then(parse_backup_stamp);
+    (at, path.to_path_buf())
+}
+
+fn sort_copy_paths(found: &mut [PathBuf], prefix: &str, suffix: &str) {
+    found.sort_by_cached_key(|path| copy_sort_key(path, prefix, suffix));
+}
+
+fn sort_restore_copies(copies: &mut [PathBuf]) {
     copies.sort_by_cached_key(|path| {
         let at = path
             .file_name()
@@ -385,16 +498,6 @@ pub fn list_restore_backups(paths: &Paths) -> Vec<PathBuf> {
             .and_then(parse_backup_stamp);
         (at, path.clone())
     });
-    copies
-}
-
-// New names have no extension, so require the *entire* generated stamp. A
-// prefix match alone would mistake a selected snapshot's WAL/SHM for backups.
-fn valid_recovery_stamp(stamp: &str) -> bool {
-    let Some((timestamp, id)) = stamp.split_once('-') else {
-        return false;
-    };
-    parse_backup_stamp(timestamp).is_some() && id.len() == 36 && uuid::Uuid::parse_str(id).is_ok()
 }
 
 fn list_copies(paths: &Paths, prefix: &str, suffix: &str) -> Vec<PathBuf> {
@@ -404,23 +507,9 @@ fn list_copies(paths: &Paths, prefix: &str, suffix: &str) -> Vec<PathBuf> {
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| e.path())
-        .filter(|p| {
-            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                n.starts_with(prefix)
-                    && n.ends_with(suffix)
-                    && (suffix != "" || n.strip_prefix(prefix).is_some_and(valid_recovery_stamp))
-            })
-        })
+        .filter(|p| copy_name_matches(p, prefix, suffix))
         .collect();
-    found.sort_by_cached_key(|p| {
-        let at = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|n| n.strip_prefix(prefix))
-            .and_then(|n| n.strip_suffix(suffix))
-            .and_then(parse_backup_stamp);
-        (at, p.clone())
-    });
+    sort_copy_paths(&mut found, prefix, suffix);
     found
 }
 
@@ -737,6 +826,16 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn legacy_storage_backup_listing(paths: &Paths) -> StorageBackupListing {
+        let mut before_restore = list_copies(paths, "before-restore-", ".db");
+        before_restore.extend(list_copies(paths, "formless.db.pre-restore-", ""));
+        sort_restore_copies(&mut before_restore);
+        StorageBackupListing {
+            before_restore,
+            last_daily: list_copies(paths, "formless-", ".db").pop(),
         }
     }
 
@@ -1447,6 +1546,59 @@ mod tests {
         let (fixture, paths) = Fixture::new();
         let store = Store::open(&fixture.0.join("synthetic-report.db")).unwrap();
         let root = &paths.data_dir;
+        let backups = root.join("backups");
+        let session = store.create_session(Some("usage fixture".into())).unwrap();
+        store.append_message(&session.id, "user", "hello").unwrap();
+        let tool_code = "function run(){return 1;}";
+        let (tool, version) = store
+            .create_tool_version(
+                "usage fixture",
+                "",
+                "{}",
+                "{}",
+                tool_code,
+                &formless_runtime::Capabilities::default(),
+                64,
+                "test",
+            )
+            .unwrap();
+        store
+            .record_invocation(
+                &tool.id,
+                version,
+                Some(&session.id),
+                None,
+                None,
+                "success",
+                "",
+                "i",
+                "o",
+                "e",
+                0,
+                10,
+            )
+            .unwrap();
+        let run = store.create_run(&session.id).unwrap();
+        store
+            .snapshot_run_file_capped(
+                &session.id,
+                &run,
+                "snapshot.txt",
+                true,
+                Some(b"before"),
+                Some("{}"),
+                "file",
+                None,
+                &crate::config::RunFilesCfg::default(),
+            )
+            .unwrap();
+        let after_state = r#"{"version":1}"#;
+        assert!(store
+            .set_run_file_after_state(&session.id, &run, "snapshot.txt", after_state)
+            .unwrap());
+        store
+            .save_artifact(Some(&session.id), "artifact.txt", "", 11)
+            .unwrap();
         for (relative, size) in [
             ("formless.db", 8),
             ("formless.db-wal", 3),
@@ -1458,28 +1610,91 @@ mod tests {
             ("formless.db.v9-20260101T120000Z.bak", 17),
             ("formless.db.v52-20251231T120000Z.bak", 19),
             ("mcp/owned.log", 23),
+            ("backups/formless-not-a-date.db", 29),
+            ("backups/formless-20260101T120000Z.db", 31),
+            ("backups/formless-20260102T120000Z.db", 32),
             ("backups/before-restore-20260102T120000Z.db", 31),
             ("backups/before-restore-20260101T120000Z.db", 37),
+            ("backups/before-restore-not-a-date.db", 41),
+            (
+                "backups/formless.db.pre-restore-20260103T120000Z-123e4567-e89b-12d3-a456-426614174000",
+                43,
+            ),
+            (
+                "backups/formless.db.pre-restore-20260102T120000Z-123e4567-e89b-12d3-a456-426614174000",
+                44,
+            ),
+            (
+                "backups/formless.db.pre-restore-20260104T120000Z-not-a-uuid",
+                47,
+            ),
         ] {
             synthetic_file(root, relative, size);
         }
+        synthetic_file(root, "backups/formless-20260105T120000Z.db/child", 5);
+        synthetic_file(root, "backups/before-restore-20260105T120000Z.db/child", 7);
+        #[cfg(unix)]
+        {
+            let target = fixture.0.join("backup-target");
+            std::fs::write(&target, "target").unwrap();
+            std::os::unix::fs::symlink(target, backups.join("formless-20260106T120000Z.db"))
+                .unwrap();
+        }
         let expected = legacy_disk_bytes(&paths, path_bytes);
-        let report = usage(&paths, &store).unwrap();
-        assert_eq!(report["data_dir"], root.display().to_string());
-        assert_eq!(report["total_bytes"], expected.total);
-        let kinds = report["kinds"].as_array().unwrap();
-        let row = |kind| kinds.iter().find(|row| row["kind"] == kind).unwrap();
-        assert_eq!(row("database")["bytes"], expected.database);
-        assert_eq!(row("logs")["bytes"], 2 + 3 + 5 + expected.mcp_logs);
-        assert_eq!(row("skills")["bytes"], expected.skills);
-        assert_eq!(row("backups")["bytes"], expected.backups);
+        let mut backup_listing_reads = 0;
+        let report = storage_usage_with_reader(&paths, &store, |directory| {
+            backup_listing_reads += 1;
+            assert_eq!(directory, backup_dir(&paths));
+            std::fs::read_dir(directory)
+        })
+        .unwrap();
+        assert_eq!(backup_listing_reads, 1);
+        let before_restore = [
+            backups.join("before-restore-not-a-date.db"),
+            backups.join("before-restore-20260101T120000Z.db"),
+            backups.join("before-restore-20260102T120000Z.db"),
+            backups.join(
+                "formless.db.pre-restore-20260102T120000Z-123e4567-e89b-12d3-a456-426614174000",
+            ),
+            backups.join(
+                "formless.db.pre-restore-20260103T120000Z-123e4567-e89b-12d3-a456-426614174000",
+            ),
+        ];
+        let legacy_listing = legacy_storage_backup_listing(&paths);
         assert_eq!(
-            row("backups")["before_restore"],
-            json!([
-                root.join("backups/before-restore-20260101T120000Z.db"),
-                root.join("backups/before-restore-20260102T120000Z.db"),
-            ])
+            before_restore.as_slice(),
+            legacy_listing.before_restore.as_slice()
         );
+        assert_eq!(
+            last_backup(&paths).map(|(path, _)| path),
+            legacy_listing.last_daily
+        );
+        assert_eq!(
+            report["last_backup"],
+            json!(last_backup(&paths).map(|(path, _)| path.display().to_string()))
+        );
+        assert_eq!(
+            report,
+            json!({
+                "data_dir": root.display().to_string(),
+                "total_bytes": expected.total,
+                "last_backup": backups.join("formless-20260102T120000Z.db").display().to_string(),
+                "kinds": [
+                    {"kind": "database", "bytes": expected.database, "detail": "formless.db (with its WAL)"},
+                    {"kind": "sessions", "bytes": 5, "detail": "messages, inside the database", "inside_db": true},
+                    {"kind": "invocation logs", "bytes": 3, "detail": "Tool inputs and outputs, inside the database", "inside_db": true},
+                    {"kind": "tool versions", "bytes": tool_code.len() + 4, "detail": "every version's code, inside the database", "inside_db": true},
+                    {"kind": "file snapshots", "bytes": 6 + 2 + after_state.len(), "rows": 1, "retained_files": 1, "before_bytes": 6, "metadata_bytes": 2, "after_state_bytes": after_state.len(), "detail": "1 recorded paths, 1 retained snapshots, inside the database", "inside_db": true},
+                    {"kind": "artifacts", "bytes": 11, "detail": "1 stored outputs"},
+                    {"kind": "logs", "bytes": 2 + 3 + 5 + expected.mcp_logs, "detail": "daemon and MCP server logs", "oversized_mcp_logs": 0},
+                    {"kind": "skills", "bytes": expected.skills, "detail": "installed skill files"},
+                    {"kind": "backups", "bytes": expected.backups, "detail": "daily, pre-migration and before-restore database copies", "before_restore": before_restore, "before_restore_keep": RESTORE_BACKUPS_KEEP},
+                ],
+            })
+        );
+        let mut usage_report = report.clone();
+        usage_report.as_object_mut().unwrap().remove("last_backup");
+        assert_eq!(usage(&paths, &store).unwrap(), usage_report);
         assert_eq!(
             migration_backups(&paths),
             [
@@ -1487,15 +1702,6 @@ mod tests {
                 root.join("formless.db.v52-20251231T120000Z.bak"),
             ]
         );
-        for inside in [
-            "sessions",
-            "invocation logs",
-            "tool versions",
-            "file snapshots",
-        ] {
-            assert_eq!(row(inside)["inside_db"], true);
-        }
-        assert_eq!(row("file snapshots")["bytes"], 0);
         let missing = Paths {
             data_dir: root.join("missing"),
             ..paths
@@ -1504,6 +1710,38 @@ mod tests {
             disk_bytes(&missing, path_bytes),
             legacy_disk_bytes(&missing, path_bytes)
         );
+    }
+
+    #[test]
+    fn storage_backup_listing_matches_legacy_for_empty_and_missing_directories() {
+        let (fixture, _) = Fixture::new();
+        let store = Store::open(&fixture.0.join("empty-report.db")).unwrap();
+        let empty =
+            Paths::from_dirs(fixture.0.join("empty"), fixture.0.join("empty-config")).unwrap();
+        std::fs::create_dir_all(backup_dir(&empty)).unwrap();
+        let missing =
+            Paths::from_dirs(fixture.0.join("missing"), fixture.0.join("missing-config")).unwrap();
+
+        for paths in [&empty, &missing] {
+            let shared =
+                storage_backup_listing(paths, |directory| std::fs::read_dir(directory), true);
+            let legacy = legacy_storage_backup_listing(paths);
+            assert_eq!(shared.before_restore, legacy.before_restore);
+            assert_eq!(shared.last_daily, legacy.last_daily);
+            assert_eq!(last_backup(paths).map(|(path, _)| path), legacy.last_daily);
+
+            let report =
+                storage_usage_with_reader(paths, &store, |directory| std::fs::read_dir(directory))
+                    .unwrap();
+            assert!(report["last_backup"].is_null());
+            let backups = report["kinds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["kind"] == "backups")
+                .unwrap();
+            assert_eq!(backups["before_restore"], json!([]));
+        }
     }
 
     #[cfg(unix)]
