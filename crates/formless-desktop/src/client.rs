@@ -3336,6 +3336,14 @@ impl Engine {
                             .unwrap_or("registry change");
                         format!("Undone: {summary}")
                     }
+                    Ok(value)
+                        if destination == Destination::Memory
+                            && add.is_some()
+                            && value.get("enabled").and_then(Value::as_bool) == Some(false) =>
+                    {
+                        "Already remembered (disabled); it remains off until you explicitly enable it."
+                            .into()
+                    }
                     Ok(value) => match value
                         .get("warning")
                         .and_then(Value::as_str)
@@ -5989,6 +5997,32 @@ mod tests {
             }
             assert_eq!(engine.updates.iter().any(|update| matches!(update, Update::ResourceAdded { destination: Destination::Jobs, text, schedule } if text == "Review" && schedule == "bad schedule")), success);
         }
+    }
+
+    #[test]
+    fn disabled_memory_duplicate_reports_that_it_remains_off() {
+        let mut engine = ready();
+        engine.command(Command::Manage {
+            destination: Destination::Memory,
+            request: Request::UpsertMemory {
+                id: None,
+                text: Some("User prefers concise answers.".into()),
+                scope: None,
+                enabled: None,
+            },
+            label: "add memory".into(),
+        });
+        let outgoing = engine.outgoing.pop_front().unwrap();
+        respond(
+            &mut engine,
+            outgoing.id,
+            json!({"id":"m","text":"User prefers concise answers.","enabled":false}),
+        );
+        assert!(engine.updates.iter().any(|update| matches!(
+            update,
+            Update::ManagementNotice { destination: Destination::Memory, notice }
+                if notice == "Already remembered (disabled); it remains off until you explicitly enable it."
+        )));
     }
 
     #[test]

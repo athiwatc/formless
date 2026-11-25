@@ -16,7 +16,7 @@ function fixture() {
     act: async req => { calls.push(JSON.parse(JSON.stringify(req))); return { applies: req.key === 'tui.on_start' ? 'on_tui_start' : 'now' }; },
     note: text => notes.push(text), toast: text => errors.push(text), refreshSettings: () => {},
   });
-  vm.runInContext(['settingsRows', 'settingDisplay', 'parseSettingInput', 'namingDownloadInfo', 'editSetting'].map(fn).join('\n'), c);
+  vm.runInContext(['settingsRows', 'settingDisplay', 'parseSettingInput', 'namingDownloadInfo', 'editSetting', 'editMemory'].map(fn).join('\n'), c);
   return c;
 }
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -96,6 +96,13 @@ test('cancelled or malformed edits never submit requests', async () => {
     assert.ok(prompts[1].body.kids[0]);
   }
   assert.deepEqual(c.calls, []); assert.equal(c.errors.length, 0);
+});
+
+test('adding an existing disabled memory reports that it remains off', async () => {
+  const c = fixture();
+  c.ask = async () => ({ enabled: false });
+  await c.editMemory(null);
+  assert.equal(c.errors.at(-1), 'Already remembered (disabled); it remains off until you explicitly enable it.');
 });
 
 test('enabling naming auto-download asks consent before saving', async () => {
