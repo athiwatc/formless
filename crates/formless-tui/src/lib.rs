@@ -3455,7 +3455,9 @@ impl App {
                         self.notes
                             .push(format!("daemon: {}", error.clone().unwrap_or_default()));
                         if matches!(kind, Pending::MentionAttach) {
-                            self.mention_attached();
+                            self.interrupt_attachment_send(
+                                "Attachment failed; the message was not sent.",
+                            );
                         }
                         if matches!(kind, Pending::SaveSetting) {
                             if let Some(key) = self.settings_saving.take() {

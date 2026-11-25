@@ -921,6 +921,24 @@ test('line citations queue files for review and report missing citations', async
   ]);
 });
 
+test('an online attachment rejection preserves the draft and blocks sending', async () => {
+  const notes = [], calls = [];
+  const c = setup(['submit', 'saveDraft', 'mentionMatches', 'mentionsIn'], {
+    isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
+    note: (message) => notes.push(message),
+    request: async (request) => {
+      calls.push(request.type);
+      throw new Error('Main Chat harnesses cannot accept attachments');
+    },
+  });
+  const draft = 'Review @file.txt';
+  c.$('input').value = draft;
+  await c.submit(false);
+  assert.deepEqual(calls, ['attach_path']);
+  assert.equal(c.$('input').value, draft);
+  assert.match(notes[0], /Main Chat harnesses cannot accept attachments/);
+});
+
 test('send completion clears only the original Session attachments', async () => {
   const wait = deferred(), calls = []; let inventoryReads = 0;
   const c = setup(['submit','saveDraft','enqueueOutbox','persistOutbox','flushOutbox','canFlushOutbox'], { isRunning: () => false, askNotifyPermission() {}, closeMentions() {},

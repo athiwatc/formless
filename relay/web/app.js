@@ -9703,6 +9703,10 @@
         } catch (error) {
           if (/^.+:\+?[0-9]+$/.test(path) || !/^no file/.test(error.message)) {
             note("cannot attach @" + path + ": " + error.message, true);
+            if (S.daemonOnline && !/^no file/.test(error.message)) {
+              saveCurrentDraft(text);
+              return;
+            }
             if (!S.daemonOnline) attachmentError = "File mentions could not be attached while offline; review before sending.";
           }
         }
