@@ -3323,7 +3323,7 @@ impl Daemon {
                     })?;
                 let dir = self.with_reader(|st| crate::skills::current_dir(st, &name))?;
                 let text = std::fs::read_to_string(dir.join("SKILL.md"))?;
-                let body = crate::skills::parse_skill_md(&text)?.body;
+                let body = crate::skills::skill_body(&text)?;
                 let files = crate::skills::files(&dir)?;
                 let scripts = crate::skills::scripts(&files);
                 Ok(json!({"skill": info, "body": body, "files": files, "scripts": scripts}))
@@ -13571,8 +13571,7 @@ impl Daemon {
                 ))
             })
         })?;
-        let body =
-            crate::skills::parse_skill_md(&std::fs::read_to_string(dir.join("SKILL.md"))?)?.body;
+        let body = crate::skills::skill_body(&std::fs::read_to_string(dir.join("SKILL.md"))?)?;
         let files: Vec<String> = crate::skills::files(&dir)?
             .into_iter()
             .filter(|f| f != "SKILL.md")

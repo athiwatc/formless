@@ -27,8 +27,50 @@ pub struct SkillMeta {
 
 #[derive(Default)]
 struct SkillFrontmatter {
-    name: Option<String>,
-    description: Option<String>,
+    name: Option<FrontmatterString>,
+    description: Option<FrontmatterString>,
+}
+
+struct FrontmatterString(String);
+
+impl<'de> Deserialize<'de> for FrontmatterString {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StringVisitor;
+
+        impl<'de> Visitor<'de> for StringVisitor {
+            type Value = FrontmatterString;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a YAML string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(FrontmatterString(value.to_string()))
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(FrontmatterString(value.to_string()))
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(FrontmatterString(value))
+            }
+        }
+
+        deserializer.deserialize_any(StringVisitor)
+    }
 }
 
 impl<'de> Deserialize<'de> for SkillFrontmatter {
@@ -73,9 +115,37 @@ impl<'de> Deserialize<'de> for SkillFrontmatter {
     }
 }
 
-/// Parse `SKILL.md`: `---` frontmatter with `name` and `description`
-/// (YAML strings), then the body.
-pub fn parse_skill_md(text: &str) -> Result<SkillMeta> {
+fn frontmatter_key(line: &str) -> Option<String> {
+    if line.starts_with(char::is_whitespace) || line.trim_start().starts_with('#') {
+        return None;
+    }
+    let (key, _) = line.split_once(':')?;
+    let key = key.trim();
+    if key.starts_with('"') && key.ends_with('"') {
+        serde_yaml_ng::from_str::<String>(key).ok()
+    } else if key.starts_with('\'') && key.ends_with('\'') {
+        Some(key[1..key.len() - 1].replace("''", "'"))
+    } else {
+        (!key.is_empty()).then(|| key.to_string())
+    }
+}
+
+fn frontmatter_key_line(frontmatter: &str, wanted: &str) -> Option<usize> {
+    frontmatter.lines().enumerate().find_map(|(index, line)| {
+        (frontmatter_key(line).as_deref() == Some(wanted)).then_some(index + 1)
+    })
+}
+
+fn duplicate_frontmatter_key_line(frontmatter: &str) -> Option<usize> {
+    let mut seen = HashSet::new();
+    frontmatter.lines().enumerate().find_map(|(index, line)| {
+        frontmatter_key(line)
+            .filter(|key| !seen.insert(key.clone()))
+            .map(|_| index + 1)
+    })
+}
+
+fn split_skill_md(text: &str) -> Result<(&str, &str)> {
     let text = text.trim_start_matches('\u{feff}');
     let (opening, rest) = text
         .split_once('\n')
@@ -100,19 +170,48 @@ pub fn parse_skill_md(text: &str) -> Result<SkillMeta> {
     };
     let front = &rest[..end];
     let body = &rest[end + closing_len..];
+    Ok((front, body))
+}
+
+pub(crate) fn skill_body(text: &str) -> Result<String> {
+    let (_, body) = split_skill_md(text)?;
+    Ok(body.trim_start_matches(['\r', '\n']).to_string())
+}
+
+/// Parse `SKILL.md`: `---` frontmatter with `name` and `description`
+/// (YAML strings), then the body.
+pub fn parse_skill_md(text: &str) -> Result<SkillMeta> {
+    let (front, body) = split_skill_md(text)?;
+    let closing_line = 2 + front.split_inclusive('\n').count();
     let fields = serde_yaml_ng::from_str::<SkillFrontmatter>(front).map_err(|error| {
-        let line = error.location().map_or(2, |location| location.line() + 1);
+        let duplicate_line = error
+            .to_string()
+            .starts_with("duplicate frontmatter key ")
+            .then(|| duplicate_frontmatter_key_line(front).map(|line| line + 1))
+            .flatten();
+        let line = duplicate_line
+            .or_else(|| error.location().map(|location| location.line() + 1))
+            .unwrap_or(closing_line);
         anyhow!("invalid SKILL.md frontmatter on line {line}: {error}")
     })?;
-    let name = fields.name.unwrap_or_default();
-    let description = fields.description.unwrap_or_default();
-    validate_name(&name)?;
+    let Some(name) = fields.name.map(|value| value.0) else {
+        bail!("SKILL.md frontmatter on line {closing_line} is missing required 'name' field");
+    };
+    let name_line = frontmatter_key_line(front, "name").map_or(2, |line| line + 1);
+    validate_name(&name)
+        .map_err(|error| anyhow!("invalid SKILL.md name on line {name_line}: {error}"))?;
+    let Some(description) = fields.description.map(|value| value.0) else {
+        bail!(
+            "SKILL.md frontmatter on line {closing_line} is missing required 'description' field"
+        );
+    };
+    let description_line = frontmatter_key_line(front, "description").map_or(2, |line| line + 1);
     let description_chars = description.chars().count();
     if description_chars == 0 || crate::descriptions::screen(&description).text.is_empty() {
-        bail!("SKILL.md needs a non-empty description");
+        bail!("SKILL.md description on line {description_line} must be non-empty");
     }
     if description_chars > 1024 {
-        bail!("SKILL.md description must be at most 1024 characters");
+        bail!("SKILL.md description on line {description_line} must be at most 1024 characters");
     }
     Ok(SkillMeta {
         name,

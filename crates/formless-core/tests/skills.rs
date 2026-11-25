@@ -139,6 +139,15 @@ fn skill_frontmatter_follows_yaml_scalar_semantics() {
         parse_skill_md("---\nname: pdf-tools\ndescription: \"Say: \\\"hi\\\"\\nnext\"\n---\nBody")
             .unwrap();
     assert_eq!(escaped.description, "Say: \"hi\"\nnext");
+    let yaml_escape =
+        parse_skill_md("---\nname: pdf-tools\ndescription: \"Letter: \\x41\"\n---\nBody").unwrap();
+    assert_eq!(yaml_escape.description, "Letter: A");
+
+    let crlf =
+        parse_skill_md("---\r\nname: pdf-tools\r\ndescription: CRLF fences\r\n---\r\n# Body\r\n")
+            .unwrap();
+    assert_eq!(crlf.description, "CRLF fences");
+    assert_eq!(crlf.body, "# Body\r\n");
 
     let example = parse_skill_md(
         "---\nname: expense-report\ndescription: File and validate reports.\nlicense: Apache-2.0\ncompatibility: Requires python3\nmetadata:\n  author: example-org\n  version: \"2.1\"\nallowed-tools: Bash(git status:*)\n---\n# Expense reports",
@@ -150,17 +159,20 @@ fn skill_frontmatter_follows_yaml_scalar_semantics() {
 
 #[test]
 fn skill_frontmatter_errors_name_duplicate_keys_and_source_lines() {
-    for (key, source) in [
+    for (key, line, source) in [
         (
             "name",
+            3,
             "---\nname: first\nname: second\ndescription: d\n---\nBody",
         ),
         (
             "description",
+            4,
             "---\nname: skill\ndescription: first\ndescription: second\n---\nBody",
         ),
         (
             "license",
+            5,
             "---\nname: skill\ndescription: d\nlicense: MIT\nlicense: Apache-2.0\n---\nBody",
         ),
     ] {
@@ -169,12 +181,39 @@ fn skill_frontmatter_errors_name_duplicate_keys_and_source_lines() {
             error.contains(&format!("duplicate frontmatter key '{key}'")),
             "{error}"
         );
+        assert!(error.contains(&format!("on line {line}")), "{error}");
     }
 
     let error = parse_skill_md("---\nname: skill\ndescription: [unterminated\n---\nBody")
         .unwrap_err()
         .to_string();
     assert!(error.contains("on line 3"), "{error}");
+}
+
+#[test]
+fn skill_frontmatter_field_errors_include_source_lines() {
+    for (source, line) in [
+        ("---\nname: Bad Name\ndescription: d\n---\nBody", 2),
+        ("---\nname: skill\ndescription: \"\"\n---\nBody", 3),
+        ("---\ndescription: d\n---\nBody", 3),
+        ("---\nname: skill\n---\nBody", 3),
+        ("---\nname: 42\ndescription: d\n---\nBody", 2),
+        ("---\nname: true\ndescription: d\n---\nBody", 2),
+        ("---\nname: null\ndescription: d\n---\nBody", 2),
+        ("---\nname: skill\ndescription: 42\n---\nBody", 3),
+        ("---\nname: skill\ndescription: false\n---\nBody", 3),
+        ("---\nname: skill\ndescription: null\n---\nBody", 3),
+    ] {
+        let error = parse_skill_md(source).unwrap_err().to_string();
+        assert!(error.contains(&format!("line {line}")), "{error}");
+    }
+
+    let too_long = format!(
+        "---\nname: skill\ndescription: {}\n---\nBody",
+        "d".repeat(1025)
+    );
+    let error = parse_skill_md(&too_long).unwrap_err().to_string();
+    assert!(error.contains("line 3"), "{error}");
 }
 
 #[test]
@@ -263,7 +302,7 @@ fn skills_install_from_folder_zip_and_git_and_version() {
         (1, false, true),
         "installed disabled"
     );
-    assert_eq!(v1.description, "Turn spreadsheets into tidy reports.\n");
+    assert_eq!(v1.description, "Turn spreadsheets into tidy reports.");
     store.set_skill_enabled("report-writer", true).unwrap();
     assert_eq!(
         read_file(&store, "report-writer", "reference.md").unwrap(),
@@ -394,6 +433,11 @@ async fn skills_are_managed_through_the_daemon() {
         (info["name"].as_str(), info["enabled"].as_bool()),
         (Some("note-taker"), Some(false))
     );
+    std::fs::write(
+        paths.data_dir.join("skills/note-taker/v1/SKILL.md"),
+        "---\nname: note-taker\ndescription: \"hi\" there\n---\nWrite notes.\n",
+    )
+    .unwrap();
     let got = daemon
         .handle(Request::GetSkill {
             name: "note-taker".into(),
@@ -451,6 +495,11 @@ async fn the_agent_loads_enabled_skills() {
         "disabled skills stay closed: {off}"
     );
     store.set_skill_enabled("report-writer", true).unwrap();
+    std::fs::write(
+        paths.data_dir.join("skills/report-writer/v1/SKILL.md"),
+        "---\nname: report-writer\ndescription: \"hi\" there\n---\nStep 1: read the sheet.\n",
+    )
+    .unwrap();
     let loaded: serde_json::Value = serde_json::from_str(
         &call("load_skill", serde_json::json!({"name": "report-writer"})).await,
     )

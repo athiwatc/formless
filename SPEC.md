@@ -2728,7 +2728,9 @@ Tools fill capability gaps; skills say how to use them well.
   escapes, multiline plain values, and block folding/chomping follow YAML
   semantics. The opening and closing `---` delimiters must each be alone on
   their line. Duplicate keys and malformed YAML are rejected with a
-  source-line error. Names cannot start or end with a hyphen or contain
+  source-line error. Missing or invalid `name` and `description` values also
+  identify their source line; missing fields point to the closing fence. Names
+  cannot start or end with a hyphen or contain
   consecutive hyphens. When the source has a named skill directory (a folder,
   Git root/subdirectory, or wrapped ZIP), its name must match the frontmatter
   `name`; mismatches are rejected. `SKILL.md` files are copied unchanged, and
