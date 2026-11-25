@@ -3310,7 +3310,7 @@ async fn edited_relative_capability_requires_approval_and_denial_prevents_execut
     })
     .await;
     c.send(Request::SendMessage {
-        session_id: id,
+        session_id: id.clone(),
         content: "edit the output path".into(),
         mode: SendMode::Send,
         client_msg_id: None,
@@ -3384,6 +3384,11 @@ async fn edited_relative_capability_requires_approval_and_denial_prevents_execut
         }
     }
     assert!(!edited_path.exists(), "denied call must not execute");
+    let session = c.rpc(Request::GetSession { id }).await.to_string();
+    assert!(
+        session.contains(&edited_path.display().to_string()),
+        "the accepted edit stores the normalized path it was validated with"
+    );
     server.abort();
 }
 

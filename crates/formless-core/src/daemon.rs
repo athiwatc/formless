@@ -5383,7 +5383,7 @@ impl Daemon {
                         "action must be continue, skip, edit or all",
                     )));
                 }
-                if action == "edit" {
+                let arguments = if action == "edit" {
                     let a = arguments.as_deref().unwrap_or_default();
                     let mut v: Value = serde_json::from_str(a).map_err(|error| {
                         RequestFailure::invalid(format!(
@@ -5395,8 +5395,16 @@ impl Daemon {
                             "edited arguments must be a JSON object",
                         )));
                     }
+                    let submitted = v.clone();
                     self.validate_step_edit(&step_id, &mut v)?;
-                }
+                    if v == submitted {
+                        arguments
+                    } else {
+                        Some(v.to_string())
+                    }
+                } else {
+                    arguments
+                };
                 let tx = self
                     .step_waiters
                     .lock()
