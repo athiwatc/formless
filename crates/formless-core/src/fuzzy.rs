@@ -22,7 +22,7 @@ pub fn fold_chars(s: &str) -> impl Iterator<Item = char> + '_ {
     s.chars().flat_map(fold_char)
 }
 
-fn fold_char(ch: char) -> impl Iterator<Item = char> {
+pub(crate) fn fold_char(ch: char) -> impl Iterator<Item = char> {
     std::iter::once(ch)
         .nfd()
         .filter(|c| !is_combining_mark(*c))

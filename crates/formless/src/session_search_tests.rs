@@ -14,6 +14,18 @@ fn hit() -> formless_protocol::SearchHit {
 }
 
 #[test]
+fn empty_scoped_search_still_reports_the_cutoff() {
+    let response = formless_protocol::SearchResults {
+        hits: Vec::new(),
+        searched_latest: Some(10_000),
+    };
+    assert_eq!(
+        scoped_session_search_text("??", 20, &response),
+        "no messages match '??'\nSearched latest 10000 messages.\n"
+    );
+}
+
+#[test]
 fn search_limits_parse_only_the_documented_range_before_dispatch() {
     for limit in ["1", "20", "200"] {
         let cli =

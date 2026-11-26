@@ -233,7 +233,7 @@ fn an_older_search_reply_preserves_the_active_rename_draft() {
     app.submit_chat(false);
     let search = request(&sent);
     assert!(
-        matches!(search.request, Request::SearchSessions { query, .. }
+        matches!(search.request, Request::SearchSessionsWithScope { query, .. }
         if query == "synthetic query")
     );
     app.input.set("new draft");
@@ -241,7 +241,7 @@ fn an_older_search_reply_preserves_the_active_rename_draft() {
     app.paste(" suffix");
     let draft_name = name(&app);
     assert!(draft_name.contains("suffix"));
-    reply(&mut app, &tx, search.id, json!([]));
+    reply(&mut app, &tx, search.id, json!({"hits":[]}));
     assert_eq!(app.view, View::Chat);
     assert_eq!(name(&app), draft_name);
     assert_eq!(app.renaming.as_ref().unwrap().target, "other");

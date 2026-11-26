@@ -6758,16 +6758,21 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             cli_subagents::detail(id, json, daemon, &mut std::io::stdout().lock())?;
         }
         SessionsAction::Search { query, limit, json } => {
-            let hits: Vec<formless_protocol::SearchHit> =
-                serde_json::from_value(daemon(Request::SearchSessions {
-                    query: query.clone(),
-                    limit: Some(limit),
-                })?)?;
             if json {
+                let hits: Vec<formless_protocol::SearchHit> =
+                    serde_json::from_value(daemon(Request::SearchSessions {
+                        query,
+                        limit: Some(limit),
+                    })?)?;
                 println!("{}", serde_json::to_string_pretty(&hits)?);
                 return Ok(());
             }
-            print!("{}", session_search_text(&query, limit, &hits));
+            let results: formless_protocol::SearchResults =
+                serde_json::from_value(daemon(Request::SearchSessionsWithScope {
+                    query: query.clone(),
+                    limit: Some(limit),
+                })?)?;
+            print!("{}", scoped_session_search_text(&query, limit, &results));
         }
         SessionsAction::Templates { action } => cli_session_templates::run(&paths, action)?,
         SessionsAction::Archive { id } => set_archived(&paths, &id, true)?,
@@ -7109,6 +7114,19 @@ fn parse_session_search_limit(value: &str) -> std::result::Result<usize, String>
         .ok()
         .filter(|limit| (1..=200).contains(limit))
         .ok_or_else(|| "search limit must be an integer from 1 to 200".into())
+}
+
+fn scoped_session_search_text(
+    query: &str,
+    limit: usize,
+    results: &formless_protocol::SearchResults,
+) -> String {
+    use std::fmt::Write as _;
+    let mut text = session_search_text(query, limit, &results.hits);
+    if let Some(latest) = results.searched_latest {
+        let _ = writeln!(text, "Searched latest {latest} messages.");
+    }
+    text
 }
 
 fn session_search_text(query: &str, limit: usize, hits: &[formless_protocol::SearchHit]) -> String {

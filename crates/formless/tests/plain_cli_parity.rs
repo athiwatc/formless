@@ -335,6 +335,9 @@ impl Fixture {
                             }
                         }
                         Request::SearchSessions { .. } => timestamp_search_hits(),
+                        Request::SearchSessionsWithScope { .. } => {
+                            json!({"hits": timestamp_search_hits()})
+                        }
                         Request::ListApprovals => timestamp_grants(),
                         Request::ListDenials => timestamp_denials(),
                         Request::ForgetDenial { capability } => {

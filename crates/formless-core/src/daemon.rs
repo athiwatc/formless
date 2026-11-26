@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Config, ProviderCfg};
 use crate::namer::{self, ModelSpec};
 use crate::provider::{DeltaKind, Provider, ToolCall, SYSTEM_PROMPT};
-use crate::storage::{ContextCache, Store};
+use crate::storage::{ContextCache, MessageSearchIndex, Store};
 use crate::tools as toolreg;
 use crate::Paths;
 use correction_loop::{CorrectionBatch, CorrectionClass, CorrectionStreak};
@@ -866,6 +866,36 @@ struct ForecastConsent {
     approved: bool,
     requires: bool,
     selected: String,
+}
+
+struct MessageSearchMaintenance {
+    indexes: [(MessageSearchIndex, bool); 2],
+}
+
+impl MessageSearchMaintenance {
+    fn new() -> Self {
+        Self {
+            indexes: [
+                (MessageSearchIndex::Words, true),
+                (MessageSearchIndex::Unicode, true),
+            ],
+        }
+    }
+
+    async fn run_pass(&mut self, daemon: &Arc<Daemon>, max_steps: usize) {
+        for (index, start) in &mut self.indexes {
+            let started = std::time::Instant::now();
+            let complete = daemon
+                .optimize_message_search_pass(*index, start, max_steps)
+                .await;
+            tracing::info!(
+                ?index,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                complete,
+                "optimize message search"
+            );
+        }
+    }
 }
 
 pub struct Daemon {
@@ -2660,6 +2690,11 @@ impl Daemon {
             Request::SearchSessions { query, limit } => {
                 Ok(serde_json::to_value(self.with_reader(|st| {
                     st.search_sessions(&query, limit.unwrap_or(50))
+                })?)?)
+            }
+            Request::SearchSessionsWithScope { query, limit } => {
+                Ok(serde_json::to_value(self.with_reader(|st| {
+                    st.search_sessions_with_scope(&query, limit.unwrap_or(50))
                 })?)?)
             }
             Request::EditMessage {
@@ -17404,6 +17439,44 @@ impl Daemon {
         }
     }
 
+    async fn database_maintenance_loop(self: Arc<Self>) {
+        let mut maintenance = MessageSearchMaintenance::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            maintenance.run_pass(&self, 1024).await;
+        }
+    }
+
+    async fn optimize_message_search_pass(
+        self: &Arc<Self>,
+        index: MessageSearchIndex,
+        start: &mut bool,
+        max_steps: usize,
+    ) -> bool {
+        for _ in 0..max_steps {
+            let daemon = self.clone();
+            let start_step = *start;
+            match tokio::task::spawn_blocking(move || {
+                daemon.with_store(|store| store.optimize_message_search_step(index, start_step))
+            })
+            .await
+            {
+                Ok(Ok(false)) if start_step => return true,
+                Ok(Ok(changed)) => *start = !changed,
+                Ok(Err(error)) => {
+                    tracing::warn!(?index, %error, "database maintenance");
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(?index, %error, "database maintenance worker failed");
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
     async fn log_rotator(self: Arc<Self>) {
         if std::env::var_os(crate::logs::DAEMON_LOG_ENV).is_none() {
             return;
@@ -17599,6 +17672,10 @@ impl Daemon {
             let this = self.clone();
             tokio::spawn(async move { this.backup_loop().await })
         };
+        let database_maintenance = {
+            let this = self.clone();
+            tokio::spawn(async move { this.database_maintenance_loop().await })
+        };
         let model_check = {
             let this = self.clone();
             tokio::spawn(async move { this.check_models_loop().await })
@@ -17615,6 +17692,7 @@ impl Daemon {
         logs.abort();
         artifact_gc.abort();
         backups.abort();
+        database_maintenance.abort();
         model_check.abort();
         mcp.abort();
         jobs.abort();
