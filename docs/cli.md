@@ -28,6 +28,7 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines`, `--jsonl` | Read or follow the daemon log and rotated files. |
+| `formless main` | `backend [show [--json]\|set inherit\|set provider NAME [--model ID] [--effort LEVEL]\|set harness KIND [--acp-agent NAME]]` | Show or save the active profile's Main Chat backend. The bare `backend` command shows the saved choice and daemon inventory. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit`, `used` | Inspect or change saved user-memory notes. |

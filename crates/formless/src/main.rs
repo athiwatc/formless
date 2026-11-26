@@ -3,6 +3,7 @@ mod cli_attach;
 mod cli_commands;
 #[cfg(test)]
 mod cli_help_tests;
+mod cli_main_chat;
 mod cli_mcp_prompts;
 mod cli_mcp_test;
 mod cli_metrics;
@@ -264,6 +265,14 @@ enum Cmd {
         /// Print one JSON object per selected entry (snapshot only)
         #[arg(long, conflicts_with = "follow")]
         jsonl: bool,
+    },
+    /// Configure the backend for the profile's canonical Main Chat
+    #[command(
+        after_help = "Examples:\n  formless main backend show\n  formless main backend set inherit"
+    )]
+    Main {
+        #[command(subcommand)]
+        action: cli_main_chat::Action,
     },
     /// Print the man page (roff), for packaging: `formless man > formless.1`
     #[command(hide = true)]
@@ -2574,6 +2583,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Modules { action }) => cli_modules::run(&paths, action),
+        Some(Cmd::Main { action }) => cli_main_chat::run(&paths, action),
         Some(Cmd::Memory { action }) => memory_cmd(paths, action),
         Some(Cmd::Runs {
             limit,

@@ -236,6 +236,7 @@ impl View {
 
 #[derive(Clone, PartialEq)]
 enum Pending {
+    MainBackendSubscription,
     QuestionAnswer {
         question: OpenQuestion,
         index: usize,
@@ -358,6 +359,8 @@ enum Pending {
         generation: u64,
         open: bool,
     },
+    MainBackendCatalog,
+    MainBackendSaved,
     TopicList {
         generation: u64,
     },
@@ -3460,7 +3463,9 @@ impl App {
                         self.notes
                             .push(format!("daemon: {}", error.clone().unwrap_or_default()));
                         if matches!(kind, Pending::MentionAttach) {
-                            self.mention_attached();
+                            self.interrupt_attachment_send(
+                                "Attachment failed; the message was not sent.",
+                            );
                         }
                         if matches!(kind, Pending::SaveSetting) {
                             if let Some(key) = self.settings_saving.take() {
@@ -3490,6 +3495,7 @@ impl App {
                         continue;
                     };
                     match kind {
+                        Pending::MainBackendSubscription => {}
                         Pending::ProviderRetry { .. } => {
                             unreachable!("retry acknowledgements handled above")
                         }
@@ -3497,6 +3503,8 @@ impl App {
                             unreachable!("approval acknowledgements handled above")
                         }
                         Pending::TopicCapability { .. }
+                        | Pending::MainBackendCatalog
+                        | Pending::MainBackendSaved
                         | Pending::TopicMain { .. }
                         | Pending::TopicList { .. }
                         | Pending::TopicGet { .. }
@@ -6064,6 +6072,7 @@ impl App {
         if matches!(
             &ev,
             Event::SettingsChanged
+                | Event::MainChatBackendChanged { .. }
                 | Event::RegistryChanged { .. }
                 | Event::SessionUpdated { .. }
                 | Event::MessageAppended { .. }
@@ -6119,6 +6128,7 @@ impl App {
             ev @ (Event::HarnessPermissionRequested { .. }
             | Event::HarnessPermissionClosed { .. }) => self.topic_permission_event(ev),
             Event::TopicChanged { topic_id } => self.topic_changed(topic_id),
+            Event::MainChatBackendChanged { backend } => self.topic.main_backend_changed(backend),
             Event::MessageAppended {
                 session_id,
                 message,
@@ -8014,6 +8024,7 @@ impl App {
             ),
             "sessions" => self.open_view(View::Sessions),
             "main" | "topics" | "topic" => self.topic_slash(cmd, ""),
+            cmd if cmd.starts_with("main ") => self.topic_slash("main", &cmd[5..]),
             cmd if cmd.starts_with("topic ") => self.topic_slash("topic", &cmd[6..]),
             "fork" => {
                 if let Some(id) = self.current.clone() {
@@ -33129,6 +33140,20 @@ mod tests {
         f.confirmation_id = required.then(|| "preview-consent".into());
         f
     }
+    #[test]
+    fn backend_change_invalidates_the_draft_forecast() {
+        let mut app = test_app();
+        let generation = app.forecast_generation();
+        app.forecast.hint = Some(forecast_reply("previous backend", false));
+        app.forecast.approved = Some(generation.clone());
+        app.on_event(Event::MainChatBackendChanged {
+            backend: formless_protocol::MainChatBackend::Inherit,
+        });
+        assert_ne!(generation, app.forecast_generation());
+        assert!(app.forecast.hint.is_none());
+        assert!(app.forecast.approved.is_none());
+    }
+
     #[test]
     fn forecast_hint_debounces_and_rejects_stale_draft_model_session_and_files() {
         for change in 0..4 {

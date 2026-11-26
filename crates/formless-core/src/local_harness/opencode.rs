@@ -67,6 +67,10 @@ const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(2);
 
+pub(crate) fn compatible_version(version: &str) -> bool {
+    acp::parse_version(version).is_some_and(|v| v.0 == 2 && v >= (2, 3, 2))
+}
+
 /// Queries only the CLI version: credential discovery initializes providers and
 /// performs network requests, so readiness must not run it.
 pub fn availability(
@@ -76,8 +80,7 @@ pub fn availability(
     let version = probe_version(executable, environment);
     let (installed, version, error) = match version {
         Ok(version) => {
-            let compatible =
-                acp::parse_version(&version).is_some_and(|v| v.0 == 2 && v >= (2, 3, 2));
+            let compatible = compatible_version(&version);
             (
                 true,
                 Some(version),
@@ -354,10 +357,19 @@ fn prepare(request: &HarnessRequest) -> Result<HarnessRequest> {
     acp::validate(request)?;
     let mut environment = request.environment.clone();
     environment.insert("PWD".into(), request.cwd.as_os_str().to_owned());
-    environment.insert(
-        "OPENCODE_CONFIG_CONTENT".into(),
-        config().to_string().into(),
-    );
+    let mut config = config();
+    if !request.has_mcp() {
+        config["agents"]["formless-review"]["system"] =
+            json!("Answer in chat. Do not modify files or state or access other conversations.");
+        config["agents"]["formless-review"]["permissions"] = json!([
+            {"action":"*","resource":"*","effect":"deny"},
+            {"action":"read","resource":"*","effect":"allow"},
+            {"action":"glob","resource":"*","effect":"allow"},
+            {"action":"grep","resource":"*","effect":"allow"},
+            {"action":"question","resource":"*","effect":"allow"},
+        ]);
+    }
+    environment.insert("OPENCODE_CONFIG_CONTENT".into(), config.to_string().into());
     Ok(HarnessRequest {
         kind: request.kind,
         acp_agent: request.acp_agent.clone(),

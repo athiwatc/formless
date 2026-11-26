@@ -118,7 +118,7 @@ pub const COMMANDS: &[Command] = &[
         "list and switch Sessions (T toggles lineage tree)",
         Session,
     ),
-    cmd("main", "", "open the canonical Main Chat", Session),
+    cmd("main", "[backend]", "open Main Chat or choose its backend", Session),
     cmd("topics", "", "browse Main Chat and topic conversations", Session),
     cmd(
         "topic",

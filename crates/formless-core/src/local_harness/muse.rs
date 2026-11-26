@@ -33,6 +33,8 @@ const MAX_FRAME: u64 = 4 * 1024 * 1024;
 const MAX_ANSWER_CHARS: usize = 500;
 const TRUST_ONCE: &str = "trust_once";
 const PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
+const NO_META_LOGIN: &str =
+    "No Meta account login detected. Run `muse login` to use a Meta account.";
 
 pub async fn probe(ctx: &ProbeContext) -> HarnessAvailability {
     let mut availability = availability(HarnessKind::Muse, Some(&ctx.executable));
@@ -62,6 +64,10 @@ pub async fn probe(ctx: &ProbeContext) -> HarnessAvailability {
     .await;
     availability.detail = match probe {
         Ok(Ok(())) => None,
+        Ok(Err(NO_META_LOGIN)) => {
+            availability.signed_in = Some(false);
+            Some(NO_META_LOGIN.into())
+        }
         Ok(Err(detail)) => Some(detail.into()),
         Err(_) => Some("probe timed out".into()),
     };
@@ -93,7 +99,7 @@ fn interpret_allowance(success: bool, stdout: &[u8], stderr: &[u8]) -> Result<()
             .split(|byte| *byte == b'\n')
             .any(|line| line.trim_ascii() == b"muse usage: not logged in: run `muse login` first")
         {
-            return Err("No Meta account login detected. Run `muse login` to use a Meta account.");
+            return Err(NO_META_LOGIN);
         }
         return Err("Muse Code did not confirm a Meta account login.");
     }
@@ -203,7 +209,10 @@ struct Launch {
 fn launch_spec(request: &HarnessRequest, read_only: bool, trust_workspace: bool) -> Launch {
     let server = format!("formless_{}", Uuid::new_v4().simple());
     let selector = format!("mcp__{server}__*");
-    let mut tools = vec!["read_file", "request_user_input", &selector];
+    let mut tools = vec!["read_file", "request_user_input"];
+    if request.has_mcp() {
+        tools.push(&selector);
+    }
     let mut args: Vec<OsString> = [
         "serve",
         "--no-session-log",
@@ -255,6 +264,9 @@ fn launch_spec(request: &HarnessRequest, read_only: bool, trust_workspace: bool)
 }
 
 fn session_config(request: &HarnessRequest, server: &str) -> Result<Value> {
+    if !request.has_mcp() {
+        return Ok(json!({"mcpServers": {}}));
+    }
     let command = request
         .mcp_command
         .to_str()
@@ -295,6 +307,9 @@ async fn run_session(
     let mut command = launch.command.command();
     for name in &request.mcp_env_vars {
         command.env_remove(name);
+    }
+    if !request.has_mcp() {
+        command.env_remove(super::TOPIC_CAPABILITY_ENV);
     }
     command
         .stdin(Stdio::piped())
@@ -499,7 +514,7 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                 None => self.receive().await?,
             };
             if event.get("method").is_none() {
-                confirm_decision(event, &mut pending)?;
+                confirm_decision(event, &mut pending, handler)?;
                 continue;
             }
             let method = event["method"]
@@ -513,7 +528,7 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                 {
                     bail!("Muse Code sent a request for an unexpected turn");
                 }
-                let (command, request) = match method {
+                let (command, request, clarification) = match method {
                     "approval/request" => {
                         let approval: Approval = decode(params, "approval request")?;
                         let mut seen = BTreeSet::new();
@@ -546,6 +561,7 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                         (
                             "approval/decide",
                             approval.decide(session, &choice.choice_id),
+                            None,
                         )
                     }
                     "userInput/request" => {
@@ -566,19 +582,19 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                     _ => bail!("Muse Code sent an unsupported server request"),
                 };
                 let id = self.send_request(command, request).await?;
-                pending.insert(id, command);
+                pending.insert(id, (command, clarification));
                 continue;
             }
             if params["sessionId"] != session {
                 continue;
             }
             if method == "turn/completed" && params["turnId"] == turn {
-                let message = output.complete(params)?;
-                tokio::time::timeout(START_TIMEOUT, async {
+                let turn_result = output.complete(params);
+                let decision_result = tokio::time::timeout(START_TIMEOUT, async {
                     while !pending.is_empty() {
                         let event = self.receive().await?;
                         if event.get("method").is_none() {
-                            confirm_decision(event, &mut pending)?;
+                            confirm_decision(event, &mut pending, handler)?;
                         } else if event.get("id").is_some() {
                             bail!("Muse Code presented another request after the turn ended");
                         }
@@ -586,8 +602,19 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                     Ok(())
                 })
                 .await
-                .context("Muse Code completed the turn with unconfirmed decisions")??;
-                return Ok(message);
+                .context("Muse Code completed the turn with unconfirmed decisions")
+                .and_then(|result| result);
+                return match turn_result {
+                    Ok(message) => decision_result.map(|()| message),
+                    Err(turn_error) => {
+                        if let Err(error) = decision_result {
+                            tracing::warn!(
+                                "Muse Code decision failed after a failed turn: {error}"
+                            );
+                        }
+                        Err(turn_error)
+                    }
+                };
             }
             if let Some(message) = output.message(method, params, turn) {
                 handler.on_update(HarnessUpdate::Message {
@@ -598,8 +625,15 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
     }
 }
 
-fn confirm_decision(event: Value, pending: &mut BTreeMap<u64, &str>) -> Result<()> {
-    let method = event["id"]
+type Clarification = (String, Vec<QuestionAnswer>);
+type Decision = (&'static str, Option<Clarification>);
+
+fn confirm_decision(
+    event: Value,
+    pending: &mut BTreeMap<u64, Decision>,
+    handler: &dyn InteractionHandler,
+) -> Result<()> {
+    let (method, clarification) = event["id"]
         .as_u64()
         .and_then(|id| pending.remove(&id))
         .context("Muse Code sent an unexpected MSP response")?;
@@ -607,6 +641,9 @@ fn confirm_decision(event: Value, pending: &mut BTreeMap<u64, &str>) -> Result<(
         response_result(event, method)?["status"] == "accepted",
         "Muse Code did not accept {method}"
     );
+    if let Some((question, answers)) = clarification {
+        handler.question_accepted(&question, &answers)?;
+    }
     Ok(())
 }
 
@@ -758,7 +795,7 @@ impl Questions {
         session: &str,
         handler: &dyn InteractionHandler,
         cancel: &CancellationToken,
-    ) -> (&'static str, Value) {
+    ) -> (&'static str, Value, Option<Clarification>) {
         let mut feedback = None;
         while !cancel.is_cancelled() {
             let Some(answers) = handler
@@ -768,11 +805,19 @@ impl Questions {
                 break;
             };
             match self.answer(session, &answers) {
-                Ok(params) => return ("userInput/answer", params),
+                Ok(params) => {
+                    let question = self
+                        .questions
+                        .iter()
+                        .map(|q| q.question.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return ("userInput/answer", params, Some((question, answers)));
+                }
                 Err(reason) => feedback = Some(reason),
             }
         }
-        ("userInput/cancel", self.cancel(session))
+        ("userInput/cancel", self.cancel(session), None)
     }
 
     fn for_formless(&self, feedback: Option<&str>) -> Vec<Question> {
@@ -1056,6 +1101,7 @@ mod tests {
         trust: Option<&'static str>,
         trust_path: std::sync::Mutex<Option<Value>>,
         question_count: std::sync::atomic::AtomicUsize,
+        accepted: std::sync::Mutex<Vec<String>>,
     }
 
     impl InteractionHandler for Hooks {
@@ -1119,6 +1165,15 @@ mod tests {
                     text: None,
                 }])
             })
+        }
+
+        fn question_accepted(&self, question: &str, answers: &[QuestionAnswer]) -> Result<()> {
+            assert_eq!(question, "Which format?");
+            self.accepted
+                .lock()
+                .unwrap()
+                .push(QuestionAnswer::summary_of(answers));
+            Ok(())
         }
 
         fn on_update(&self, update: HarnessUpdate) -> Result<()> {
@@ -1339,12 +1394,70 @@ fi
         .unwrap();
         assert_eq!(result.unwrap(), "Fixture done");
         assert_eq!(*hooks.stream.lock().unwrap(), ["Fixture done"]);
+        assert_eq!(*hooks.accepted.lock().unwrap(), ["CSV"]);
         assert_eq!(
             hooks
                 .question_count
                 .load(std::sync::atomic::Ordering::Relaxed),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn msp_drains_clarification_acknowledgement_without_masking_turn_errors() {
+        for (terminal, status, error) in [
+            ("failed", "accepted", "did not complete the turn"),
+            ("completed", "accepted", "did not return a final answer"),
+            ("failed", "rejected", "did not complete the turn"),
+        ] {
+            let (client, server) = tokio::io::duplex(4096);
+            let (client_input, client_output) = tokio::io::split(client);
+            let (server_input, server_output) = tokio::io::split(server);
+            let mut client = Msp {
+                input: client_output,
+                output: BufReader::new(client_input),
+                next_id: 0,
+            };
+            let mut server = Msp {
+                input: server_output,
+                output: BufReader::new(server_input),
+                next_id: 0,
+            };
+            let hooks = Hooks::default();
+            let cancel = CancellationToken::new();
+            let script = async {
+                server.send(json!({"jsonrpc": "2.0", "id": 9, "method": "userInput/request", "params": questions()})).await.unwrap();
+                assert_eq!(server.receive().await.unwrap()["id"], 9);
+                assert_eq!(
+                    server.receive().await.unwrap()["method"],
+                    "userInput/engaged"
+                );
+                let answer = server.receive().await.unwrap();
+                assert_eq!(answer["method"], "userInput/answer");
+                server.send(json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {"sessionId": "session", "turnId": "turn", "terminal": terminal}})).await.unwrap();
+                server
+                    .send(
+                        json!({"jsonrpc": "2.0", "id": answer["id"], "result": {"status": status}}),
+                    )
+                    .await
+                    .unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(START_TIMEOUT, async {
+                tokio::join!(
+                    client.run_turn("session", "turn", VecDeque::new(), true, &hooks, &cancel),
+                    script,
+                )
+            })
+            .await
+            .unwrap();
+            assert!(result.unwrap_err().to_string().contains(error));
+            let accepted = hooks.accepted.lock().unwrap();
+            if status == "accepted" {
+                assert_eq!(*accepted, ["CSV"]);
+            } else {
+                assert!(accepted.is_empty());
+            }
+        }
     }
 
     #[tokio::test]

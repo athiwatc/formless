@@ -261,6 +261,7 @@ mod tests {
             sessions: None,
             deltas: !opted,
             transcript_attempts: opted,
+            main_chat_backend: false,
             label: None,
         };
         (

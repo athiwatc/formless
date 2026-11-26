@@ -604,7 +604,7 @@ pub(super) fn validate(request: &HarnessRequest) -> Result<()> {
     if !request.cwd.is_absolute() {
         bail!("harness working directory must be absolute");
     }
-    if !request.mcp_command.is_absolute() {
+    if request.has_mcp() && !request.mcp_command.is_absolute() {
         bail!("MCP server executable must be an absolute path");
     }
     request
@@ -824,6 +824,9 @@ impl AgentProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if !request.has_mcp() {
+            command.env_remove(super::TOPIC_CAPABILITY_ENV);
+        }
         let process = spawn(command, cancel).map_err(|error| {
             anyhow!(
                 "failed to start {} ({error}); is it installed and on PATH?",
@@ -865,17 +868,22 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
             })
         })
         .collect();
+    let mcp_servers = if request.has_mcp() {
+        json!([{
+            "name": "formless",
+            "command": request.mcp_command.to_str().expect("validated"),
+            "args": request.mcp_args,
+            "env": env,
+        }])
+    } else {
+        json!([])
+    };
     let session = rpc
         .call(
             "session/new",
             json!({
                 "cwd": request.cwd.to_str().expect("validated"),
-                "mcpServers": [{
-                    "name": "formless",
-                    "command": request.mcp_command.to_str().expect("validated"),
-                    "args": request.mcp_args,
-                    "env": env,
-                }]
+                "mcpServers": mcp_servers
             }),
             permissions,
         )?
@@ -898,8 +906,12 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
                     )
                 }
             }
-            code => anyhow!(
+            code if request.has_mcp() => anyhow!(
                 "{} rejected session/new with the Formless MCP server (JSON-RPC error {code}).",
+                spec.name
+            ),
+            code => anyhow!(
+                "{} rejected session/new (JSON-RPC error {code}).",
                 spec.name
             ),
         })?;
@@ -918,7 +930,7 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
 
     if request.access == StepAccess::ReadOnly {
         let purpose = "keep a review session read-only";
-        let fail_closed = spec.read_only_fail_closed;
+        let fail_closed = spec.read_only_fail_closed || !request.has_mcp();
         let modes = spec.read_only_modes;
         select_mode(
             spec,

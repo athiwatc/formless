@@ -199,6 +199,75 @@ pub(crate) fn estimate_store_with_window(
     estimate_store_with_window_and_pending_attachments(st, cfg, input, cached, selected, true)
 }
 
+pub(crate) struct ModelSelection {
+    pub model: String,
+    pub role: Option<String>,
+    pub provider: String,
+    pub main_effort: Option<String>,
+    pub main_provider: bool,
+}
+
+pub(crate) fn model_selection(
+    st: &Store,
+    cfg: &Config,
+    session: Option<&SessionInfo>,
+    override_model: Option<&str>,
+) -> Result<ModelSelection> {
+    let backend = st.session_main_chat_backend(session.map(|s| s.id.as_str()))?;
+    let (wanted, selected_provider, main_effort) = match backend {
+        formless_protocol::MainChatBackend::Provider {
+            name,
+            model,
+            effort,
+        } => {
+            let p = cfg.provider_cfg_ref(Some(&name))?;
+            let wanted = p.resolve_alias(override_model.or(model.as_deref()).unwrap_or(&p.model));
+            anyhow::ensure!(
+                !p.base_url.trim().is_empty() && !wanted.trim().is_empty(),
+                "Main Chat provider '{name}' is not configured with an endpoint and model"
+            );
+            (wanted, Some(name), effort)
+        }
+        _ => (
+            cfg.provider.resolve_alias(
+                override_model
+                    .or_else(|| session.and_then(|s| s.model.as_deref()))
+                    .unwrap_or(&cfg.provider.model),
+            ),
+            None,
+            None,
+        ),
+    };
+    let role = wanted.strip_prefix("role:").map(str::to_owned);
+    let role_cfg = role.as_deref().map(|r| cfg.role(r)).transpose()?;
+    let role_provider = role_cfg
+        .and_then(|r| r.provider.as_deref())
+        .unwrap_or(crate::config::DEFAULT_PROVIDER);
+    if let Some(selected) = &selected_provider {
+        anyhow::ensure!(
+            role_cfg.is_none() || selected == role_provider,
+            "model '{wanted}' does not use selected Main Chat provider '{selected}'"
+        );
+    }
+    let main_provider = selected_provider.is_some();
+    let provider = selected_provider.unwrap_or_else(|| role_provider.to_owned());
+    let pcfg = cfg.provider_cfg_ref(Some(&provider))?;
+    let model = role_cfg.map_or(wanted, |r| {
+        pcfg.resolve_alias(if r.model.is_empty() {
+            &pcfg.model
+        } else {
+            &r.model
+        })
+    });
+    Ok(ModelSelection {
+        model,
+        role,
+        provider,
+        main_effort,
+        main_provider,
+    })
+}
+
 pub(crate) fn estimate_store_with_window_and_pending_attachments(
     st: &Store,
     cfg: &Config,
@@ -207,6 +276,9 @@ pub(crate) fn estimate_store_with_window_and_pending_attachments(
     selected: Option<&str>,
     include_pending_attachments: bool,
 ) -> Result<RunForecast> {
+    if let Some(forecast) = crate::daemon::main_chat_backend::harness_forecast(st, cfg, input)? {
+        return Ok(forecast);
+    }
     let mut canonical = input.clone();
     if let Some(model) = &input.options.model {
         anyhow::ensure!(
@@ -280,31 +352,15 @@ pub(crate) fn estimate_store_with_window_and_pending_attachments(
     if input.session_id.is_some() && session.is_none() {
         anyhow::bail!("no such Session for forecast");
     }
-    let wanted = input
-        .model
-        .clone()
-        .or_else(|| session.as_ref().and_then(|s| s.model.clone()))
-        .unwrap_or_else(|| cfg.provider.model.clone());
-    let wanted = cfg.provider.resolve_alias(&wanted);
-    let selected_role = wanted.strip_prefix("role:");
+    let selection = model_selection(st, cfg, session.as_ref(), input.model.as_deref())?;
+    let selected_role = selection.role.as_deref();
     let role = selected_role
         .map(|r| format!("role:{r}"))
         .unwrap_or_else(|| "main".into());
     let rcfg = selected_role.map(|r| cfg.role(r)).transpose()?;
-    let name = rcfg
-        .and_then(|r| r.provider.as_deref())
-        .unwrap_or(crate::config::DEFAULT_PROVIDER);
+    let name = selection.provider.as_str();
     let pcfg = cfg.provider_cfg(Some(name))?;
-    let mut model = rcfg.map_or_else(
-        || wanted.clone(),
-        |r| {
-            pcfg.resolve_alias(if r.model.is_empty() {
-                &pcfg.model
-            } else {
-                &r.model
-            })
-        },
-    );
+    let mut model = selection.model;
     let was_routed = ProviderCfg::is_auto_model(&model);
     if was_routed {
         if let Some(r) = rcfg.filter(|r| !r.candidates.is_empty()) {
@@ -520,16 +576,23 @@ pub(crate) fn estimate_store_with_window_and_pending_attachments(
         provider_key: key,
         model: model.clone(),
         role: role.clone(),
-        reasoning_effort: input.options.reasoning_effort.clone().or_else(|| {
-            if let Some(r) = rcfg {
-                r.reasoning_effort.clone().or(pcfg.reasoning_effort.clone())
-            } else {
-                session
-                    .as_ref()
-                    .and_then(|s| s.reasoning_effort.clone())
-                    .or(pcfg.reasoning_effort.clone())
-            }
-        }),
+        reasoning_effort: input
+            .options
+            .reasoning_effort
+            .clone()
+            .or(selection.main_effort)
+            .or_else(|| {
+                if let Some(r) = rcfg {
+                    r.reasoning_effort.clone().or(pcfg.reasoning_effort.clone())
+                } else if selection.main_provider {
+                    pcfg.reasoning_effort.clone()
+                } else {
+                    session
+                        .as_ref()
+                        .and_then(|s| s.reasoning_effort.clone())
+                        .or(pcfg.reasoning_effort.clone())
+                }
+            }),
         session_id: input.session_id.clone(),
         cwd_hash: hash(&cwd),
         tools_hash: hash(&defs),
@@ -619,9 +682,7 @@ pub(crate) fn estimate_store_with_window_and_pending_attachments(
     } else if n > 0 && cost_usd.is_none() {
         warnings.push("Incomplete historical prices: no dollar forecast".into());
     }
-    if ProviderCfg::is_auto_model(&wanted)
-        || rcfg.is_some_and(|r| ProviderCfg::is_auto_model(&r.model))
-    {
+    if was_routed || rcfg.is_some_and(|r| ProviderCfg::is_auto_model(&r.model)) {
         warnings.push("Auto-model estimate uses local deterministic selection; routing/exploration/fallback may choose differently".into());
     }
     let mut f = RunForecast {
@@ -662,6 +723,7 @@ pub(crate) fn estimate_store_with_window_and_pending_attachments(
         session
             .as_ref()
             .map(|s| (&s.model, &s.reasoning_effort, &s.cwd, &s.instructions)),
+        st.session_main_chat_backend(input.session_id.as_deref())?,
         &logical,
         &fingerprint_cfg,
         ratio,

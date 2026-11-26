@@ -1,12 +1,14 @@
 use super::*;
 use crate::topics::{self, Action, Reply};
-use formless_protocol::{HarnessKind, TopicFeatureStatus, TopicStatus};
+use formless_protocol::{HarnessKind, MainChatBackend, TopicFeatureStatus, TopicStatus};
 mod outline;
 mod parent;
 mod policy;
 
 pub(super) struct Ui {
     pub state: topics::State,
+    choosing_main_backend: bool,
+    main_provider: Option<(String, Entity<InputState>, Entity<InputState>)>,
     proposing: bool,
     source: Option<String>,
     selected: HashSet<String>,
@@ -27,6 +29,8 @@ pub(super) struct Ui {
 impl Ui {
     pub fn reset_connection(&mut self) {
         self.state = Default::default();
+        self.choosing_main_backend = false;
+        self.main_provider = None;
         self.proposing = false;
         self.source = None;
         self.selected.clear();
@@ -41,6 +45,8 @@ impl Ui {
         self.selected.retain(|id| available.contains(id.as_str()));
     }
     pub fn session_changed(&mut self, session: Option<&str>) {
+        self.choosing_main_backend = false;
+        self.main_provider = None;
         self.show_harness_details = false;
         self.policy = None;
         self.proposing = false;
@@ -67,6 +73,8 @@ impl Ui {
     pub fn new(window: &mut Window, cx: &mut Context<Shell>) -> Self {
         Self {
             state: Default::default(),
+            choosing_main_backend: false,
+            main_provider: None,
             proposing: false,
             source: None,
             selected: HashSet::new(),
@@ -88,6 +96,44 @@ impl Ui {
 }
 
 impl Shell {
+    fn select_main_backend(
+        &mut self,
+        backend: MainChatBackend,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let MainChatBackend::Provider { name, .. } = backend {
+            let (model, effort) = match self
+                .topic_ui
+                .state
+                .main_backends
+                .as_ref()
+                .map(|catalog| &catalog.selected)
+            {
+                Some(MainChatBackend::Provider {
+                    name: saved,
+                    model,
+                    effort,
+                }) if saved == &name => (
+                    model.clone().unwrap_or_default(),
+                    effort.clone().unwrap_or_default(),
+                ),
+                _ => (String::new(), String::new()),
+            };
+            let model_input =
+                cx.new(|cx| InputState::new(window, cx).placeholder("Model override (optional)"));
+            let effort_input =
+                cx.new(|cx| InputState::new(window, cx).placeholder("Reasoning effort (optional)"));
+            model_input.update(cx, |input, cx| input.set_value(model, window, cx));
+            effort_input.update(cx, |input, cx| input.set_value(effort, window, cx));
+            self.topic_ui.main_provider = Some((name, model_input, effort_input));
+            cx.notify();
+        } else {
+            self.topic_ui.main_provider = None;
+            self.topic_action(Action::SetMainBackend(backend), cx);
+        }
+    }
+
     fn toggle_topic_policy(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self
             .topic_ui
@@ -219,8 +265,11 @@ impl Shell {
         let Some(client) = &self.client else {
             return;
         };
-        let operation = (!matches!(action, Action::Main | Action::List | Action::Harnesses))
-            .then(uuid::Uuid::new_v4);
+        let operation = (!matches!(
+            action,
+            Action::Main | Action::List | Action::Harnesses | Action::MainBackends
+        ))
+        .then(uuid::Uuid::new_v4);
         let command = ClientCommand::Topic {
             connection: client.connection(),
             operation,
@@ -292,6 +341,10 @@ impl Shell {
                 if operation.is_some() {
                     self.topic_ui.proposing = false;
                     self.topic_ui.state.notice = Some("Updated from Formless.".into());
+                }
+                if matches!(&reply, Reply::MainBackendSaved(_)) {
+                    self.topic_ui.choosing_main_backend = false;
+                    self.topic_ui.main_provider = None;
                 }
                 self.topic_ui.state.apply(reply);
                 if let Some(id) = newly_pending {
@@ -652,12 +705,12 @@ impl Shell {
         let current_topic = ui.state.displayed(self.sidebar.active_id());
         let awaiting_consent =
             current_topic.is_some_and(|topic| topic.status == TopicStatus::PendingApproval);
-        let title = if ui
+        let main_active = ui
             .state
             .main
             .as_ref()
-            .is_some_and(|s| Some(s.id.as_str()) == self.sidebar.active_id())
-        {
+            .is_some_and(|s| Some(s.id.as_str()) == self.sidebar.active_id());
+        let title = if main_active {
             "Main Chat · everyday conversation"
         } else if read_only {
             "Harness conversation · read only"
@@ -720,8 +773,87 @@ impl Shell {
                     )
                     .when_some(current_topic.filter(|_| !ui.proposing), |row, topic| {
                         row.child(policy::toggle(ui, topic, busy, cx))
+                    })
+                    .when(main_active, |row| {
+                        row.child(
+                            Button::new("main-chat-backend")
+                                .small()
+                                .outline()
+                                .label(ui.state.main_backend.as_ref().map_or_else(
+                                    || "Main Chat backend".into(),
+                                    MainChatBackend::label,
+                                ))
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.topic_ui.choosing_main_backend =
+                                        !this.topic_ui.choosing_main_backend;
+                                    this.topic_ui.main_provider = None;
+                                    if this.topic_ui.choosing_main_backend {
+                                        this.topic_ui.state.main_backends = None;
+                                        this.topic_action(Action::MainBackends, cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
                     }),
             );
+        if main_active && ui.choosing_main_backend {
+            if let Some(catalog) = &ui.state.main_backends {
+                for (index, (backend, detail)) in catalog.choices().into_iter().enumerate() {
+                    let selected = catalog.selected.same_choice(&backend);
+                    panel =
+                        panel.child(
+                            h_flex()
+                                .gap_2()
+                                .flex_wrap()
+                                .items_center()
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "main-backend-choice-{index}"
+                                    )))
+                                    .small()
+                                    .outline()
+                                    .label(format!(
+                                        "{}{}",
+                                        if selected { "Selected · " } else { "" },
+                                        backend.label()
+                                    ))
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.select_main_backend(backend.clone(), window, cx)
+                                    })),
+                                )
+                                .child(div().text_xs().child(detail)),
+                        );
+                }
+            }
+            if let Some((name, model, effort)) = &ui.main_provider {
+                let name = name.clone();
+                panel = panel
+                    .child(Input::new(model).small().aria_label("Model override"))
+                    .child(Input::new(effort).small().aria_label("Reasoning effort"))
+                    .child(
+                        Button::new("main-backend-provider-save")
+                            .small()
+                            .label("Save provider")
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some((_, model, effort)) = &this.topic_ui.main_provider {
+                                    let value = |input: &Entity<InputState>| {
+                                        let value = input.read(cx).value().trim().to_owned();
+                                        (!value.is_empty()).then_some(value)
+                                    };
+                                    let backend = MainChatBackend::Provider {
+                                        name: name.clone(),
+                                        model: value(model),
+                                        effort: value(effort),
+                                    };
+                                    this.topic_action(Action::SetMainBackend(backend), cx);
+                                }
+                            })),
+                    );
+            }
+        }
         if ui.proposing {
             panel = panel.child(readable("topic-proposal-help", "Choose saved requests, a topic name and an optional starting outline. Nothing moves or starts until you approve.").text_sm())
                 .child(Input::new(&ui.name).small().aria_label("Topic name"))

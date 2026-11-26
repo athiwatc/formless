@@ -527,7 +527,7 @@ async fn raw_legacy_skill_prefix_refuses_all_run_admission_writes_and_explicit_f
         .unwrap_err()
         .to_string()
         .contains("/fork"));
-    daemon.start_next_queued_message(session.id.clone());
+    daemon.start_next_queued_message(session.id.clone()).await;
     assert_eq!(snapshot(), before);
     assert!(
         requests.locked().is_empty(),

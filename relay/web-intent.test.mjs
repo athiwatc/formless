@@ -921,6 +921,48 @@ test('line citations queue files for review and report missing citations', async
   ]);
 });
 
+test('an online attachment rejection preserves the draft and blocks sending', async () => {
+  const notes = [], calls = [];
+  const c = setup(['submit', 'saveDraft', 'mentionMatches', 'mentionsIn'], {
+    isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
+    note: (message) => notes.push(message),
+    request: async (request) => {
+      calls.push(request.type);
+      throw new Error('Main Chat harnesses cannot accept attachments');
+    },
+  });
+  const draft = 'Review @file.txt';
+  c.$('input').value = draft;
+  await c.submit(false);
+  assert.deepEqual(calls, ['attach_path']);
+  assert.equal(c.$('input').value, draft);
+  assert.match(notes[0], /Main Chat harnesses cannot accept attachments/);
+});
+
+test('a later mention rejection still displays the files already staged for review', async () => {
+  const calls = [], notes = [];
+  let chips;
+  const attachment = { id: 'first', name: 'first.txt' };
+  const c = setup(['submit', 'saveDraft', 'mentionMatches', 'mentionsIn'], {
+    askNotifyPermission() {}, closeMentions() {},
+    renderChips() { chips = c.S.chips.A; },
+    note: (message) => notes.push(message),
+    request: async (request) => {
+      calls.push(request.type);
+      if (request.type === 'list_pending_attachments') return { attachments: [attachment] };
+      if (request.path === 'first.txt') return attachment;
+      throw new Error('Cannot attach this file.');
+    },
+  });
+  const draft = 'Review @first.txt @second.txt';
+  c.$('input').value = draft;
+  await c.submit(false);
+  assert.deepEqual(calls, ['attach_path', 'attach_path', 'list_pending_attachments']);
+  assert.equal(c.$('input').value, draft);
+  assert.equal(chips[0].id, 'first');
+  assert.match(notes.at(-1), /first\.txt.*Fix or remove @second\.txt before sending/);
+});
+
 test('send completion clears only the original Session attachments', async () => {
   const wait = deferred(), calls = []; let inventoryReads = 0;
   const c = setup(['submit','saveDraft','enqueueOutbox','persistOutbox','flushOutbox','canFlushOutbox'], { isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
