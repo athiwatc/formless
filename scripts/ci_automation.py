@@ -25,8 +25,16 @@ REQUIRED_JOBS = {
 }
 
 
-def gh(*args):
-    return subprocess.check_output(["gh", *args], text=True)
+def gh(*args, write=False):
+    env = os.environ.copy()
+    merge_token = env.pop("CI_AUTOMERGE_TOKEN", "")
+    if write:
+        if merge_token:
+            print("Using CI_AUTOMERGE_TOKEN for this pull request write.", flush=True)
+            env["GH_TOKEN"] = merge_token
+        else:
+            print("Using GITHUB_TOKEN fallback for this pull request write.", flush=True)
+    return subprocess.check_output(["gh", *args], text=True, env=env)
 
 
 def api(path, paginated=False, **params):
@@ -136,6 +144,25 @@ def merge(repo, run):
         merge_pr(repo, pr, run["head_sha"])
 
 
+def update_branch(repo, pr, sha):
+    print(f"Updating pull request #{pr} from main instead of merging.")
+    if not os.environ.get("CI_AUTOMERGE_TOKEN"):
+        print(
+            "GITHUB_TOKEN updates require manual approval for PR CI. "
+            "Approve the workflow runs or configure CI_AUTOMERGE_TOKEN for automatic runs."
+        )
+    try:
+        gh(
+            "api", "--include", "--method", "PUT", f"repos/{repo}/pulls/{pr}/update-branch",
+            "-f", f"expected_head_sha={sha}", write=True,
+        )
+    except subprocess.CalledProcessError as error:
+        status = (error.output or "").split(maxsplit=2)
+        if len(status) < 2 or not status[0].startswith("HTTP/") or status[1] != "422":
+            raise
+        print(f"GitHub rejected the branch update for pull request #{pr} (HTTP 422); skipping merge.")
+
+
 def merge_pr(repo, pr, sha):
     for attempt in range(5):
         details = api(f"repos/{repo}/pulls/{pr}")
@@ -154,7 +181,7 @@ def merge_pr(repo, pr, sha):
             time.sleep(2)
     if (
         details["mergeable"] is not True
-        or details["mergeable_state"] not in {"clean", "unstable"}
+        or details["mergeable_state"] not in {"clean", "unstable", "behind"}
     ):
         return
     pages = api(f"repos/{repo}/pulls/{pr}/files", True, per_page=100)
@@ -166,8 +193,16 @@ def merge_pr(repo, pr, sha):
         successful_workflow(repo, workflow, pr, sha, details["head"]["ref"])
         for workflow in required
     ) and successful_checks(repo, sha):
+        if api(f"repos/{repo}/compare/main...{sha}")["behind_by"] != 0:
+            update_branch(repo, pr, sha)
+            return
+        if details["mergeable_state"] == "behind":
+            return
         print(f"Merging pull request #{pr} at {sha}.")
-        gh("pr", "merge", str(pr), "--merge", "--match-head-commit", sha, "--repo", repo)
+        gh(
+            "pr", "merge", str(pr), "--merge", "--match-head-commit", sha, "--repo", repo,
+            write=True,
+        )
 
 
 def dispatch(operation, repo, event):
