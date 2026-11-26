@@ -1859,6 +1859,10 @@ enum DaemonAction {
         /// Never stop for being idle (how the login service runs it)
         #[arg(long)]
         stay: bool,
+        /// Open the Windows log in this process, rather than using shell redirection.
+        #[cfg(windows)]
+        #[arg(long, hide = true, requires = "stay")]
+        own_log: bool,
     },
     /// Start the daemon at login (launchd, systemd user unit or a Windows
     /// logon task), so scheduled jobs run on time
@@ -2203,6 +2207,21 @@ fn validate_tui_start(cli: &mut Cli) -> Result<()> {
     Ok(())
 }
 
+fn tracing_uses_ansi(_cmd: Option<&Cmd>, stderr_is_terminal: bool, color_allowed: bool) -> bool {
+    // The Windows managed daemon changes its stderr after tracing is set up.
+    // Choose based on its final file sink, even when launched from a console.
+    #[cfg(windows)]
+    if matches!(
+        _cmd,
+        Some(Cmd::Daemon {
+            action: DaemonAction::Serve { own_log: true, .. }
+        })
+    ) {
+        return false;
+    }
+    stderr_is_terminal && color_allowed
+}
+
 fn run_cli(mut cli: Cli) -> Result<()> {
     cli_attach::validate_runs_limit(&cli)?;
     validate_runs_filters(&cli)?;
@@ -2241,7 +2260,11 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
-            .with_ansi(std::io::stderr().is_terminal() && table::color_allowed())
+            .with_ansi(tracing_uses_ansi(
+                cli.cmd.as_ref(),
+                std::io::stderr().is_terminal(),
+                table::color_allowed(),
+            ))
             .init();
     }
     // Documentation needs no profile/config/daemon, even for invalid topics.
@@ -3287,7 +3310,16 @@ fn relay_cmd(paths: Paths, action: RelayAction) -> Result<()> {
 
 fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
     match action {
-        DaemonAction::Serve { stay } => {
+        DaemonAction::Serve {
+            stay,
+            #[cfg(windows)]
+            own_log,
+        } => {
+            #[cfg(windows)]
+            if own_log {
+                formless_core::logs::reopen_stdio(&paths).context("open daemon log")?;
+                std::env::set_var(formless_core::logs::DAEMON_LOG_ENV, "1");
+            }
             if stay {
                 std::env::set_var(formless_core::daemon::STAY_ENV, "1");
             }
@@ -9904,6 +9936,22 @@ mod cli_doctor_tests;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn owned_daemon_log_disables_ansi_even_with_a_color_terminal() {
+        use super::{tracing_uses_ansi, Cli};
+        use clap::Parser;
+
+        let managed =
+            Cli::try_parse_from(["formless", "daemon", "serve", "--stay", "--own-log"]).unwrap();
+        let foreground = Cli::try_parse_from(["formless", "daemon", "serve", "--stay"]).unwrap();
+
+        assert!(!tracing_uses_ansi(managed.cmd.as_ref(), true, true));
+        assert!(tracing_uses_ansi(foreground.cmd.as_ref(), true, true));
+        assert!(!tracing_uses_ansi(foreground.cmd.as_ref(), false, true));
+        assert!(!tracing_uses_ansi(foreground.cmd.as_ref(), true, false));
+    }
+
     fn override_fixture(id: &str, name: &str) -> super::SessionInfo {
         serde_json::from_value(serde_json::json!({
             "id": id,

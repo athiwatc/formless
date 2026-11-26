@@ -3687,11 +3687,15 @@ such as `read_file`, `read_text_file` and `file_read`.
   exceeds `daemon.log_max_bytes`, the daemon shifts numbered history, renames
   the live file to `.1`, then reopens stdout/stderr on a fresh `daemon.log`.
   This rename-and-reopen behavior also works on Windows, so new output does
-  not remain in `.1`. With `log_keep = 0`, no history is kept: when the live
-  log exceeds its size cap, Unix unlinks it and reopens stdio, while Windows
-  truncates a regular live log in place. Symlink paths are unlinked rather
-  than followed. Setting `daemon.log_max_bytes = 0` disables size-triggered
-  rotation.
+  not remain in `.1`. With `log_keep = 0`, no numbered history is kept.
+  Once the live log exceeds `daemon.log_max_bytes`, Unix unlinks the live
+  name and reopens stdio. Windows discards the opened live name without
+  truncating the file or following a final symlink. If extended deletion
+  is unsupported, Windows moves the live name to a single pending name
+  for deletion after its handles close, then reopens stdio. A pending
+  entry that cannot be reclaimed is preserved and can prevent further
+  fallback rotation; see the Windows install guide. Setting
+  `daemon.log_max_bytes = 0` disables size-triggered rotation.
 - **SQLite** holds Sessions, Runs, Tool metadata/versions index,
   Invocations, metrics tallies, compaction checkpoints, approvals, audit
   events. Schema is versioned; the daemon auto-migrates on start and takes a

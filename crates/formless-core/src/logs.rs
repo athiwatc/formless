@@ -153,6 +153,350 @@ fn promote_alias(source: &std::path::Path, destination: &std::path::Path) -> std
     std::fs::remove_file(source)
 }
 
+#[cfg(windows)]
+const PENDING_LOG_NAME: &str = "daemon.log.discard-pending";
+
+#[cfg(windows)]
+fn discard_live_log(path: &std::path::Path) -> std::io::Result<()> {
+    discard_live_log_with(path, delete_log_link_posix)
+}
+
+#[cfg(windows)]
+fn discard_live_log_with(
+    path: &std::path::Path,
+    delete_posix: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::{
+        ERROR_CALL_NOT_IMPLEMENTED, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+        ERROR_NOT_SUPPORTED,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let log = std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    match delete_posix(&log) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error.raw_os_error().is_some_and(|code| {
+                matches!(
+                    code as u32,
+                    ERROR_INVALID_FUNCTION
+                        | ERROR_NOT_SUPPORTED
+                        | ERROR_INVALID_PARAMETER
+                        | ERROR_CALL_NOT_IMPLEMENTED
+                )
+            }) =>
+        {
+            let parent = path.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "log has no parent directory",
+                )
+            })?;
+            move_and_delete_log_link(&log, parent)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn delete_log_link_posix(log: &std::fs::File) -> std::io::Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfoEx, SetFileInformationByHandle, FILE_DISPOSITION_FLAG_DELETE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: the handle and complete fixed-size input are valid throughout
+    // the synchronous call. Close removes this name without touching others.
+    if unsafe {
+        SetFileInformationByHandle(
+            log.as_raw_handle(),
+            FileDispositionInfoEx,
+            (&disposition as *const FILE_DISPOSITION_INFO_EX).cast(),
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn move_and_delete_log_link(log: &std::fs::File, parent: &std::path::Path) -> std::io::Result<()> {
+    move_and_delete_log_link_with(log, parent, delete_log_link_on_release)
+}
+
+#[cfg(windows)]
+fn move_and_delete_log_link_with(
+    log: &std::fs::File,
+    parent: &std::path::Path,
+    mark_for_deletion: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
+    };
+
+    // Use a full Win32 name with a null RootDirectory. A handle-relative
+    // target was rejected by SetFileInformationByHandle with error 87.
+    let pending = std::fs::canonicalize(parent)?.join(PENDING_LOG_NAME);
+    match std::fs::symlink_metadata(&pending) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "pending daemon log slot is occupied or inaccessible (see Windows install guide): {}",
+                    pending.display()
+                ),
+            ));
+        }
+    }
+    let name: Vec<u16> = pending.as_os_str().encode_wide().collect();
+    // Match the existing Windows namespace rename buffer alignment and include
+    // a terminal NUL for compatibility (the declared byte count excludes it).
+    let bytes = size_of::<FILE_RENAME_INFO>()
+        .max(offset_of!(FILE_RENAME_INFO, FileName) + (name.len() + 1) * 2);
+    let mut buffer = vec![0u64; bytes.div_ceil(size_of::<u64>())];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: the aligned, zeroed, correctly sized allocation and borrowed
+    // live-file handle remain valid until the synchronous operation returns.
+    if unsafe {
+        (*info).Anonymous.ReplaceIfExists = 0;
+        (*info).RootDirectory = std::ptr::null_mut();
+        (*info).FileNameLength = (name.len() * 2) as u32;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
+        SetFileInformationByHandle(
+            log.as_raw_handle(),
+            FileRenameInfo,
+            info.cast(),
+            (buffer.len() * size_of::<u64>()) as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if let Err(error) = mark_for_deletion(log) {
+        // The live name is already free: report rotation so stdio switches to
+        // a fresh file. Do not delete this pathname later without proof of
+        // ownership, including if the process stops between rename and mark.
+        tracing::warn!(
+            path = %pending.display(),
+            %error,
+            "could not mark pending daemon log for deletion; preserved for inspection"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn delete_log_link_on_release(log: &std::fs::File) -> std::io::Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    // SAFETY: same opened link as the rename. Traditional disposition removes
+    // only that moved name once its old writers close.
+    if unsafe {
+        SetFileInformationByHandle(
+            log.as_raw_handle(),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(windows, test))]
+mod windows_rotation_fallback {
+    use super::*;
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{self, Write};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    struct TempLog(PathBuf);
+
+    impl TempLog {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "formless-fallback-{}-{stamp}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn live(&self) -> PathBuf {
+            self.0.join("daemon.log")
+        }
+
+        fn pending(&self) -> PathBuf {
+            self.0.join(PENDING_LOG_NAME)
+        }
+    }
+
+    impl Drop for TempLog {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unsupported(_: &File) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(ERROR_NOT_SUPPORTED as i32))
+    }
+
+    #[test]
+    fn rename_allows_retry_and_release_without_mutating_another_link() {
+        let f = TempLog::new();
+        let live = f.live();
+        let alias = f.0.join("keep.log");
+        fs::write(&live, b"old contents").unwrap();
+        fs::hard_link(&live, &alias).unwrap();
+        let mut writer = OpenOptions::new()
+            .append(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&live)
+            .unwrap();
+
+        discard_live_log_with(&live, unsupported).unwrap();
+        // Model a reopen blocked transiently. Old stdio must remain usable.
+        fs::create_dir(&live).unwrap();
+        assert!(OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&live)
+            .is_err());
+        writer.write_all(b" and old writer").unwrap();
+        writer.flush().unwrap();
+        fs::remove_dir(&live).unwrap();
+        OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&live)
+            .unwrap()
+            .write_all(b"new live")
+            .unwrap();
+        // While the first old writer still pins the pending name, a second
+        // rotation must not replace that slot or disturb the fresh live log.
+        assert!(discard_live_log_with(&live, unsupported).is_err());
+        assert_eq!(fs::read(&live).unwrap(), b"new live");
+        writer.write_all(b" after refused rotation").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert_eq!(
+            fs::read(&alias).unwrap(),
+            b"old contents and old writer after refused rotation"
+        );
+        assert_eq!(
+            fs::symlink_metadata(f.pending()).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+
+        // The same bounded slot is reusable after the old writer closes.
+        let second_writer = OpenOptions::new()
+            .append(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&live)
+            .unwrap();
+        discard_live_log_with(&live, unsupported).unwrap();
+        OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&live)
+            .unwrap()
+            .write_all(b"third live")
+            .unwrap();
+        drop(second_writer);
+        assert_eq!(fs::read(&live).unwrap(), b"third live");
+        assert_eq!(
+            fs::read(&alias).unwrap(),
+            b"old contents and old writer after refused rotation"
+        );
+        assert_eq!(
+            fs::symlink_metadata(f.pending()).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn existing_pending_slot_is_never_replaced_or_deleted() {
+        let f = TempLog::new();
+        fs::write(f.live(), b"old contents").unwrap();
+        fs::write(f.pending(), b"keep the pending data").unwrap();
+
+        let error = discard_live_log_with(&f.live(), unsupported).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(f.live()).unwrap(), b"old contents");
+        assert_eq!(fs::read(f.pending()).unwrap(), b"keep the pending data");
+    }
+
+    #[test]
+    fn deletion_failure_after_move_still_allows_reopen_and_preserves_pending() {
+        let f = TempLog::new();
+        let live = f.live();
+        fs::write(&live, b"old contents").unwrap();
+        let handle = OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&live)
+            .unwrap();
+
+        move_and_delete_log_link_with(&handle, &f.0, |_| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "forced traditional disposition failure",
+            ))
+        })
+        .unwrap();
+        drop(handle);
+        fs::write(&live, b"new live").unwrap();
+        assert_eq!(fs::read(live).unwrap(), b"new live");
+        assert_eq!(fs::read(f.pending()).unwrap(), b"old contents");
+    }
+}
+
+#[cfg(not(windows))]
+fn discard_live_log(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
 /// Enforce retention even below the live size cap, then rotate if needed.
 /// `keep` is bounded to 0..=64; zero discards rotated history.
 pub fn rotate_if_needed(paths: &Paths, max_bytes: u64, keep: usize) -> std::io::Result<bool> {
@@ -204,23 +548,8 @@ pub fn rotate_if_needed(paths: &Paths, max_bytes: u64, keep: usize) -> std::io::
         return Ok(false);
     }
     if keep == 0 {
-        if std::fs::symlink_metadata(&log)?.file_type().is_symlink() {
-            std::fs::remove_file(&log)?;
-            return Ok(true);
-        }
-        #[cfg(windows)]
-        {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&log)?;
-            return Ok(false);
-        }
-        #[cfg(not(windows))]
-        {
-            std::fs::remove_file(&log)?;
-            return Ok(true);
-        }
+        discard_live_log(&log)?;
+        return Ok(true);
     }
     remove_if_present(rotated(paths, keep))?;
     for n in (1..keep).rev() {

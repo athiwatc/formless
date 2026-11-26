@@ -29,31 +29,45 @@ fn logs_rotate_past_the_size_cap_and_keep_a_bounded_history() {
     assert!(!std::path::Path::new(&rotated(3)).exists());
     assert_eq!(log_usage(&paths), 2 * ("round 3 ".len() as u64 + 200));
 
-    // keep = 0 discards history; max = 0 disables size-triggered rotation.
+    // keep = 0 discards the live log; max = 0 disables rotation.
     std::fs::write(&log, "y".repeat(300)).unwrap();
     assert!(!rotate_if_needed(&paths, 0, 2).unwrap());
     let mut open_log = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    assert!(rotate_if_needed(&paths, 100, 0).unwrap());
+    assert!(!log.exists());
+    std::fs::write(&log, b"fresh log").unwrap();
+    open_log.write_all(b"old handle stays valid").unwrap();
+    open_log.flush().unwrap();
+    assert_eq!(std::fs::read(&log).unwrap(), b"fresh log");
+}
 
-    #[cfg(windows)]
-    {
-        assert!(!rotate_if_needed(&paths, 100, 0).unwrap());
-        assert!(log.exists());
-        assert!(std::fs::read(&log).unwrap().is_empty());
-        open_log.write_all(b"after truncation").unwrap();
-        open_log.flush().unwrap();
-        assert_eq!(std::fs::read(&log).unwrap(), b"after truncation");
-    }
+#[test]
+fn zero_retention_unlinks_only_the_live_name_with_an_open_writer() {
+    let f = Fixture::new();
+    let live = f.paths.log_file();
+    let other = f.root.join("retained-by-another-name.log");
+    let contents = b"keep these bytes";
+    std::fs::write(&live, contents).unwrap();
+    std::fs::hard_link(&live, &other).unwrap();
+    let mut writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&live)
+        .unwrap();
 
-    #[cfg(unix)]
-    {
-        assert!(rotate_if_needed(&paths, 100, 0).unwrap());
-        assert!(!log.exists(), "the daemon reopens the unlinked log");
-        open_log.write_all(b"old handle").unwrap();
-        open_log.flush().unwrap();
-        assert!(!log.exists());
-        std::fs::write(&log, b"after reopen").unwrap();
-        assert_eq!(std::fs::read(&log).unwrap(), b"after reopen");
-    }
+    assert!(rotate_if_needed(&f.paths, 1, 0).unwrap());
+    assert_eq!(
+        std::fs::symlink_metadata(&live).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert_eq!(std::fs::read(&other).unwrap(), contents);
+    std::fs::write(&live, b"new log").unwrap();
+    writer.write_all(b" and this old-handle write").unwrap();
+    writer.flush().unwrap();
+    assert_eq!(std::fs::read(&live).unwrap(), b"new log");
+    assert_eq!(
+        std::fs::read(&other).unwrap(),
+        b"keep these bytes and this old-handle write"
+    );
 }
 
 #[cfg(unix)]
@@ -160,17 +174,8 @@ fn retention_reductions_apply_under_cap_and_when_live_rotation_is_disabled() {
         .unwrap()
         .is_empty());
     std::fs::write(f.paths.log_file(), "x".repeat(200)).unwrap();
-    #[cfg(windows)]
-    {
-        assert!(!rotate_if_needed(&f.paths, 100, 0).unwrap());
-        assert!(f.paths.log_file().exists());
-        assert_eq!(std::fs::metadata(f.paths.log_file()).unwrap().len(), 0);
-    }
-    #[cfg(unix)]
-    {
-        assert!(rotate_if_needed(&f.paths, 100, 0).unwrap());
-        assert!(!f.paths.log_file().exists());
-    }
+    assert!(rotate_if_needed(&f.paths, 100, 0).unwrap());
+    assert!(!f.paths.log_file().exists());
     assert_eq!(log_usage(&f.paths), 0);
 }
 
