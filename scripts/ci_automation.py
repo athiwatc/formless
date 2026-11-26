@@ -158,14 +158,19 @@ def pr_write(pr, operation, files, *args):
         if status == "422" and operation == "branch update":
             print(f"GitHub rejected the branch update for pull request #{pr} (HTTP 422); skipping merge.")
             return
-        if status is None and (error.stderr or "").startswith("GraphQL: Resource not accessible"):
+        message = error.stderr or ""
+        workflow_denied = (
+            "refusing to allow a personal access token" in message.lower()
+            and "workflow" in message.lower()
+        )
+        if status is None and (workflow_denied or message.startswith("GraphQL: Resource not accessible")):
             status = "403"
         if status in {"401", "403"}:
             token = "CI_AUTOMERGE_TOKEN" if os.environ.get("CI_AUTOMERGE_TOKEN") else (
                 "GITHUB_TOKEN fallback (CI_AUTOMERGE_TOKEN not configured)"
             )
             permissions = "Contents: write and Pull requests: write"
-            if any(
+            if workflow_denied or any(
                 path.startswith(".github/workflows/")
                 for file in files
                 for path in (file["filename"], file.get("previous_filename", ""))

@@ -206,6 +206,19 @@ class AutomationTests(unittest.TestCase):
                 self.assertIn("Contents: write and Pull requests: write", self.stdout.getvalue())
                 self.assertNotIn("Workflows: write", self.stdout.getvalue())
 
+    def test_graphql_workflow_denial_reports_workflow_permission(self):
+        self.gh.side_effect = subprocess.CalledProcessError(
+            1, "gh", stderr="GraphQL: refusing to allow a Personal Access Token to create or "
+            "update workflow `.github/workflows/ci.yml` without workflow access (mergePullRequest)",
+        )
+        with patch.dict(os.environ, {"CI_AUTOMERGE_TOKEN": "automation-token"}):
+            status = automation.dispatch("merge", REPO, {"workflow_run": self.run})
+
+        self.assertEqual(status, 1)
+        self.assert_merge()
+        self.assertIn("::error::GitHub denied the merge for pull request #42 (HTTP 403)", self.stdout.getvalue())
+        self.assertIn("Workflows: write", self.stdout.getvalue())
+
     def test_partial_rerun_uses_most_recent_result_of_each_job(self):
         self.run["run_attempt"] = 2
         previous = self.jobs[17][0]
