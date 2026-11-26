@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -34,7 +35,9 @@ def gh(*args, write=False):
             env["GH_TOKEN"] = merge_token
         else:
             print("Using GITHUB_TOKEN fallback for this pull request write.", flush=True)
-    return subprocess.check_output(["gh", *args], text=True, env=env)
+    return subprocess.check_output(
+        ["gh", *args], text=True, env=env, stderr=subprocess.PIPE if write else None
+    )
 
 
 def api(path, paginated=False, **params):
@@ -141,26 +144,56 @@ def merge(repo, run):
         return
     pr = current_pr(repo, run)
     if pr is not None:
-        merge_pr(repo, pr, run["head_sha"])
+        return merge_pr(repo, pr, run["head_sha"])
 
 
-def update_branch(repo, pr, sha):
+def pr_write(pr, operation, files, *args):
+    try:
+        gh(*args, write=True)
+    except subprocess.CalledProcessError as error:
+        match = re.match(r"HTTP/\S+ (\d{3})\b", error.output or "") or re.search(
+            r"\bHTTP (\d{3})\b", error.stderr or ""
+        )
+        status = match.group(1) if match else None
+        if status == "422" and operation == "branch update":
+            print(f"GitHub rejected the branch update for pull request #{pr} (HTTP 422); skipping merge.")
+            return
+        if status is None and (error.stderr or "").startswith("GraphQL: Resource not accessible"):
+            status = "403"
+        if status in {"401", "403"}:
+            token = "CI_AUTOMERGE_TOKEN" if os.environ.get("CI_AUTOMERGE_TOKEN") else (
+                "GITHUB_TOKEN fallback (CI_AUTOMERGE_TOKEN not configured)"
+            )
+            permissions = "Contents: write and Pull requests: write"
+            if any(
+                path.startswith(".github/workflows/")
+                for file in files
+                for path in (file["filename"], file.get("previous_filename", ""))
+            ):
+                permissions = "Workflows: write, Contents: write, and Pull requests: write"
+            print(
+                f"::error::GitHub denied the {operation} for pull request #{pr} "
+                f"(HTTP {status}) using {token}. Verify the token is valid, "
+                f"can access this repository, and has {permissions}. Skipping this PR."
+            )
+            return 1
+        if error.stderr:
+            print(error.stderr, file=sys.stderr, end="")
+        raise
+
+
+def update_branch(repo, pr, sha, files):
     print(f"Updating pull request #{pr} from main instead of merging.")
     if not os.environ.get("CI_AUTOMERGE_TOKEN"):
         print(
             "GITHUB_TOKEN updates require manual approval for PR CI. "
             "Approve the workflow runs or configure CI_AUTOMERGE_TOKEN for automatic runs."
         )
-    try:
-        gh(
-            "api", "--include", "--method", "PUT", f"repos/{repo}/pulls/{pr}/update-branch",
-            "-f", f"expected_head_sha={sha}", write=True,
-        )
-    except subprocess.CalledProcessError as error:
-        status = (error.output or "").split(maxsplit=2)
-        if len(status) < 2 or not status[0].startswith("HTTP/") or status[1] != "422":
-            raise
-        print(f"GitHub rejected the branch update for pull request #{pr} (HTTP 422); skipping merge.")
+    return pr_write(
+        pr, "branch update", files,
+        "api", "--include", "--method", "PUT", f"repos/{repo}/pulls/{pr}/update-branch",
+        "-f", f"expected_head_sha={sha}",
+    )
 
 
 def merge_pr(repo, pr, sha):
@@ -194,14 +227,13 @@ def merge_pr(repo, pr, sha):
         for workflow in required
     ) and successful_checks(repo, sha):
         if api(f"repos/{repo}/compare/main...{sha}")["behind_by"] != 0:
-            update_branch(repo, pr, sha)
-            return
+            return update_branch(repo, pr, sha, files)
         if details["mergeable_state"] == "behind":
             return
         print(f"Merging pull request #{pr} at {sha}.")
-        gh(
+        return pr_write(
+            pr, "merge", files,
             "pr", "merge", str(pr), "--merge", "--match-head-commit", sha, "--repo", repo,
-            write=True,
         )
 
 
@@ -209,13 +241,13 @@ def dispatch(operation, repo, event):
     if operation == "retry":
         retry(repo, event["workflow_run"])
     elif "workflow_run" in event:
-        merge(repo, event["workflow_run"])
+        return merge(repo, event["workflow_run"])
     elif event.get("action") == "ready_for_review":
         pr = event["pull_request"]
         if (pr["head"]["repo"] or {}).get("full_name") == repo and pr["base"]["ref"] == "main":
-            merge_pr(repo, pr["number"], pr["head"]["sha"])
+            return merge_pr(repo, pr["number"], pr["head"]["sha"])
 
 
 if __name__ == "__main__":
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-    dispatch(sys.argv[1], os.environ["GITHUB_REPOSITORY"], event)
+    raise SystemExit(dispatch(sys.argv[1], os.environ["GITHUB_REPOSITORY"], event))
