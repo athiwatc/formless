@@ -61,8 +61,8 @@ Main Chat
 ## Harnesses
 
 Integrated adapters use each harness's official local interface and a private,
-per-step MCP bridge back to the topic. Install and sign in to a harness the
-usual way; Formless does not ship or log in to them for you. Availability
+per-step MCP bridge back to the topic. Install each harness and sign in as
+usual; Formless does not bundle harnesses or sign in on your behalf. Availability
 distinguishes installation from sign-in: an unknown sign-in status is not proof
 that a harness is signed in or authenticated.
 
