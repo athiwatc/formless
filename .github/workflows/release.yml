@@ -353,7 +353,8 @@ jobs:
           if command -v apt-get >/dev/null; then
             apt-get update && apt-get install -y ./*.deb
           else
-            dnf install -y ./*.rpm
+            # Rocky's container skips docs by default, including this RPM's LICENSE.
+            dnf --setopt=tsflags= install -y ./*.rpm
           fi
           formless --version
           test -f /usr/share/doc/formless/copyright || test -f /usr/share/licenses/formless/LICENSE

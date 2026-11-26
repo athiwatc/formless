@@ -405,6 +405,17 @@ class ReleasePublication(unittest.TestCase):
                 ).splitlines()
                 self.assertEqual(args, ["test", "--workspace", "--locked", *options])
 
+    def test_rpm_install_smoke_test_includes_documentation(self):
+        for filename, step in (
+            ("release.yml", "Install and run"),
+            ("release-baseline.yml", "Verify, install and smoke (disposable container only)"),
+        ):
+            with self.subTest(workflow=filename):
+                workflow = (ROOT / ".github/workflows" / filename).read_text()
+                install = workflow.split(f"      - name: {step}\n", 1)[1].split("\n      - name:", 1)[0]
+                self.assertIn("dnf --setopt=tsflags= install -y ./*.rpm", install)
+                self.assertIn("test -f /usr/share/licenses/formless/LICENSE", install)
+
     def test_main_prerelease_waits_for_every_platform_without_publishing_stable_channels(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn('  push:\n    branches: [main]\n    tags: ["v*"]', workflow)
