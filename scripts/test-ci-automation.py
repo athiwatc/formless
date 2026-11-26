@@ -169,6 +169,75 @@ class AutomationTests(unittest.TestCase):
         self.assert_update()
         self.assertIn("(HTTP 422); skipping merge.", self.stdout.getvalue())
 
+    def test_update_denied_reports_workflow_token_permission(self):
+        self.files = [{"filename": "docs/ci.md", "previous_filename": ".github/workflows/old.yml"}]
+        self.payloads[f"compare/main...{SHA}"]["behind_by"] = 1
+        self.gh.side_effect = subprocess.CalledProcessError(
+            1, "gh", output="HTTP/2.0 403 Forbidden\n",
+            stderr="gh: Resource not accessible by personal access token (HTTP 403)\n",
+        )
+        with patch.dict(os.environ, {"CI_AUTOMERGE_TOKEN": "automation-token"}):
+            status = automation.dispatch("merge", REPO, {"workflow_run": self.run})
+
+        self.assertEqual(status, 1)
+        self.assert_update()
+        self.assertIn("::error::GitHub denied the branch update for pull request #42 (HTTP 403)", self.stdout.getvalue())
+        self.assertIn("using CI_AUTOMERGE_TOKEN.", self.stdout.getvalue())
+        self.assertIn("Workflows: write", self.stdout.getvalue())
+
+    def test_rate_limit_preserves_github_response_without_permission_hint(self):
+        self.files = [{"filename": ".github/workflows/ci.yml"}]
+        self.payloads[f"compare/main...{SHA}"]["behind_by"] = 1
+        self.gh.side_effect = subprocess.CalledProcessError(
+            1, "gh", output="HTTP/2.0 403 Forbidden\n",
+            stderr="gh: You have exceeded a secondary rate limit (HTTP 403)\nPlease retry later.",
+        )
+        with patch.dict(os.environ, {"CI_AUTOMERGE_TOKEN": "automation-token"}):
+            status = automation.dispatch("merge", REPO, {"workflow_run": self.run})
+
+        self.assertEqual(status, 1)
+        self.assert_update()
+        annotation = next(line for line in self.stdout.getvalue().splitlines() if line.startswith("::error::"))
+        self.assertIn("gh: You have exceeded a secondary rate limit (HTTP 403)%0APlease retry later.", annotation)
+        self.assertNotIn("Verify the token", annotation)
+        self.assertNotIn("Workflows: write", annotation)
+        self.assertNotIn("Pull requests: write", annotation)
+
+    def test_merge_auth_failures_report_token_and_exit_nonzero(self):
+        event = {"action": "ready_for_review", "pull_request": copy.deepcopy(self.pr)}
+        for http, message in (
+            (401, "HTTP 401: Bad credentials (https://api.github.com/graphql)"),
+            (403, "GraphQL: Resource not accessible by personal access token (mergePullRequest)"),
+        ):
+            with self.subTest(http=http):
+                self.gh.reset_mock()
+                self.stdout.truncate(0)
+                self.stdout.seek(0)
+                self.gh.side_effect = subprocess.CalledProcessError(1, "gh", output="", stderr=message)
+                with patch.dict(os.environ, {"CI_AUTOMERGE_TOKEN": "automation-token"}):
+                    status = automation.dispatch("merge", REPO, event)
+
+                self.assertEqual(status, 1)
+                self.assert_merge()
+                self.assertIn(f"::error::GitHub denied the merge for pull request #42 (HTTP {http})", self.stdout.getvalue())
+                self.assertIn("using CI_AUTOMERGE_TOKEN.", self.stdout.getvalue())
+                self.assertIn(message, self.stdout.getvalue())
+                self.assertIn("Contents: write and Pull requests: write", self.stdout.getvalue())
+                self.assertNotIn("Workflows: write", self.stdout.getvalue())
+
+    def test_graphql_workflow_denial_reports_workflow_permission(self):
+        self.gh.side_effect = subprocess.CalledProcessError(
+            1, "gh", stderr="GraphQL: refusing to allow a Personal Access Token to create or "
+            "update workflow `.github/workflows/ci.yml` without workflow access (mergePullRequest)",
+        )
+        with patch.dict(os.environ, {"CI_AUTOMERGE_TOKEN": "automation-token"}):
+            status = automation.dispatch("merge", REPO, {"workflow_run": self.run})
+
+        self.assertEqual(status, 1)
+        self.assert_merge()
+        self.assertIn("::error::GitHub denied the merge for pull request #42 (HTTP 403)", self.stdout.getvalue())
+        self.assertIn("Workflows: write", self.stdout.getvalue())
+
     def test_partial_rerun_uses_most_recent_result_of_each_job(self):
         self.run["run_attempt"] = 2
         previous = self.jobs[17][0]
