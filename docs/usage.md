@@ -104,6 +104,16 @@ On a daemon with topic orchestration, `/main` opens the canonical Main Chat and
 conversations. Terminals at least 110 columns wide show a conversation rail;
 narrower terminals use a picker and breadcrumb.
 
+Use `/main backend` in the terminal, **Main Chat backend** in the desktop or
+relay web Main Chat, or `formless main backend` to inspect the saved choice and
+available backends. **Inherit** keeps the current Session model behavior.
+You can select a configured provider with optional model and reasoning-effort
+overrides, or a daemon-supported local harness. A harness that is not ready
+rejects sends without substituting another backend. Harnesses accept new text
+only (no attachments or steering), receive only the Main Chat transcript,
+and relay questions and permission requests back to you. Topic Chat routing
+does not change.
+
 Use `/topic` to propose moving selected genuine user requests from Main Chat
 into a Topic Chat. A proposal moves nothing until you approve it; work starts
 only after a separate confirmation unless you explicitly approve and start

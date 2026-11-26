@@ -218,6 +218,8 @@
     topics: [],
     mainChat: null,
     topicsAvailable: false,
+    mainBackendSupported: false,
+    mainBackend: null,
     topicsUnsupported: false,
     topicRevision: 0,
     topicFocus: null,
@@ -2422,13 +2424,15 @@
     const attempt = currentTopicAttempt();
     const topic = S.topics.find(item => item.id === S.topicFocus) || topicForSession();
     const pending = S.topics.filter(item => item.source_session_id === S.current && item.status === "pending_approval" && item.id !== topic?.id);
-    root.classList.toggle("hidden", !S.topicsAvailable || !topic && !pending.length);
+    const mainBackend = S.mainBackendSupported && S.mainChat?.id === S.current;
+    root.classList.toggle("hidden", !S.topicsAvailable || !topic && !pending.length && !mainBackend);
     if (!S.topicsAvailable) return;
-    const signature = JSON.stringify([topic, attempt?.id, pending, S.topicBusy, S.topicsError, S.attemptTranscriptError]);
+    const signature = JSON.stringify([topic, attempt?.id, pending, S.topicBusy, S.topicsError, S.attemptTranscriptError, mainBackend, S.mainBackend]);
     if (root.topicSignature === signature) return;
     const control = (label, key, action, primary = false) => h("button", { type: "button", class: "btn small" + (primary ? " primary" : " ghost"),
       disabled: !!S.topicBusy, "data-topic-control": key, onclick: action }, label);
     const children = [];
+    if (mainBackend) children.push(control(S.mainBackend ? "Backend: " + mainBackendLabel(S.mainBackend) : "Main Chat backend", "main-backend", editMainBackend));
     if (topic) {
       children.push(h("div", { class: "topic-summary" }, h("div", { class: "topic-summary-copy" },
         h("div", { class: "topic-eyebrow" }, attempt ? "Harness conversation · read only" : "Topic workflow", topicBadge(topic.status)),
@@ -2508,6 +2512,12 @@
           if (S.channel !== channel || revision !== (S.topicRevision || 0)) return;
           if (!Array.isArray(ping?.features) || !ping.features.includes("topic_orchestration_v2")) {
             throw Object.assign(new Error("Topic orchestration v2 is not supported"), { daemonResponse: true, code: "unsupported" });
+          }
+          S.mainBackendSupported = ping.features.includes("main_chat_backend_v1");
+          S.mainBackend = null;
+          if (S.mainBackendSupported) {
+            await request({ type: "subscribe_main_chat_backend" }).catch(() => {});
+            if (S.channel !== channel || revision !== (S.topicRevision || 0)) return;
           }
         }
         const [main, topics] = await Promise.all([initial ? request({ type: "get_main_chat" }) : S.mainChat, request({ type: "list_topics" })]);
@@ -2634,6 +2644,74 @@
       return options.saveRequest();
     } });
     if (result && S.channel === channel) storeTopic(result);
+  }
+  function mainBackendLabel(backend) {
+    if (backend.kind === "provider") return [backend.name, backend.model, backend.effort].filter(Boolean).join(" · ");
+    if (backend.kind === "harness") return [harnessLabel(backend.harness), backend.acp_agent].filter(Boolean).join(" · ");
+    return "Inherit session model";
+  }
+  async function editMainBackend() {
+    const channel = S.channel;
+    let catalog;
+    try {
+      catalog = await request({ type: "list_main_chat_backends" });
+    } catch (error) {
+      if (channel === S.channel) toast("Could not load Main Chat backends: " + error.message);
+      return;
+    }
+    if (channel !== S.channel || S.current !== S.mainChat?.id) return;
+    const choices = [{ kind: "inherit" }];
+    const select = h("select", { class: "main-backend-select", "aria-label": "Main Chat backend" }, h("option", { value: "0" }, mainBackendLabel(choices[0])));
+    const add = (backend, detail) => {
+      const index = choices.push(backend) - 1;
+      select.append(h("option", { value: String(index) }, mainBackendLabel(backend) + " — " + detail));
+    };
+    for (const provider of catalog.providers) {
+      add({ kind: "provider", name: provider.name }, "Configured model: " + (provider.model || "(enter a model)"));
+    }
+    for (const harness of catalog.harnesses) {
+      const status = !harness.installed ? "Not installed" : harness.signed_in === false ? "Sign in required"
+        : (harness.kind === "acp" ? harness.signed_in == null : !harness.version) ? "Readiness not verified"
+        : harness.signed_in == null ? "Installed; sign-in unknown" : "Ready";
+      add({ kind: "harness", harness: harness.kind, acp_agent: harness.acp_agent ?? null },
+        [status, harness.detail].filter(Boolean).join(" · "));
+    }
+    const selected = catalog.selected;
+    const selectedIndex = choices.findIndex(choice => choice.kind === selected.kind
+      && choice.name === selected.name && choice.harness === selected.harness
+      && (choice.acp_agent ?? null) === (selected.acp_agent ?? null));
+    select.value = String(Math.max(0, selectedIndex));
+    const model = h("input", { type: "text", "aria-label": "Model override", placeholder: "Model override (optional)" });
+    const effort = h("input", { type: "text", "aria-label": "Reasoning effort", placeholder: "Reasoning effort (optional)" });
+    const overrides = h("div", null, model, effort);
+    const update = () => {
+      overrides.hidden = choices[Number(select.value)].kind !== "provider";
+      const saved = Number(select.value) === selectedIndex;
+      model.value = saved ? selected.model || "" : "";
+      effort.value = saved ? selected.effort || "" : "";
+    };
+    select.addEventListener("change", update);
+    update();
+    S.mainBackend = selected;
+    renderTopicContext();
+    const saved = await ask({
+      title: "Main Chat backend",
+      text: "Current: " + mainBackendLabel(selected) + ". Harnesses accept text only and must be ready before sending.",
+      body: h("div", null, select, overrides), ok: "Save backend",
+      saveRequest: () => {
+        if (channel !== S.channel) throw new Error("The daemon connection changed. Reopen the picker.");
+        const backend = { ...choices[Number(select.value)] };
+        if (backend.kind === "provider") {
+          backend.model = model.value.trim() || null;
+          backend.effort = effort.value.trim() || null;
+        }
+        return { type: "set_main_chat_backend", backend };
+      }
+    });
+    if (saved && channel === S.channel) {
+      S.mainBackend = saved;
+      renderTopicContext();
+    }
   }
   async function editTopicContext(topic) {
     const allow = !topic.allow_external_context;
@@ -9618,6 +9696,7 @@
       const already = mentionAttached[sessionKey] || new Set();
       const fresh = [];
       let attachmentError = "";
+      let failedMention;
       for (const path of mentionsIn(text)) {
         if (toolNames.has(path) || already.has(path)) continue;
         if (!S.daemonOnline || !S.channel) {
@@ -9633,6 +9712,14 @@
         } catch (error) {
           if (/^.+:\+?[0-9]+$/.test(path) || !/^no file/.test(error.message)) {
             note("cannot attach @" + path + ": " + error.message, true);
+            if (S.daemonOnline && !/^no file/.test(error.message)) {
+              if (fresh.length) {
+                failedMention = path;
+                break;
+              }
+              saveCurrentDraft(text);
+              return;
+            }
             if (!S.daemonOnline) attachmentError = "File mentions could not be attached while offline; review before sending.";
           }
         }
@@ -9641,7 +9728,10 @@
         await refreshAttachmentInventory(sid, scope);
         if (S.current === sid && scope === S.storageScope) { saveCurrentDraft(input.value); autosize(); renderChips(); }
         else { attachmentDrafts[sessionCacheKey(scope, sid)] = text; saveCurrentDraft(text); }
-        note("This message attaches " + fresh.join(", ") + " (shown above the box; × removes one). Press Send again to send.");
+        const next = failedMention
+          ? " Fix or remove @" + failedMention + " before sending."
+          : " Press Send again to send.";
+        note("This message attaches " + fresh.join(", ") + " (shown above the box; × removes one)." + next);
         return;
       }
       let forecastPending = false;
@@ -9965,7 +10055,7 @@
 
   function onEvent(ev) {
     branchSummaryEvent(ev);
-    if (["settings_changed", "registry_changed", "session_updated", "messages_edited", "compaction_notice", "tool_updated", "tool_deleted", "message_appended", "message_complete", "run_started", "run_finished", "run_paused"].includes(ev.type)) {
+    if (["settings_changed", "registry_changed", "main_chat_backend_changed", "session_updated", "messages_edited", "compaction_notice", "tool_updated", "tool_deleted", "message_appended", "message_complete", "run_started", "run_finished", "run_paused"].includes(ev.type)) {
       forecastRevision++;
       scheduleForecast();
     }
@@ -9975,6 +10065,10 @@
     notifyFor(ev);
     const here = ev.session_id === S.current;
     switch (ev.type) {
+      case "main_chat_backend_changed":
+        S.mainBackend = ev.backend;
+        renderTopicContext();
+        break;
       case "deltas_dropped":
         reconcileDropped(ev);
         break;

@@ -772,6 +772,13 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool, call_label: &str) -
         Event::MessageComplete { .. } => {
             return (*streaming).then(|| end_stream(streaming).to_string());
         }
+        Event::MessageAppended { message, .. }
+            if message.role == "assistant"
+                && message.meta.as_deref().and_then(|meta| serde_json::from_str::<serde_json::Value>(meta).ok())
+                    .is_some_and(|meta| meta["harness"].is_string()) =>
+        {
+            format!("{}Formless: {}", end_stream(streaming), message.content)
+        }
         // Scripted output is never silently wrong (#1096).
         Event::DeltasDropped { .. } => {
             eprintln!("\n[display fell behind: live text, reasoning or progress updates were skipped; final answers remain in the transcript; recorded usage and tool activity are refreshed when affected]");
@@ -1733,6 +1740,23 @@ mod tests {
         assert!(!out.contains("worHello"), "{out}");
         assert!(out.contains("starts again"), "{out}");
         assert!(out.ends_with("Formless: Hello world"), "{out}");
+    }
+
+    #[test]
+    fn events_print_harness_answers_without_streaming() {
+        let message = serde_json::from_value(serde_json::json!({
+            "id":"m", "session_id":"s", "seq":2, "role":"assistant",
+            "content":"harness reply", "created_at":"", "meta":"{\"harness\":\"Claude\"}"
+        }))
+        .unwrap();
+        let appended = Event::MessageAppended {
+            session_id: "s".into(),
+            message,
+        };
+        assert_eq!(
+            format_event(&appended, &mut false, "").as_deref(),
+            Some("Formless: harness reply")
+        );
     }
 
     #[test]

@@ -459,14 +459,14 @@ async fn probe_environment_with_identity(
     };
     base.installed = executable_file(&executable);
     let ctx = ProbeContext {
-        executable,
+        executable: executable.clone(),
         environment: environment.clone(),
         timeout,
     };
     match tokio::time::timeout_at(deadline, dispatch(kind, &ctx, agent)).await {
         Ok(value) => HarnessReadiness {
             availability: value,
-            resolved_executable: None,
+            resolved_executable: Some(executable),
             resolved_executable_argv0: None,
         },
         Err(_) => HarnessReadiness {

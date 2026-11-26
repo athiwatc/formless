@@ -28,6 +28,7 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines`, `--jsonl` | Read or follow the daemon log and rotated files. |
+| `formless main` | `backend [show [--json]\|set inherit\|set provider NAME [--model ID] [--effort LEVEL]\|set harness KIND [--acp-agent NAME]]` | Show or save the active profile's Main Chat backend. The bare `backend` command shows the saved choice and daemon inventory. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit`, `used` | Inspect or change saved user-memory notes. |
@@ -160,13 +161,14 @@ formless sessions subagent exact-subagent-id
 `update --json`, `update check --json`, and `update --check --json` emit one
 object: `{installed, status, newer_releases: [{tag, url, notes}]}`. Notes retain
 the existing trimmed body and oldest-first order; `installed` has no `v` prefix.
-`update_available` means the fetched page contains newer stable releases;
-`up_to_date` means none in that single 50-release response, without pagination.
+The lookup follows GitHub release pages within one 15-second timeout and
+excludes drafts and prereleases. `update_available` means at least one newer
+stable release was found; `up_to_date` means a completed lookup found none.
 `release_check_unavailable` maps to an actual HTTP 404 response,
 not verified absence of releases. Error text alone never selects this status.
 Completed checks exit 0; other fetch or JSON parse failures remain errors with
-no success JSON. Human output stays unchanged, and the JSON form never runs
-an updater.
+no success JSON. The human output format stays unchanged, and the JSON form
+never runs an updater.
 
 `runs --session SESSION --since DURATION [--limit N] [--json]` sends the
 existing Session/time filters to RunMetrics before its newest-N limit. Each

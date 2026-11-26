@@ -1,6 +1,8 @@
 import contextlib
 import copy
 import io
+import os
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -56,6 +58,7 @@ class AutomationTests(unittest.TestCase):
             "actions/runs/17": self.run,
             "actions/workflows/ci.yml/runs": {"workflow_runs": [self.run]},
             "actions/workflows/desktop.yml/runs": {"workflow_runs": [self.desktop]},
+            f"compare/main...{SHA}": {"behind_by": 0},
         }
         api_patch = patch.object(automation, "api", side_effect=self.request)
         api_patch.start()
@@ -63,7 +66,8 @@ class AutomationTests(unittest.TestCase):
         gh_patch = patch.object(automation, "gh")
         self.gh = gh_patch.start()
         self.addCleanup(gh_patch.stop)
-        output = contextlib.redirect_stdout(io.StringIO())
+        self.stdout = io.StringIO()
+        output = contextlib.redirect_stdout(self.stdout)
         output.__enter__()
         self.addCleanup(output.__exit__, None, None, None)
 
@@ -86,7 +90,14 @@ class AutomationTests(unittest.TestCase):
 
     def assert_merge(self):
         self.gh.assert_called_once_with(
-            "pr", "merge", "42", "--merge", "--match-head-commit", SHA, "--repo", REPO
+            "pr", "merge", "42", "--merge", "--match-head-commit", SHA, "--repo", REPO,
+            write=True,
+        )
+
+    def assert_update(self):
+        self.gh.assert_called_once_with(
+            "api", "--include", "--method", "PUT", f"repos/{REPO}/pulls/42/update-branch",
+            "-f", f"expected_head_sha={SHA}", write=True,
         )
 
     def test_retries_only_failed_jobs_on_first_two_current_attempts(self):
@@ -137,6 +148,26 @@ class AutomationTests(unittest.TestCase):
         self.jobs[17].pop()
         automation.merge(REPO, self.run)
         self.gh.assert_not_called()
+
+    def test_behind_pr_is_updated_instead_of_merged(self):
+        self.payloads[f"compare/main...{SHA}"]["behind_by"] = 1
+        with patch.dict(os.environ, {"CI_AUTOMERGE_TOKEN": ""}):
+            for state in ("clean", "behind"):
+                with self.subTest(state=state):
+                    self.gh.reset_mock()
+                    self.pr["mergeable_state"] = state
+                    automation.merge(REPO, self.run)
+                    self.assert_update()
+        self.assertIn("GITHUB_TOKEN updates require manual approval for PR CI.", self.stdout.getvalue())
+
+    def test_rejected_update_never_merges(self):
+        self.payloads[f"compare/main...{SHA}"]["behind_by"] = 1
+        self.gh.side_effect = subprocess.CalledProcessError(
+            1, "gh", output="HTTP/2.0 422 Unprocessable Entity\n"
+        )
+        automation.merge(REPO, self.run)
+        self.assert_update()
+        self.assertIn("(HTTP 422); skipping merge.", self.stdout.getvalue())
 
     def test_partial_rerun_uses_most_recent_result_of_each_job(self):
         self.run["run_attempt"] = 2
@@ -230,6 +261,28 @@ class AutomationTests(unittest.TestCase):
                     automation.merge(REPO, self.run)
                 self.assertEqual(wait.call_count, 4 if change == {"mergeable": None} else 0)
                 self.gh.assert_not_called()
+
+
+class AuthenticationTests(unittest.TestCase):
+    def test_only_pr_writes_use_the_optional_secret(self):
+        for secret in ("automation-token", ""):
+            with self.subTest(secret=bool(secret)):
+                output = io.StringIO()
+                credentials = {"GH_TOKEN": "workflow-token", "CI_AUTOMERGE_TOKEN": secret}
+                with patch.dict(os.environ, credentials), patch.object(subprocess, "check_output") as command:
+                    with contextlib.redirect_stdout(output):
+                        automation.gh("api", "repos/owner/repo")
+                        automation.gh("run", "rerun", "17")
+                        automation.gh("pr", "merge", "42", write=True)
+
+                envs = [call.kwargs["env"] for call in command.call_args_list]
+                self.assertEqual(
+                    [env["GH_TOKEN"] for env in envs],
+                    ["workflow-token", "workflow-token", secret or "workflow-token"],
+                )
+                self.assertTrue(all("CI_AUTOMERGE_TOKEN" not in env for env in envs))
+                self.assertIn("CI_AUTOMERGE_TOKEN" if secret else "GITHUB_TOKEN fallback", output.getvalue())
+                self.assertNotIn(secret or "workflow-token", output.getvalue())
 
 
 if __name__ == "__main__":

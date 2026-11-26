@@ -31,6 +31,54 @@ function setup(names, extra = {}) {
 }
 const json = value => JSON.parse(JSON.stringify(value));
 
+test('Main Chat picker shows readiness and saves the listed provider and overrides', async () => {
+  const calls = [];
+  const h = (type, attrs, ...children) => ({
+    type, attrs, children, value: attrs?.value ?? "", append(child) { this.children.push(child); },
+    addEventListener(event, handler) { this[event] = handler; }
+  });
+  const c = setup(['mainBackendLabel', 'editMainBackend'], {
+    h, harnessLabel: kind => kind,
+    request: async req => {
+      calls.push(json(req));
+      return {
+        selected: { kind: "provider", name: "work", model: "old", effort: null },
+        providers: [{ name: "work", model: "configured" }],
+        harnesses: [{ kind: "claude", installed: false }],
+      };
+    },
+    ask: async opts => {
+      const [select, fields] = opts.body.children;
+      assert.equal(select.value, "1");
+      assert.match(select.children[2].children[0], /Not installed/);
+      assert.equal(fields.children[0].value, "old");
+      fields.children[0].value = " new ";
+      fields.children[1].value = " high ";
+      const req = json(opts.saveRequest());
+      calls.push(req);
+      return req.backend;
+    },
+  });
+  await c.editMainBackend();
+  assert.deepEqual(calls, [{ type: "list_main_chat_backends" },
+    { type: "set_main_chat_backend", backend: { kind: "provider", name: "work", model: "new", effort: "high" } }]);
+  assert.equal(c.S.mainBackend.model, "new");
+});
+
+test('Main Chat backend change from another client updates the open web label', () => {
+  let renders = 0;
+  const c = setup(['onEvent'], {
+    forecastRevision: 0, branchSummaryEvent() {}, scheduleForecast() {}, scheduleEventRender() {}, notifyFor() {},
+    renderTopicContext() { renders++; },
+  });
+  c.S.mainBackend = { kind: 'provider', name: 'alternate' };
+  c.S.current = 'another-session';
+  const backend = { kind: 'harness', harness: 'claude', acp_agent: null };
+  c.onEvent({ type: 'main_chat_backend_changed', backend });
+  assert.deepEqual(json(c.S.mainBackend), backend);
+  assert.equal(renders, 1);
+});
+
 test('main/topic/attempt hierarchy uses Formless transcript IDs, not external harness IDs', () => {
   const c = setup(['topicSessionIds', 'topicForSession', 'currentTopicAttempt']);
   c.S.topics = [topic('running')];

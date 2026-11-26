@@ -72,7 +72,7 @@ Type `/` in the TUI or the web composer; the same commands work in both (a few a
 | `/untag NAME…` | remove tags from this Session |
 | `/cd [PATH]` | show or change this Session's working directory |
 | `/sessions` | list and switch Sessions (T toggles lineage tree) |
-| `/main` | open the canonical Main Chat |
+| `/main [backend]` | open Main Chat or choose its backend |
 | `/topics` | browse Main Chat and topic conversations |
 | `/topic [ID\|start\|cancel\|recover\|retry TOPIC FEATURE\|reject TOPIC REASON\|context TOPIC on/off\|limits TOPIC RETRIES ATTEMPTS\|allow/deny TOPIC PATTERN\|unrule TOPIC RULE\|harnesses]` | propose, review, or manage a Topic Chat |
 | `/fork` | fork the current Session |

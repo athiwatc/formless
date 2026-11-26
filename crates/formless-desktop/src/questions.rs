@@ -69,8 +69,7 @@ impl Open {
         {
             if permission_id.len() > 256
                 || session_id.len() > 256
-                || topic_id.is_empty()
-                || attempt_id.is_empty()
+                || topic_id.is_empty() != attempt_id.is_empty()
                 || topic_id.len() > 256
                 || attempt_id.len() > 256
                 || options.len() > 64
@@ -93,8 +92,8 @@ impl Open {
                 user_only: true,
                 id: permission_id.clone(),
                 session_id: session_id.clone(),
-                topic_id: Some(topic_id.clone()),
-                attempt_id: Some(attempt_id.clone()),
+                topic_id: (!topic_id.is_empty()).then(|| topic_id.clone()),
+                attempt_id: (!attempt_id.is_empty()).then(|| attempt_id.clone()),
                 permission: Some(Permission {
                     topic_id: topic_id.clone(),
                     attempt_id: attempt_id.clone(),
@@ -507,6 +506,24 @@ mod tests {
         answers[0].selected.push("foreign option".into());
         assert!(open.validate_answers(&answers).is_err());
     }
+    #[test]
+    fn main_chat_permission_accepts_both_topic_identifiers_absent() {
+        let mut event = crate::fixture::harness_permission("main-chat");
+        if let Event::HarnessPermissionRequested {
+            topic_id,
+            attempt_id,
+            ..
+        } = &mut event
+        {
+            topic_id.clear();
+            attempt_id.clear();
+        }
+        let open = Open::from_event(&event).unwrap();
+        assert_eq!(open.topic_id, None);
+        assert_eq!(open.attempt_id, None);
+        assert!(open.permission.is_some());
+    }
+
     #[test]
     fn permission_uses_exact_option_ids_even_when_harness_names_collide_and_never_treats_text_as_authority(
     ) {

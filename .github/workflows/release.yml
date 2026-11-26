@@ -1,14 +1,17 @@
 name: release
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 permissions:
   contents: read
+env:
+  RELEASE_ID: ${{ github.ref == 'refs/heads/main' && format('main-{0}', github.sha) || github.ref_name }}
 
 # Never cancel a release halfway through publication.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -83,7 +86,14 @@ jobs:
       - name: Storage before workspace tests
         shell: bash
         run: bash scripts/ci-storage-budget.sh snapshot before-tests
-      - run: cargo test --workspace --locked
+      - if: runner.os != 'Windows'
+        run: cargo test --workspace --locked
+      - name: Windows release smoke tests
+        if: runner.os == 'Windows'
+        run: |
+          cargo test --locked -p formless-core --test windows_pipe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p formless-bin --bin formless cli_help_tests
       - name: Reclaim completed workspace test artifacts
         shell: bash
         run: bash scripts/ci-storage-budget.sh clean-debug
@@ -95,7 +105,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          name="formless-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="formless-${RELEASE_ID}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/formless" "$name/"
           cp README.md SPEC.md LICENSE SECURITY.md "$name/"
@@ -117,7 +127,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "formless-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          $name = "formless-$env:RELEASE_ID-${{ matrix.target }}"
           New-Item -ItemType Directory $name
           Copy-Item "target/${{ matrix.target }}/release/formless.exe" $name
           Copy-Item README.md,SPEC.md,LICENSE,SECURITY.md $name
@@ -206,7 +216,7 @@ jobs:
         run: |
           host="$(rustc -vV | sed -n 's/^host: //p')"
           test "$host" = "$FORMLESS_RELEASE_TARGET"
-          name="formless-${GITHUB_REF_NAME}-${FORMLESS_RELEASE_TARGET}"
+          name="formless-${RELEASE_ID}-${FORMLESS_RELEASE_TARGET}"
           mkdir -p dist "$name"
           cp target/release/formless target/formless.1 README.md SPEC.md LICENSE SECURITY.md "$name/"
           mkdir -p "$name/packaging" "$name/relay" "$name/crates/formless-desktop"
@@ -228,10 +238,20 @@ jobs:
         run: |
           deb_version=()
           rpm_version=()
-          if [[ "$PRERELEASE" == true ]]; then
-            version="${GITHUB_REF_NAME#v}"
-            suffix="${version#*-}"
-            package_version="${version%%-*}~${suffix//-/+}"
+          asset_version=
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            package_id="$(cargo pkgid --locked -p formless-bin)"
+            version="${package_id##*#}"
+            version="${version##*@}"
+            version="${version%%+*}"
+            package_version="${version%%-*}~main.$GITHUB_RUN_NUMBER"
+            asset_version="$RELEASE_ID"
+          elif [[ "$PRERELEASE" == true ]]; then
+            asset_version="${GITHUB_REF_NAME#v}"
+            suffix="${asset_version#*-}"
+            package_version="${asset_version%%-*}~${suffix//-/+}"
+          fi
+          if [[ -n "$asset_version" ]]; then
             deb_version=(--deb-version "$package_version-1")
             rpm_version=(--set-metadata "version=\"$package_version\"")
           fi
@@ -239,11 +259,11 @@ jobs:
           # --output recognizes directories only when they already exist.
           mkdir -p target/generate-rpm
           cargo generate-rpm -p crates/formless --output target/generate-rpm "${rpm_version[@]}"
-          if [[ "$PRERELEASE" == true ]]; then
-            # Use the tag's characters in asset names so checksum sidecars
+          if [[ -n "$asset_version" ]]; then
+            # Use the release ID's characters so checksum sidecars
             # match the downloaded names after GitHub's filename normalization.
-            cp target/debian/*.deb "dist/formless_${version}_amd64.deb"
-            cp target/generate-rpm/*.rpm "dist/formless-${version}.x86_64.rpm"
+            cp target/debian/*.deb "dist/formless_${asset_version}_amd64.deb"
+            cp target/generate-rpm/*.rpm "dist/formless-${asset_version}.x86_64.rpm"
           else
             cp target/debian/*.deb target/generate-rpm/*.rpm dist/
           fi
@@ -633,6 +653,7 @@ jobs:
           fi
           # The login action uses this isolated config in its post step.
           rm -f -- "$DOCKER_PUBLISH_DIR/image.tar"
+
   channel-summary:
     if: always() && startsWith(github.ref, 'refs/tags/v')
     needs: [version-check, publish, docker-publish]
@@ -654,3 +675,101 @@ jobs:
           DOCKER_VERSION: ${{ needs.docker-publish.outputs.version }}
           DOCKER_LATEST: ${{ needs.docker-publish.outputs.latest }}
         run: bash scripts/release-channel-summary.sh "$RELEASE" "$TAP" "$WINGET" "$AUR" "$DOCKER"
+
+  desktop:
+    if: github.ref == 'refs/heads/main'
+    needs: [build, linux]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            cli-artifact: formless-aarch64-apple-darwin
+            archive: tar.gz
+            installer: dmg
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            cli-artifact: formless-x86_64-apple-darwin
+            archive: tar.gz
+            installer: dmg
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            cli-artifact: formless-linux
+            archive: tar.gz
+            installer: deb
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cli-artifact: formless-x86_64-pc-windows-msvc
+            archive: zip
+            installer: exe
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      PACKAGE_TARGET: ${{ matrix.target }}
+      PACKAGE_EXT: ${{ matrix.installer }}
+      CLI_ARCHIVE: ${{ matrix.archive }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          # Match crates/formless-desktop/notices/TOOLCHAIN.json.
+          toolchain: 1.100.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ matrix.cli-artifact }}
+          path: ${{ runner.temp }}/formless-desktop-${{ github.run_attempt }}/cli
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dpkg-dev libdbus-1-dev pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-xinput-dev libxcb-xkb-dev libxcb-cursor-dev libfontconfig1-dev libfreetype6-dev libvulkan-dev
+      - name: Windows installer tooling
+        if: runner.os == 'Windows'
+        run: choco install nsis --yes --no-progress
+      - name: Build locked desktop bundle and native installer
+        env:
+          PACKAGE_DIR: ${{ runner.temp }}/formless-desktop-${{ github.run_attempt }}
+        run: python crates/formless-desktop/scripts/package-preview.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: formless-desktop-${{ matrix.target }}
+          path: ${{ runner.temp }}/formless-desktop-${{ github.run_attempt }}/release/*
+          if-no-files-found: error
+
+  publish-main:
+    if: github.ref == 'refs/heads/main'
+    needs: [build, linux, linux-install-test, desktop]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: assets
+          pattern: formless-*
+          merge-multiple: true
+      - name: Tag the built commit without moving existing tags
+        run: git push origin "HEAD:refs/tags/$RELEASE_ID"
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          tag_name: ${{ env.RELEASE_ID }}
+          name: Formless main (${{ github.sha }})
+          body: Unsigned preview build from main. Desktop installers are not notarized or native-acceptance tested.
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
+          files: |
+            assets/formless-*.tar.gz
+            assets/formless-*.zip
+            assets/formless-*.deb
+            assets/formless-*.rpm
+            assets/formless-desktop-*.dmg
+            assets/formless-desktop-*.exe
+            assets/formless-*.sha256

@@ -3,6 +3,7 @@ mod cli_attach;
 mod cli_commands;
 #[cfg(test)]
 mod cli_help_tests;
+mod cli_main_chat;
 mod cli_mcp_prompts;
 mod cli_mcp_test;
 mod cli_metrics;
@@ -264,6 +265,14 @@ enum Cmd {
         /// Print one JSON object per selected entry (snapshot only)
         #[arg(long, conflicts_with = "follow")]
         jsonl: bool,
+    },
+    /// Configure the backend for the profile's canonical Main Chat
+    #[command(
+        after_help = "Examples:\n  formless main backend show\n  formless main backend set inherit"
+    )]
+    Main {
+        #[command(subcommand)]
+        action: cli_main_chat::Action,
     },
     /// Print the man page (roff), for packaging: `formless man > formless.1`
     #[command(hide = true)]
@@ -541,7 +550,7 @@ enum Cmd {
     },
     /// Check for a newer release, show what changed, and how to upgrade
     #[command(
-        after_help = "Examples:\n  formless update check\n  formless update --check\n  formless update check --json\n\nJSON: {installed, status, newer_releases: [{tag, url, notes}]}. Status is update_available, up_to_date (within the fetched page), or release_check_unavailable (HTTP 404 status). Checks never execute an updater."
+        after_help = "Examples:\n  formless update check\n  formless update --check\n  formless update check --json\n\nJSON: {installed, status, newer_releases: [{tag, url, notes}]}. Status is update_available (newer stable release found), up_to_date (no newer stable release after checking all pages), or release_check_unavailable (HTTP 404 status). Checks never execute an updater."
     )]
     Update {
         #[command(subcommand)]
@@ -2574,6 +2583,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Modules { action }) => cli_modules::run(&paths, action),
+        Some(Cmd::Main { action }) => cli_main_chat::run(&paths, action),
         Some(Cmd::Memory { action }) => memory_cmd(paths, action),
         Some(Cmd::Runs {
             limit,
@@ -3074,7 +3084,7 @@ fn update_cmd(check: bool, json: bool) -> Result<()> {
         json,
         env!("CARGO_PKG_VERSION"),
         upgrade_command(),
-        || update_http::get("https://api.github.com/repos/athiwatc/formless/releases?per_page=50"),
+        update_http::get_releases,
     )
 }
 

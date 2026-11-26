@@ -1030,8 +1030,44 @@ task, with quality as a gate**.
 
 ### 5.2 Run lifecycle
 
-The singleton Main Chat answers everyday questions in place. For an explicit
-request to organize work, the Main or Topic Chat assistant can call
+The singleton Main Chat answers everyday questions in place. A profile's
+Main Chat backend is persisted separately from the Session model. It defaults
+to `inherit`, preserving normal Session model, Role and provider resolution.
+An explicit provider selects the configured default or a configured named
+provider, with optional model and reasoning-effort overrides. A harness
+selection must identify an entry in the daemon's supported Main Chat harness
+inventory; ACP profiles without a supported read-only mode are not offered.
+The picker displays readiness; a send to an unready harness fails without
+falling back. A harness receives only a bounded Main Chat transcript and runs
+in a private scratch working directory with read-only adapter settings, no
+Topic MCP bridge, and no access to Topic Chat context through Formless.
+Questions and permission requests go to the human. Harness-backed Main Chat
+rejects attachments, steering, and provider spending limits; it accepts new
+text messages. Topic Chats and their step-harness choices are unaffected.
+Daemons supporting this setting advertise `main_chat_backend_v1` and expose
+`get_main_chat_backend`, `list_main_chat_backends`, and `set_main_chat_backend`.
+The get request has no arguments and returns the selected backend object.
+The list request has no arguments and returns an object with `selected`
+(the backend object), `providers` (entries with `name` and configured `model`),
+and `harnesses` (supported harness availability entries, including readiness
+details). The setter takes `{"type":"set_main_chat_backend","backend":...}`
+and returns the saved backend object, not the inventory. Backend objects are:
+
+- `{"kind":"inherit"}`
+- `{"kind":"provider","name":"default","model":null,"effort":null}` (use
+  `default` or a configured provider name; omit or set either override to null
+  to use its configured value)
+- `{"kind":"harness","harness":"claude","acp_agent":null}` (use a harness
+  listed by the daemon; specify a listed agent for `"harness":"acp"`)
+
+Clients that support the event opt in with `{"type":"subscribe_main_chat_backend"}`
+on each connection after seeing `main_chat_backend_v1` in the daemon's feature
+list. The reply is `{"subscribed":true}`. A successful setter broadcasts
+`main_chat_backend_changed` with the saved `backend` to those connections,
+regardless of their Session filters.
+
+For an explicit request to organize work, the provider-backed Main or Topic
+Chat assistant can call
 `read_topic_context` for recent persisted user messages, the working directory,
 and the topic hierarchy. Work can be in any domain. A proposal can name a
 workspace or use scratch space. An outline reflects only stated or standing
@@ -5467,6 +5503,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines`, `--jsonl` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
+| `formless main` | `backend [show\|set]` | Inspect or select the provider or harness for Main Chat. |
 | `formless memory` | `list`, `add`, `rm`, `edit`, `used` | Inspect or change saved user-memory notes. |
 | `formless models` | `list [--json]` | Fetch the default-provider model catalog and existing picker report; a non-null listing error prints a partial report and exits 1. |
 | `formless modules` | `list`, `show`; `show --version N` | Read all modules, inspect metadata/history/dependents, or emit an exact stored source version. |
@@ -5592,13 +5629,14 @@ formless sessions subagent exact-subagent-id
 `update --json`, `update check --json`, and `update --check --json` emit one
 object: `{installed, status, newer_releases: [{tag, url, notes}]}`. Notes retain
 the existing trimmed body and oldest-first order; `installed` has no `v` prefix.
-`update_available` means the fetched page contains newer stable releases;
-`up_to_date` means none in that single 50-release response, without pagination.
+The lookup follows GitHub release pages within one 15-second timeout and
+excludes drafts and prereleases. `update_available` means at least one newer
+stable release was found; `up_to_date` means a completed lookup found none.
 `release_check_unavailable` maps to an actual HTTP 404 response,
 not verified absence of releases. Error text alone never selects this status.
 Completed checks exit 0; other fetch or JSON parse failures remain errors with
-no success JSON. Human output stays unchanged, and the JSON form never runs
-an updater.
+no success JSON. The human output format stays unchanged, and the JSON form
+never runs an updater.
 
 ### Root and global flags
 
