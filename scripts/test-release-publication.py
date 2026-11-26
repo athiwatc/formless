@@ -384,6 +384,27 @@ class ReleasePublication(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$")
 
+    def test_linux_release_uses_hosted_containers_and_limits_gemm_override_to_arm_tests(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        linux = workflow.split("\n  linux:\n", 1)[1].split("\n  linux-install-test:\n", 1)[0]
+        install = workflow.split("\n  linux-install-test:\n", 1)[1].split("\n  docker:", 1)[0]
+        self.assertIn("os: ubuntu-24.04\n            target: x86_64-unknown-linux-gnu", linux)
+        self.assertIn("os: ubuntu-24.04-arm\n            target: aarch64-unknown-linux-gnu", linux)
+        self.assertIn("container: rust:1-bullseye", linux)
+        self.assertIn("runs-on: ubuntu-24.04\n    container: ${{ matrix.image }}", install)
+
+        step = linux.split("      - name: Workspace tests\n", 1)[1].split("\n      - ", 1)[0]
+        run = dedent(step.split("        run: |\n", 1)[1])
+        for arch, options in (("X64", []), ("ARM64", ["--config", "profile.test.package.gemm-f16.opt-level=3"])):
+            with self.subTest(arch=arch):
+                args = subprocess.check_output(
+                    ["bash", "-e", "-c", "cargo() { printf '%s\\n' \"$@\"; }\n" + run],
+                    env={**os.environ, "RUNNER_ARCH": arch},
+                    text=True,
+                    timeout=5,
+                ).splitlines()
+                self.assertEqual(args, ["test", "--workspace", "--locked", *options])
+
     def test_main_prerelease_waits_for_every_platform_without_publishing_stable_channels(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn('  push:\n    branches: [main]\n    tags: ["v*"]', workflow)
