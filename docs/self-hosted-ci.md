@@ -12,11 +12,17 @@ checks remain restricted to main, and the cold baseline remains manual on main.
 | Desktop | `ubuntu-latest`, `macos-latest`, `windows-latest` |
 | release-baseline | `ubuntu-24.04`, `macos-15`, `macos-15-intel`, `windows-latest` |
 
-The separate release workflow still uses self-hosted Linux x64, Apple Silicon
-and Intel Mac runners for its existing jobs. Its hosted Windows and Linux arm64
-jobs, trigger conditions and publishing setup are unchanged. A release can
-queue if a required self-hosted runner is offline. Do not use a personal
-self-hosted runner for untrusted contributions to this public repository.
+In the release workflow, the Linux x64 CLI build and native package install
+tests run in containers on GitHub-hosted `ubuntu-24.04`. The Linux ARM64 CLI
+build runs on `ubuntu-24.04-arm`, and the Windows CLI build and preview desktop
+packaging jobs also use hosted runners. The preview release publishing job
+runs on `ubuntu-24.04`.
+
+The release preflight and the version-tag Docker build, release publishing,
+Docker publishing, and channel summary jobs still use self-hosted Linux x64.
+The macOS CLI builds still use self-hosted Apple Silicon and Intel Macs. A
+release can queue if a required self-hosted runner is offline. Do not use a
+personal self-hosted runner for untrusted contributions to this public repository.
 
 ## Linux relay browser checks
 
@@ -39,8 +45,9 @@ Playwright installs Chromium and its required Linux system libraries.
 
 No current PR workflow intentionally targets self-hosted runners. Do not
 approve unreviewed changes to workflows that could target a persistent runner.
-Release builds accept version tags and manual main dispatches; publication
-remains tag-only. Review source and workflow changes before merging or tagging.
+Release builds accept version tags, pushes to main, and manual main dispatches.
+Main builds publish previews; stable distribution remains tag-only. Review
+source and workflow changes before merging or tagging.
 Runner registrations, branch protection, and host permissions are not changed.
 
 ## Pipeline behavior
