@@ -158,10 +158,11 @@ def pr_write(pr, operation, files, *args):
         if status == "422" and operation == "branch update":
             print(f"GitHub rejected the branch update for pull request #{pr} (HTTP 422); skipping merge.")
             return
-        message = error.stderr or ""
+        message = (error.stderr or "").strip()
+        normalized_message = message.lower()
         workflow_denied = (
-            "refusing to allow a personal access token" in message.lower()
-            and "workflow" in message.lower()
+            "refusing to allow a personal access token" in normalized_message
+            and "workflow" in normalized_message
         )
         if status is None and (workflow_denied or message.startswith("GraphQL: Resource not accessible")):
             status = "403"
@@ -169,17 +170,21 @@ def pr_write(pr, operation, files, *args):
             token = "CI_AUTOMERGE_TOKEN" if os.environ.get("CI_AUTOMERGE_TOKEN") else (
                 "GITHUB_TOKEN fallback (CI_AUTOMERGE_TOKEN not configured)"
             )
-            permissions = "Contents: write and Pull requests: write"
-            if workflow_denied or any(
-                path.startswith(".github/workflows/")
-                for file in files
-                for path in (file["filename"], file.get("previous_filename", ""))
-            ):
-                permissions = "Workflows: write, Contents: write, and Pull requests: write"
+            hint = ""
+            if not re.search(r"rate[\s-]+limit", normalized_message):
+                permissions = "Contents: write and Pull requests: write"
+                if workflow_denied or any(
+                    path.startswith(".github/workflows/")
+                    for file in files
+                    for path in (file["filename"], file.get("previous_filename", ""))
+                ):
+                    permissions = "Workflows: write, Contents: write, and Pull requests: write"
+                hint = f" Verify the token is valid, can access this repository, and has {permissions}."
+            response = message or (error.output or "").split("\n", 1)[0]
+            response = response.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
             print(
                 f"::error::GitHub denied the {operation} for pull request #{pr} "
-                f"(HTTP {status}) using {token}. Verify the token is valid, "
-                f"can access this repository, and has {permissions}. Skipping this PR."
+                f"(HTTP {status}) using {token}.{hint} Skipping this PR. GitHub response: {response}"
             )
             return 1
         if error.stderr:
