@@ -349,7 +349,8 @@ jobs:
                 rpm -qp "--$script_query" ./*.rpm > "$INSTALL_FIXTURES/rpm-$script_query"
                 test ! -s "$INSTALL_FIXTURES/rpm-$script_query"
               done
-              dnf install -y ./*.rpm
+              # Rocky's container skips docs by default, including this RPM's LICENSE.
+              dnf --setopt=tsflags= install -y ./*.rpm
             fi
             formless --version
             test -f /usr/share/doc/formless/copyright || test -f /usr/share/licenses/formless/LICENSE
