@@ -1,7 +1,7 @@
 //! Skills (SPEC §7.10): SKILL.md parsing, installs from a folder, a zip and
 //! git, versioning, trust (installed disabled) and safe file reads.
 
-use formless_core::skills::{has_scripts, install, parse_skill_md, read_file};
+use formless_core::skills::{has_scripts, install, parse_skill_md, read_file, validate_name};
 use formless_core::{Paths, Store};
 
 struct Fixture(std::path::PathBuf);
@@ -54,18 +54,26 @@ fn skill_md_frontmatter_is_parsed_and_validated() {
     );
     assert!(parse_skill_md("no frontmatter").is_err());
     assert!(parse_skill_md("---\nname: Bad Name\ndescription: x\n---\n").is_err());
+    assert!(parse_skill_md("---anything\nname: ok\ndescription: x\n---\n").is_err());
+    assert!(parse_skill_md("---\nname: ok\ndescription: x\n---anything\n").is_err());
     assert!(
         parse_skill_md("---\nname: ok\n---\nbody").is_err(),
         "description required"
     );
+    let literal = parse_skill_md(
+        "---\nname: pdf-tools\ndescription: |\n  before\n  ---\n  after\n---\n# Body",
+    )
+    .unwrap();
+    assert_eq!(literal.description, "before\n---\nafter\n");
+    assert_eq!(literal.body, "# Body");
     assert!(has_scripts(&["scripts/run.sh".into()]) && !has_scripts(&["SKILL.md".into()]));
 }
 
 #[test]
-fn skill_scalar_quotes_preserve_literal_text_and_decode_complete_pairs() {
+fn skill_scalar_quotes_follow_yaml_semantics() {
     for (value, expected) in [
         (r#"say "hello""#, r#"say "hello""#),
-        (r#""hi" there"#, r#""hi" there"#),
+        (r#"hi" there"#, r#"hi" there"#),
         ("users'", "users'"),
         (r#""Work with PDFs""#, "Work with PDFs"),
         (r#""say \"hi\"""#, r#"say "hi""#),
@@ -78,11 +86,203 @@ fn skill_scalar_quotes_preserve_literal_text_and_decode_complete_pairs() {
         assert_eq!(meta.description, expected, "{value}");
         assert_eq!(meta.body, "# Body\n");
     }
+    assert!(parse_skill_md("---\nname: pdf-tools\ndescription: \"hi\" there\n---\n").is_err());
     let meta = parse_skill_md(
         "---\nname: pdf-tools\ndescription: |-\n  \"literal quoted block\"\n---\nBody",
     )
     .unwrap();
     assert_eq!(meta.description, "\"literal quoted block\"");
+}
+
+#[test]
+fn skill_frontmatter_follows_yaml_scalar_semantics() {
+    for (indicator, expected) in [
+        ("|", "First\nSecond\n"),
+        ("|-", "First\nSecond"),
+        ("|+", "First\nSecond\n"),
+        ("|2", "First\nSecond\n"),
+        ("|2-", "First\nSecond"),
+        ("|-2", "First\nSecond"),
+        ("|+2", "First\nSecond\n"),
+        ("|2+", "First\nSecond\n"),
+        (">", "First Second\n"),
+        (">-", "First Second"),
+        (">+", "First Second\n"),
+        ("> # note", "First Second\n"),
+        (">2-", "First Second"),
+        (">-2", "First Second"),
+        (">+2", "First Second\n"),
+        (">2+", "First Second\n"),
+    ] {
+        let source =
+            format!("---\nname: pdf-tools\ndescription: {indicator}\n  First\n  Second\n---\nBody");
+        assert_eq!(
+            parse_skill_md(&source).unwrap().description,
+            expected,
+            "{indicator}"
+        );
+    }
+    let kept =
+        parse_skill_md("---\nname: pdf-tools\ndescription: |+\n  First\n\n---\nBody").unwrap();
+    assert_eq!(kept.description, "First\n\n");
+    let folded_kept =
+        parse_skill_md("---\nname: pdf-tools\ndescription: >+\n  First\n\n---\nBody").unwrap();
+    assert_eq!(folded_kept.description, "First\n\n");
+
+    let plain = parse_skill_md(
+        "---\nname: pdf-tools\ndescription: Work with PDFs\n  across multiple lines.\n---\nBody",
+    )
+    .unwrap();
+    assert_eq!(plain.description, "Work with PDFs across multiple lines.");
+
+    let escaped =
+        parse_skill_md("---\nname: pdf-tools\ndescription: \"Say: \\\"hi\\\"\\nnext\"\n---\nBody")
+            .unwrap();
+    assert_eq!(escaped.description, "Say: \"hi\"\nnext");
+    let yaml_escape =
+        parse_skill_md("---\nname: pdf-tools\ndescription: \"Letter: \\x41\"\n---\nBody").unwrap();
+    assert_eq!(yaml_escape.description, "Letter: A");
+
+    let crlf =
+        parse_skill_md("---\r\nname: pdf-tools\r\ndescription: CRLF fences\r\n---\r\n# Body\r\n")
+            .unwrap();
+    assert_eq!(crlf.description, "CRLF fences");
+    assert_eq!(crlf.body, "# Body\r\n");
+
+    let quoted_colon_key = parse_skill_md(
+        "---\n':anything': ignored\nname: pdf-tools\ndescription: quoted key\n---\nBody",
+    )
+    .unwrap();
+    assert_eq!(quoted_colon_key.name, "pdf-tools");
+
+    let example = parse_skill_md(
+        "---\nname: expense-report\ndescription: File and validate reports.\nlicense: Apache-2.0\ncompatibility: Requires python3\nmetadata:\n  author: example-org\n  version: \"2.1\"\nallowed-tools: Bash(git status:*)\n---\n# Expense reports",
+    )
+    .unwrap();
+    assert_eq!(example.name, "expense-report");
+    assert_eq!(example.description, "File and validate reports.");
+}
+
+#[test]
+fn skill_frontmatter_errors_name_duplicate_keys_and_source_lines() {
+    for (key, line, source) in [
+        (
+            "name",
+            3,
+            "---\nname: first\nname: second\ndescription: d\n---\nBody",
+        ),
+        (
+            "description",
+            4,
+            "---\nname: skill\ndescription: first\ndescription: second\n---\nBody",
+        ),
+        (
+            "license",
+            5,
+            "---\nname: skill\ndescription: d\nlicense: MIT\nlicense: Apache-2.0\n---\nBody",
+        ),
+    ] {
+        let error = parse_skill_md(source).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("duplicate frontmatter key '{key}'")),
+            "{error}"
+        );
+        assert!(error.contains(&format!("on line {line}")), "{error}");
+    }
+
+    let error = parse_skill_md(
+        "---\nname: skill\ndescription: \"first line\nlicense: scalar text\ncontinues\"\nlicense: MIT\nlicense: Apache-2.0\n---\nBody",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("duplicate frontmatter key 'license'"),
+        "{error}"
+    );
+    assert!(error.contains("on line 7"), "{error}");
+
+    let error = parse_skill_md("---\nname: skill\ndescription: [unterminated\n---\nBody")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("on line 3"), "{error}");
+}
+
+#[test]
+fn skill_frontmatter_field_errors_include_source_lines() {
+    for (source, line) in [
+        ("---\nname: Bad Name\ndescription: d\n---\nBody", 2),
+        ("---\nname: skill\ndescription: \"\"\n---\nBody", 3),
+        ("---\ndescription: d\n---\nBody", 3),
+        ("---\nname: skill\n---\nBody", 3),
+        ("---\nname: 42\ndescription: d\n---\nBody", 2),
+        ("---\nname: true\ndescription: d\n---\nBody", 2),
+        ("---\nname: null\ndescription: d\n---\nBody", 2),
+        ("---\nname: skill\ndescription: 42\n---\nBody", 3),
+        ("---\nname: skill\ndescription: false\n---\nBody", 3),
+        ("---\nname: skill\ndescription: null\n---\nBody", 3),
+    ] {
+        let error = parse_skill_md(source).unwrap_err().to_string();
+        assert!(error.contains(&format!("line {line}")), "{error}");
+    }
+
+    let too_long = format!(
+        "---\nname: skill\ndescription: {}\n---\nBody",
+        "d".repeat(1025)
+    );
+    let error = parse_skill_md(&too_long).unwrap_err().to_string();
+    assert!(error.contains("line 3"), "{error}");
+
+    let indented =
+        parse_skill_md("---\n# Root comment\n  name: skill\n  description: d\n---\nBody").unwrap();
+    assert_eq!(indented.name, "skill");
+    let error =
+        parse_skill_md("---\n# Root comment\n  name: Bad Name\n  description: d\n---\nBody")
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("on line 3"), "{error}");
+}
+
+#[test]
+fn skill_names_follow_agent_skills_rules_and_match_source_directory() {
+    for name in ["-leading", "trailing-", "double--hyphen"] {
+        assert!(validate_name(name).is_err(), "{name}");
+    }
+    for name in ["pdf-tools", "a", "a-1"] {
+        validate_name(name).unwrap();
+    }
+    let too_long = "d".repeat(1025);
+    assert!(parse_skill_md(&format!(
+        "---\nname: skill\ndescription: {too_long}\n---\nBody"
+    ))
+    .is_err());
+
+    let (_fixture, paths) = temp_paths("skill-name-directory");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let src = paths.data_dir.join("src/directory-name");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("SKILL.md"),
+        "---\nname: metadata-name\ndescription: d\n---\nBody",
+    )
+    .unwrap();
+    let error = install(&paths, &store, src.to_str().unwrap(), None, None, "user")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("metadata-name"), "{error}");
+    assert!(error.contains("directory-name"), "{error}");
+    assert!(store.list_skills().unwrap().is_empty());
+
+    let text = "---\nname: metadata-name\ndescription: d\n---\nBody";
+    let info = formless_core::skills::install_text(&paths, &store, text, "auto", "auto").unwrap();
+    assert_eq!(info.name, "metadata-name");
+
+    let bundle = formless_core::skills::export(&store, "metadata-name").unwrap();
+    let (_other_fixture, other_paths) = temp_paths("skill-name-bundle");
+    let other_store = Store::open(&other_paths.db_file()).unwrap();
+    let staged = formless_core::skills::prepare_bundle(&other_paths, &bundle).unwrap();
+    let imported =
+        formless_core::skills::commit(&other_paths, &other_store, &staged, "import").unwrap();
+    assert_eq!(imported.name, "metadata-name");
 }
 
 #[test]
@@ -115,7 +315,7 @@ fn skill_scalar_comments_leave_quoted_hashes_and_block_content_intact() {
 fn skill_scalar_metadata_survives_disabled_installation() {
     let (_fixture, paths) = temp_paths("skill-scalars");
     let store = Store::open(&paths.db_file()).unwrap();
-    let src = paths.data_dir.join("src/skill");
+    let src = paths.data_dir.join("src/pdf-tools");
     std::fs::create_dir_all(&src).unwrap();
     let source="---\nname: pdf-tools # primary\ndescription: \"say \\\"hi\\\"\" # annotation\n---\n# Body\n";
     std::fs::write(src.join("SKILL.md"), source).unwrap();
@@ -131,7 +331,7 @@ fn skill_scalar_metadata_survives_disabled_installation() {
 fn skills_install_from_folder_zip_and_git_and_version() {
     let (_fixture, paths) = temp_paths("skills");
     let store = Store::open(&paths.db_file()).unwrap();
-    let src = paths.data_dir.join("src/report");
+    let src = paths.data_dir.join("src/report-writer");
     write_skill(&src, "report-writer", "Step 1: read the sheet.");
 
     let v1 = install(&paths, &store, src.to_str().unwrap(), None, None, "user").unwrap();
@@ -154,11 +354,11 @@ fn skills_install_from_folder_zip_and_git_and_version() {
     // A zip that wraps the skill in a folder: a new version, disabled again.
     write_skill(&src, "report-writer", "Step 1: read the sheet carefully.");
     let zip = paths.data_dir.join("report.zip");
-    let report = paths.data_dir.join("src/report");
+    let report = paths.data_dir.join("src/report-writer");
     let mut entries = Vec::new();
     for rel in formless_core::skills::files(&report).unwrap() {
         entries.push((
-            format!("report/{rel}"),
+            format!("report-writer/{rel}"),
             std::fs::read(report.join(&rel)).unwrap(),
         ));
     }
@@ -170,10 +370,47 @@ fn skills_install_from_folder_zip_and_git_and_version() {
         std::fs::read_to_string(src.join("SKILL.md")).unwrap(),
         "zip install must contain the updated version's actual files"
     );
+    let mismatched_entries = entries
+        .iter()
+        .map(|(path, bytes)| {
+            (
+                path.replacen("report-writer/", "wrong-wrapper/", 1),
+                bytes.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mismatched_zip = paths.data_dir.join("mismatched.zip");
+    write_zip(&mismatched_zip, &mismatched_entries);
+    let error = install(
+        &paths,
+        &store,
+        mismatched_zip.to_str().unwrap(),
+        None,
+        None,
+        "user",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("report-writer"), "{error}");
+    assert!(error.contains("wrong-wrapper"), "{error}");
+    assert_eq!(
+        store.get_skill("report-writer").unwrap().unwrap().version,
+        2
+    );
 
     // git (a local bare repo stands in for a URL), with a subdir.
     let repo = paths.data_dir.join("work");
     write_skill(&repo.join("skills/git-skill"), "git-skill", "From git.");
+    write_skill(
+        &repo.join("skills/wrong-directory"),
+        "git-skill",
+        "Wrong directory.",
+    );
+    write_skill(
+        &repo.join("container/nested-skill"),
+        "nested-skill",
+        "From a nested directory.",
+    );
     let git = |args: &[&str], dir: &std::path::Path| {
         let output = std::process::Command::new("git")
             .args(args)
@@ -244,7 +481,21 @@ fn skills_install_from_folder_zip_and_git_and_version() {
         read_file(&store, "git-skill", "scripts/fix.py").unwrap(),
         "print('hi')"
     );
-    assert_eq!(store.list_skills().unwrap().len(), 2);
+    let nested = install(&paths, &store, &source, Some("container"), None, "user").unwrap();
+    assert_eq!(nested.name, "nested-skill");
+    let error = install(
+        &paths,
+        &store,
+        &source,
+        Some("skills/wrong-directory"),
+        None,
+        "user",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("git-skill"), "{error}");
+    assert!(error.contains("wrong-directory"), "{error}");
+    assert_eq!(store.list_skills().unwrap().len(), 3);
     // Removing deletes rows; files are the caller's to delete.
     assert!(!store.remove_skill("git-skill").unwrap().is_empty());
     assert!(store.get_skill("git-skill").unwrap().is_none());
@@ -256,7 +507,7 @@ async fn skills_are_managed_through_the_daemon() {
     use std::sync::Arc;
     let (_fixture, paths) = temp_paths("skillsd");
     formless_core::Config::default().save(&paths).unwrap();
-    let src = paths.data_dir.join("src/notes");
+    let src = paths.data_dir.join("src/note-taker");
     write_skill(&src, "note-taker", "Write notes.");
     let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
     let info = daemon
@@ -271,6 +522,11 @@ async fn skills_are_managed_through_the_daemon() {
         (info["name"].as_str(), info["enabled"].as_bool()),
         (Some("note-taker"), Some(false))
     );
+    std::fs::write(
+        paths.data_dir.join("skills/note-taker/v1/SKILL.md"),
+        "---\nname: note-taker\ndescription: \"hi\" there\n---\nWrite notes.\n",
+    )
+    .unwrap();
     let got = daemon
         .handle(Request::GetSkill {
             name: "note-taker".into(),
@@ -313,7 +569,7 @@ async fn the_agent_loads_enabled_skills() {
     let (_fixture, paths) = temp_paths("loadskill");
     formless_core::Config::default().save(&paths).unwrap();
     let store = Store::open(&paths.db_file()).unwrap();
-    let src = paths.data_dir.join("src/report");
+    let src = paths.data_dir.join("src/report-writer");
     write_skill(&src, "report-writer", "Step 1: read the sheet.");
     install(&paths, &store, src.to_str().unwrap(), None, None, "user").unwrap();
     let session = store.create_session(None).unwrap().id;
@@ -328,6 +584,11 @@ async fn the_agent_loads_enabled_skills() {
         "disabled skills stay closed: {off}"
     );
     store.set_skill_enabled("report-writer", true).unwrap();
+    std::fs::write(
+        paths.data_dir.join("skills/report-writer/v1/SKILL.md"),
+        "---\nname: report-writer\ndescription: \"hi\" there\n---\nStep 1: read the sheet.\n",
+    )
+    .unwrap();
     let loaded: serde_json::Value = serde_json::from_str(
         &call("load_skill", serde_json::json!({"name": "report-writer"})).await,
     )
@@ -414,10 +675,11 @@ async fn the_agent_loads_enabled_skills() {
 
 #[test]
 fn skills_export_and_import_bundles() {
+    use base64::Engine;
     use formless_core::skills::{commit, export, prepare_bundle};
     let (_fixture, paths) = temp_paths("skbundle");
     let store = Store::open(&paths.db_file()).unwrap();
-    let src = paths.data_dir.join("src/report");
+    let src = paths.data_dir.join("src/report-writer");
     write_skill(&src, "report-writer", "Step 1: read the sheet.");
     install(&paths, &store, src.to_str().unwrap(), None, None, "user").unwrap();
     store.set_skill_enabled("report-writer", true).unwrap();
@@ -444,6 +706,22 @@ fn skills_export_and_import_bundles() {
         "print('hi')"
     );
 
+    let mut invalid_bundle = bundle.clone();
+    let skill_file = invalid_bundle["files"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|file| file["path"] == "SKILL.md")
+        .unwrap();
+    skill_file["content_b64"] = base64::engine::general_purpose::STANDARD
+        .encode("---\nname: report-writer\ndescription: \"hi\" there\n---\nBody\n")
+        .into();
+    let error = prepare_bundle(&other, &invalid_bundle)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("on line 3"), "{error}");
+
     // Paths that leave the folder are refused.
     let mut evil = bundle.clone();
     evil["files"][0]["path"] = "../escape.md".into();
@@ -453,6 +731,14 @@ fn skills_export_and_import_bundles() {
 #[test]
 fn distilled_skills_parse_and_install_as_auto() {
     use formless_core::skills::{distil_input, install_text, parse_distilled};
+    let example = formless_core::skills::DISTIL_PROMPT
+        .split_once("Reply with the SKILL.md only, in this exact form:\n")
+        .unwrap()
+        .1
+        .split_once("\nRules:\n")
+        .unwrap()
+        .0;
+    assert!(parse_skill_md(example).is_ok());
     assert!(parse_distilled("NONE").is_none());
     assert!(parse_distilled("Sure! here is a skill").is_none());
     let reply = "```markdown\n---\nname: csv-cleanup\ndescription: Clean a CSV before analysis.\n---\n# CSV cleanup\n## Steps\n1. Read it.\n```";
@@ -719,7 +1005,7 @@ fn hostile_skill_zips_are_refused_and_leave_nothing() {
 }
 
 #[test]
-fn local_skill_directory_with_git_suffix_is_copied_as_a_folder() {
+fn local_skill_directory_with_git_suffix_is_not_treated_as_a_git_url() {
     let (_fixture, paths) = temp_paths("skill-git-name");
     let store = Store::open(&paths.db_file()).unwrap();
     let src = paths.data_dir.join("vendor/notes.git");
@@ -730,9 +1016,12 @@ fn local_skill_directory_with_git_suffix_is_copied_as_a_folder() {
         src.to_string_lossy().into_owned(),
         format!("{}/", src.display()),
     ] {
-        let info = install(&paths, &store, &source, None, None, "user").unwrap();
-        assert_eq!(info.name, "git-named-folder");
-        assert_eq!(info.description, "Turn spreadsheets into tidy reports.");
-        assert!(!info.enabled);
+        let error = install(&paths, &store, &source, None, None, "user")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not match source directory 'notes.git'"),
+            "{error}"
+        );
     }
 }
