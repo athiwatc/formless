@@ -277,15 +277,18 @@ async fn exercise_step_handoff(
     future_reader: bool,
     choice: formless_desktop::step_decision::Choice,
 ) {
+    use formless_desktop::step_decision::{Choice, Outcome, Status};
+
+    const TOOL: &str = "desktop_native_step_fixture";
     let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let fixture=Fixture::start(app(axum::routing::post({let requests=requests.clone();move|| {
         let number=requests.fetch_add(1,std::sync::atomic::Ordering::SeqCst)+1;
         async move {
             let gate=Arc::new(Notify::new());gate.notify_one();
             match number {
-                1=>gated_response(prefix("Review this missing fixture Tool. "),Some(encode(&[
+                1=>gated_response(prefix("Review this fixture Tool. "),Some(encode(&[
                     json!({"type":"content_block_stop","index":0}),
-                    json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"step-call","name":"no_such_step_fixture_tool"}}),
+                    json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"step-call","name":TOOL}}),
                     json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
                     json!({"type":"content_block_stop","index":1}),
                     json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":10}}),json!({"type":"message_stop"})
@@ -295,6 +298,22 @@ async fn exercise_step_handoff(
             }
         }
     }})),0).await;
+    let created = fixture
+        .daemon
+        .call_tool_direct(
+            &fixture.session,
+            "create_tool",
+            json!({
+                "name": TOOL,
+                "description": "Private Step review fixture",
+                "input_schema": {"type": "object", "properties": {"native": {"type": "string"}}},
+                "output_schema": {},
+                "implementation_js": "function run(input) { return input; }",
+                "capabilities": []
+            }),
+        )
+        .await;
+    assert!(created.contains("\"created\""), "{created}");
     let client = if future_reader {
         Client::start_future_attempts_for_validation(fixture.endpoint.clone())
     } else {
@@ -405,33 +424,62 @@ async fn exercise_step_handoff(
             .is_err(),
         "pending choice cannot be resubmitted"
     );
-    wait(&mut observer, |event| {
-        matches!(event, Event::RunFinished { .. })
-    })
-    .await;
-    future_cases::canonical(&restored, "Tool gate finished. Done 😀", &[]).await;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if matches!(
-            restored.step_status(),
-            formless_desktop::step_decision::Status::Finished {
-                outcome: formless_desktop::step_decision::Outcome::Accepted,
-                ..
-            }
-        ) {
+        let status = restored.step_status();
+        if let Status::Finished { outcome, .. } = status {
+            assert_eq!(outcome, Outcome::Accepted, "native Step receipt");
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "native Step receipt deadline: {:?}",
-            restored.step_status()
+            "native Step receipt deadline: {status:?}"
         );
-        restored.drain().for_each(drop);
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    wait(&mut observer, |event| {
+        matches!(event, Event::RunFinished { .. })
+    })
+    .await;
+    let arguments: Vec<Value> = observer
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ToolCallStarted {
+                tool_name,
+                arguments,
+                ..
+            } if tool_name == TOOL => Some(serde_json::from_str(arguments).unwrap()),
+            _ => None,
+        })
+        .collect();
+    let expected = match &choice {
+        Choice::Continue | Choice::All => vec![json!({})],
+        Choice::Skip => vec![],
+        Choice::Edit(_) => vec![json!({"native": "ไทย"})],
+    };
+    assert_eq!(arguments, expected);
+    let completed: Vec<_> = observer
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ToolCallFinished { tool_name, ok, .. } if tool_name == TOOL => Some(*ok),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        completed,
+        if matches!(choice, Choice::Skip) {
+            &[][..]
+        } else {
+            &[true]
+        },
+        "fixture Tool outcomes for {choice:?}"
+    );
+    future_cases::canonical(&restored, "Tool gate finished. Done 😀", &[]).await;
     assert_eq!(
         snapshot(&mut observer, &fixture.session).await["step_mode"],
-        !matches!(choice, formless_desktop::step_decision::Choice::All)
+        !matches!(choice, Choice::All)
     );
     until(&restored,"step-resolved-client-inventory",|update| {
         matches!(step_inventory(&update),Some(formless_desktop::steps::Inventory::Snapshot(s)) if s.prompts.is_empty() && !s.more)
