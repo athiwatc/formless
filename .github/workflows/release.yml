@@ -160,7 +160,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: [self-hosted, Linux, X64]
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact: formless-linux
             packages: true
@@ -199,7 +199,15 @@ jobs:
       - name: Storage before workspace tests
         shell: bash
         run: bash scripts/ci-storage-budget.sh snapshot before-tests
-      - run: cargo test --workspace --locked
+      - name: Workspace tests
+        shell: bash
+        run: |
+          test_profile=()
+          if [[ "$RUNNER_ARCH" == ARM64 ]]; then
+            # Inline gemm's FP16 asm into feature-enabled kernels without raising the CPU baseline.
+            test_profile=(--config 'profile.test.package.gemm-f16.opt-level=3')
+          fi
+          cargo test --workspace --locked "${test_profile[@]}"
       - name: Reclaim completed workspace test artifacts
         shell: bash
         run: bash scripts/ci-storage-budget.sh clean-debug
@@ -321,7 +329,7 @@ jobs:
       fail-fast: false
       matrix:
         image: ["debian:bookworm", "ubuntu:22.04", "rockylinux:9"]
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
     steps:
       - name: Record runner workspace owner before container writes
