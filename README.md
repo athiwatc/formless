@@ -82,17 +82,20 @@ sandbox; the isolated worktree or directory is the boundary.
 
 ## Install
 
-```bash
-# macOS / Linux — latest release, checksum-verified
-curl -fsSL https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
+Build from source with Rust stable, Cargo, and a C compiler. On Linux, also
+install `pkg-config` and the D-Bus development headers. See the
+[build requirements](docs/usage.md#requirements) for details.
 
-formless   # starts the daemon and opens the setup wizard
-```
+Install with `cargo install --git https://github.com/athiwatc/formless --locked formless-bin`,
+then run `formless` to start the daemon and open the setup wizard.
 
-Other ways in: build from source with `cargo install --git https://github.com/athiwatc/formless --locked formless-bin`,
-use the `.deb`/`.rpm` from a [release](https://github.com/athiwatc/formless/releases),
-run the daemon in [Docker](docs/docker.md), or follow the [Windows guide](docs/windows-install.md).
+If [GitHub Releases](https://github.com/athiwatc/formless/releases) has a matching
+asset for your platform, see the [macOS/Linux install guide](docs/usage.md#install)
+for the [installer script](https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh)
+and packages, or see the [Windows ZIP guide](docs/windows-install.md). For a
+headless setup without a published release, [build the Docker image from source](docs/docker.md#building-it-yourself)
+and use `formless` as the local image name.
+
 The wizard needs a model endpoint with tool calling: OpenAI-compatible Chat
 Completions or Responses, or native Anthropic Messages. Ollama and LM Studio
 work locally without a key. Full details are in [Using Formless](docs/usage.md).
