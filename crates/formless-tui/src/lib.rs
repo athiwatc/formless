@@ -1338,6 +1338,8 @@ struct PendingStep {
     step_id: String,
     tool_name: String,
     arguments: String,
+    /// The last edit sent, kept so a rejected edit can be fixed and resent.
+    draft: Option<String>,
     index: usize,
     count: usize,
 }
@@ -2515,13 +2517,18 @@ impl App {
 
     /// Answer the call waiting in step mode.
     fn step_decide(&mut self, action: &str, arguments: Option<String>) {
-        let Some(step) = self.step.clone() else {
+        let Some(step_id) = self.step.as_mut().map(|step| {
+            if action == "edit" {
+                step.draft = arguments.clone();
+            }
+            step.step_id.clone()
+        }) else {
             return;
         };
         self.request(
             Pending::StepDecision,
             Request::StepDecision {
-                step_id: step.step_id,
+                step_id,
                 action: action.into(),
                 arguments,
             },
@@ -6247,6 +6254,7 @@ impl App {
                         step_id,
                         tool_name,
                         arguments,
+                        draft: None,
                         index,
                         count,
                     });
@@ -7457,9 +7465,8 @@ impl App {
             return;
         }
         if self.editing_step {
-            let text = self.input.take();
             self.editing_step = false;
-            self.step_decide("edit", Some(text.trim().to_string()));
+            self.step_decide("edit", Some(text));
             return;
         }
         if let Some(message_id) = self.editing_id.take() {
@@ -12274,7 +12281,7 @@ impl App {
                     let args = self
                         .step
                         .as_ref()
-                        .map(|s| pretty_json(&s.arguments))
+                        .map(|s| pretty_json(s.draft.as_deref().unwrap_or(&s.arguments)))
                         .unwrap_or_default();
                     self.input.set(&args);
                     self.editing_step = true;
@@ -20921,6 +20928,42 @@ mod tests {
             "memory fixture [project:test\\u{202e}, off] note\\r\\n\\u{1b}\\u{9b} · agent\\u{9b}"
         );
     }
+
+    #[test]
+    fn rejected_step_edit_preserves_draft_for_retry() {
+        let mut app = test_app();
+        app.step = Some(PendingStep {
+            step_id: "step-1".into(),
+            tool_name: "echo".into(),
+            arguments: r#"{"value":1}"#.into(),
+            draft: None,
+            index: 0,
+            count: 1,
+        });
+
+        let draft = r#"{"value":"invalid"}"#;
+        app.step_decide("edit", Some(draft.into()));
+        assert_eq!(
+            app.step.as_ref().unwrap().arguments,
+            r#"{"value":1}"#,
+            "the preview keeps the arguments Enter runs"
+        );
+
+        app.input.clear();
+        app.key(key(KeyCode::Char('e')));
+        assert_eq!(app.input.expanded(), pretty_json(draft));
+
+        let corrected = r#"{"value":2}"#;
+        app.input.set(corrected);
+        app.key(key(KeyCode::Enter));
+        assert!(!app.editing_step);
+        assert_eq!(
+            app.step.as_ref().unwrap().draft.as_deref(),
+            Some(corrected),
+            "Enter in the step editor sends the typed arguments"
+        );
+    }
+
     include!("hunk_tests.rs");
     include!("run_file_coverage_tests.rs");
     include!("invocation_progress_tests.rs");

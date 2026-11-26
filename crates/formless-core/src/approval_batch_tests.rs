@@ -97,8 +97,8 @@ async fn interleaved_same_session_prepasses_and_direct_call_keep_owned_batches()
         let ca = CancellationToken::new();
         let cb = CancellationToken::new();
         let cd = CancellationToken::new();
-        let first = daemon.approve_calls(&cfg, &session, "same-run", &a, &ca);
-        let second = daemon.approve_calls(&cfg, &session, "same-run", &b, &cb);
+        let first = daemon.approve_calls(&cfg, &session, "same-run", &a, None, &ca);
+        let second = daemon.approve_calls(&cfg, &session, "same-run", &b, None, &cb);
         tokio::pin!(first, second);
         assert!(futures_util::poll!(&mut first).is_pending());
         let (a1, ab1) = requested(&mut events);
@@ -223,7 +223,7 @@ async fn cwd_change_during_approval_keeps_prompt_and_dispatch_on_prepared_scope(
             },
         ];
         let cancel = CancellationToken::new();
-        let approval = daemon.approve_calls(&cfg, &session, "fixture", &calls, &cancel);
+        let approval = daemon.approve_calls(&cfg, &session, "fixture", &calls, None, &cancel);
         tokio::pin!(approval);
         assert!(futures_util::poll!(&mut approval).is_pending());
         let (first, batch) = requested(&mut events);
@@ -275,6 +275,115 @@ async fn cwd_change_during_approval_keeps_prompt_and_dispatch_on_prepared_scope(
                     ServerMessage::Event(Event::ApprovalRequested { .. })
                 ),
                 "prepared calls were already approved for their exact scope"
+            );
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn skipped_calls_are_excluded_without_skipping_executable_approvals() {
+    let _env = crate::credential_env::EnvGuard::isolated();
+    let root = std::env::temp_dir().join(format!("fl-step-approval-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("project")).unwrap();
+    let project = root.join("project").canonicalize().unwrap();
+    let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+    let mut cfg = Config::default();
+    cfg.security.secure = true;
+    cfg.security.trusted_paths.clear();
+    cfg.tools.approval_summaries = false;
+    cfg.save(&paths).unwrap();
+    {
+        let daemon = Arc::new(Daemon::new(paths).unwrap());
+        let caps = Capabilities::parse(&["fs:write:$input.path".into()]).unwrap();
+        let session = daemon
+            .with_store(|store| {
+                store.create_tool_version(
+                    "step_writer",
+                    "fixture",
+                    r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#,
+                    "{}",
+                    "function run(i) { return true; }",
+                    &caps,
+                    64,
+                    "user",
+                )?;
+                let session = store.create_session(None)?.id;
+                store.set_session_cwd(&session, project.to_str())?;
+                Ok(session)
+            })
+            .unwrap();
+        let (tx, mut events) = mpsc::channel(64);
+        daemon.subs.locked().push(Subscriber {
+            conn: 969,
+            tx: tx.into(),
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: CancellationToken::new(),
+            gaps: BTreeMap::new(),
+        });
+        let call = |id: &str, leaf: &str| ToolCall {
+            id: id.into(),
+            name: "step_writer".into(),
+            arguments: json!({"path": project.join(leaf)}).to_string(),
+        };
+        let calls = [
+            call("skipped", "skipped.txt"),
+            call("first", "first.txt"),
+            call("second", "second.txt"),
+        ];
+        let skipped = HashSet::from(["skipped".to_string()]);
+        let cancel = CancellationToken::new();
+        let approval =
+            daemon.approve_calls(&cfg, &session, "fixture", &calls, Some(&skipped), &cancel);
+        tokio::pin!(approval);
+        assert!(futures_util::poll!(&mut approval).is_pending());
+        let (first_id, first_batch) = requested(&mut events);
+        let first_batch = first_batch.unwrap();
+        assert_eq!(first_batch.index, 1);
+        assert_eq!(
+            first_batch
+                .calls
+                .iter()
+                .map(|call| call.capabilities.clone())
+                .collect::<Vec<_>>(),
+            [
+                vec![format!("fs:write:{}", project.join("first.txt").display())],
+                vec![format!("fs:write:{}", project.join("second.txt").display())],
+            ]
+        );
+        assert_eq!(
+            first_batch
+                .calls
+                .iter()
+                .map(|call| call.new_capabilities.clone())
+                .collect::<Vec<_>>(),
+            [
+                vec![format!("fs:write:{}", project.join("first.txt").display())],
+                vec![format!("fs:write:{}", project.join("second.txt").display())],
+            ]
+        );
+        approve(&daemon, first_id).await;
+        assert!(futures_util::poll!(&mut approval).is_pending());
+        let (second_id, second_batch) = requested(&mut events);
+        assert_eq!(
+            second_batch,
+            Some(ApprovalBatch {
+                index: 2,
+                ..first_batch
+            })
+        );
+        approve(&daemon, second_id).await;
+        let (denied, prepared) = approval.await.unwrap();
+        assert!(denied.is_empty());
+        assert_eq!(prepared.len(), calls.len());
+        assert_eq!(prepared[0].arguments, calls[0].arguments);
+        while let Ok(message) = events.try_recv() {
+            assert!(
+                !matches!(
+                    message,
+                    ServerMessage::Event(Event::ApprovalRequested { .. })
+                ),
+                "only executable calls require approval"
             );
         }
     }

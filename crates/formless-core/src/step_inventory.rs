@@ -339,6 +339,21 @@ mod tests {
     async fn reconnect_snapshot_recovers_identity_and_resolved_authority_is_removed() {
         let _env = crate::credential_env::EnvGuard::isolated();
         let f = Fixture::new();
+        f.daemon
+            .with_store(|store| {
+                store.create_tool_version(
+                    "fixture-read",
+                    "Fixture read",
+                    r#"{"type":"object"}"#,
+                    r#"{}"#,
+                    "",
+                    &Capabilities::default(),
+                    64,
+                    "test",
+                )?;
+                Ok(())
+            })
+            .unwrap();
         let mut events = f.subscribe();
         let task = f.start(CancellationToken::new());
         let id = pending(&mut events).await;

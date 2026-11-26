@@ -4,7 +4,7 @@ use formless_runtime::LockExt as _;
 use formless_runtime::{Capabilities, ExecErrorKind, ExecRequest, HostMode, HostOps};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -5464,16 +5464,28 @@ impl Daemon {
                         "action must be continue, skip, edit or all",
                     )));
                 }
-                if action == "edit" {
+                let arguments = if action == "edit" {
                     let a = arguments.as_deref().unwrap_or_default();
-                    let v: Value = serde_json::from_str(a)
-                        .context("edited arguments must be a JSON object")?;
+                    let mut v: Value = serde_json::from_str(a).map_err(|error| {
+                        RequestFailure::invalid(format!(
+                            "edited arguments must be a JSON object: {error}"
+                        ))
+                    })?;
                     if !v.is_object() {
                         return Err(anyhow::Error::new(RequestFailure::invalid(
                             "edited arguments must be a JSON object",
                         )));
                     }
-                }
+                    let submitted = v.clone();
+                    self.validate_step_edit(&step_id, &mut v)?;
+                    if v == submitted {
+                        arguments
+                    } else {
+                        Some(v.to_string())
+                    }
+                } else {
+                    arguments
+                };
                 let tx = self
                     .step_waiters
                     .lock()
@@ -6895,8 +6907,13 @@ impl Daemon {
         let producer = crate::routing_task_observation::Producer(task.clone());
         crate::routing_task_observation::scope(
             task,
-            self.clone()
-                .run_loop_inner(session_id, run_id, cancel, cancel_flag, steer_rx),
+            Box::pin(self.clone().run_loop_inner(
+                session_id,
+                run_id,
+                cancel,
+                cancel_flag,
+                steer_rx,
+            )),
         )
         .await;
         drop(producer);
@@ -8487,7 +8504,14 @@ impl Daemon {
                 bail!("interrupted");
             }
             let (denied, approved_calls) = self
-                .approve_calls(&cfg, session_id, run_id, &result.tool_calls, cancel)
+                .approve_calls(
+                    &cfg,
+                    session_id,
+                    run_id,
+                    &result.tool_calls,
+                    Some(&skipped),
+                    cancel,
+                )
                 .await?;
             if cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst) {
                 bail!("interrupted");
@@ -8830,6 +8854,59 @@ impl Daemon {
     /// Step mode (SPEC §5.9): before a step's calls run, ask about each
     /// one. Edited arguments replace the call's; returns the ids of the
     /// calls to skip. Without a connected client it does not wait.
+    fn validate_step_edit(&self, step_id: &str, input: &mut Value) -> Result<()> {
+        let (session_id, tool_name) = self
+            .step_waiters
+            .lock()
+            .unwrap()
+            .get(step_id)
+            .map(|waiter| {
+                (
+                    waiter.prompt.session_id.clone(),
+                    waiter.prompt.tool_name.clone(),
+                )
+            })
+            .context(RequestFailure::not_found("that step is no longer waiting"))?;
+        let (schema, caps) = match toolreg::builtin_schema(&tool_name) {
+            Some(schema) => (schema, None),
+            None => {
+                let Some((_, version)) =
+                    self.with_store(|store| store.get_tool_by_name(&tool_name))?
+                else {
+                    return Err(anyhow::Error::new(RequestFailure::invalid(format!(
+                        "tool '{tool_name}' no longer exists"
+                    ))));
+                };
+                let schema = serde_json::from_str(&version.input_schema).map_err(|error| {
+                    RequestFailure::invalid(format!("tool has invalid input schema: {error}"))
+                })?;
+                let caps = Capabilities::parse(&version.capabilities).map_err(|error| {
+                    RequestFailure::invalid(format!("tool has invalid capabilities: {error}"))
+                })?;
+                (schema, Some(caps))
+            }
+        };
+        let validator = toolreg::compile_schema(&schema).map_err(|error| {
+            RequestFailure::invalid(format!("tool has invalid input schema: {error}"))
+        })?;
+        toolreg::coerce_json_strings(&schema, input);
+        if let Some(caps) = caps {
+            let cwd = self
+                .session_cwd(&session_id)
+                .map(std::path::PathBuf::from)
+                .map(Ok)
+                .unwrap_or_else(std::env::current_dir)?;
+            let mut normalized = input.clone();
+            if caps.absolutize_inputs(&mut normalized, &cwd).is_ok() {
+                *input = normalized;
+            }
+        }
+        toolreg::validate_against(&validator, input).map_err(|error| {
+            RequestFailure::invalid(format!("input failed schema validation: {error}"))
+        })?;
+        Ok(())
+    }
+
     async fn step_gate(
         &self,
         session_id: &str,
@@ -8910,6 +8987,7 @@ impl Daemon {
         session_id: &str,
         run_id: &str,
         calls: &[ToolCall],
+        skipped_ids: Option<&HashSet<String>>,
         cancel: &CancellationToken,
     ) -> Result<(HashMap<String, bool>, Vec<ToolCall>)> {
         if cancel.is_cancelled() {
@@ -8925,7 +9003,9 @@ impl Daemon {
             .unwrap_or_else(std::env::current_dir)?;
         let mut prepared = calls.to_vec();
         for call in &mut prepared {
-            if toolreg::is_builtin(&call.name) {
+            if skipped_ids.is_some_and(|ids| ids.contains(&call.id))
+                || toolreg::is_builtin(&call.name)
+            {
                 continue;
             }
             let Some((_, ver)) = self.with_store(|st| st.get_tool_by_name(&call.name))? else {
@@ -8950,7 +9030,8 @@ impl Daemon {
         let mut denied: HashMap<String, bool> = HashMap::new();
         // Several held calls in one batch: each prompt lists them all
         // (SPEC §5.2), and each is still answered on its own.
-        let batch = approval_batch::Batch::new(self.held_calls(cfg, session_id, calls)?);
+        let batch =
+            approval_batch::Batch::new(self.held_calls(cfg, session_id, calls, skipped_ids)?);
         self.approve_each(
             cfg,
             session_id,
@@ -8959,6 +9040,7 @@ impl Daemon {
             cancel,
             &mut denied,
             batch.as_ref(),
+            skipped_ids,
         )
         .await?;
         Ok((denied, prepared))
@@ -9075,10 +9157,12 @@ impl Daemon {
         cfg: &Config,
         session_id: &str,
         calls: &[ToolCall],
+        skipped_ids: Option<&HashSet<String>>,
     ) -> Result<Vec<(usize, String, HeldCall)>> {
         let mut held = Vec::new();
         for (ordinal, tc) in calls.iter().enumerate() {
-            if toolreg::is_builtin(&tc.name) {
+            if skipped_ids.is_some_and(|ids| ids.contains(&tc.id)) || toolreg::is_builtin(&tc.name)
+            {
                 continue;
             }
             let Some((info, ver)) = self.with_store(|st| st.get_tool_by_name(&tc.name))? else {
@@ -9176,12 +9260,14 @@ impl Daemon {
         cancel: &CancellationToken,
         denied: &mut HashMap<String, bool>,
         batch: Option<&approval_batch::Batch>,
+        skipped_ids: Option<&HashSet<String>>,
     ) -> Result<()> {
         for (ordinal, tc) in calls.iter().enumerate() {
             if cancel.is_cancelled() {
                 bail!("interrupted");
             }
-            if toolreg::is_builtin(&tc.name) {
+            if skipped_ids.is_some_and(|ids| ids.contains(&tc.id)) || toolreg::is_builtin(&tc.name)
+            {
                 continue;
             }
             if let Some((info, ver)) = self.with_store(|st| st.get_tool_by_name(&tc.name))? {
@@ -10173,6 +10259,7 @@ impl Daemon {
                 session_id,
                 "direct",
                 std::slice::from_ref(&tc),
+                None,
                 &cancel,
             )
             .await
@@ -11741,7 +11828,7 @@ impl Daemon {
                         continue;
                     }
                     let (denied, approved_calls) = self
-                        .approve_calls(cfg, session_id, run_id, &result.tool_calls, cancel)
+                        .approve_calls(cfg, session_id, run_id, &result.tool_calls, None, cancel)
                         .await?;
                     let mut stuck = None;
                         let mut correction_batch = CorrectionBatch::default();
@@ -19540,7 +19627,10 @@ mod trust_precedence_tests {
             arguments: "{}".into(),
         };
         assert!(
-            daemon.held_calls(&cfg, &sid, &[call]).unwrap().is_empty(),
+            daemon
+                .held_calls(&cfg, &sid, &[call], None)
+                .unwrap()
+                .is_empty(),
             "a trusted call is never listed as held"
         );
         // With a stored grant too, the grant is the basis: no trusted audit.
