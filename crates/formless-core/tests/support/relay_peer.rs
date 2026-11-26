@@ -5,15 +5,23 @@
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 const CHUNK: usize = 64 * 1024;
 const WIRE: usize = CHUNK + 1024;
 const NATIVE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+struct UpProgress {
+    index: usize,
+    total: usize,
+    sent_at: Instant,
+}
+
 pub struct RoomPeer {
     ws: WebSocketStream<tokio::net::TcpStream>,
     clients: HashMap<String, String>,
     pending: VecDeque<Value>,
-    up: HashSet<String>,
+    up: HashMap<String, UpProgress>,
+    last_up_ack: Option<Instant>,
     down: HashMap<String, (String, usize, usize, String)>,
     sequence: u64,
     pub biggest: usize,
@@ -30,7 +38,8 @@ impl RoomPeer {
             ws,
             clients: HashMap::new(),
             pending: VecDeque::new(),
-            up: HashSet::new(),
+            up: HashMap::new(),
+            last_up_ack: None,
             down: HashMap::new(),
             sequence: 0,
             biggest: 0,
@@ -125,12 +134,18 @@ impl RoomPeer {
                         self.pump().await;
                     }
                     let id = format!("{:032x}", self.sequence + 1);
+                    let total = f.len().div_ceil(CHUNK);
                     for (index, data) in f.as_bytes().chunks(CHUNK).enumerate() {
                         while self.up.len() >= 8 {
                             self.pump().await;
                         }
                         let receipt = self.receipt();
-                        assert!(self.up.insert(receipt.clone()));
+                        let progress = UpProgress {
+                            index,
+                            total,
+                            sent_at: Instant::now(),
+                        };
+                        assert!(self.up.insert(receipt.clone(), progress).is_none());
                         let data = std::str::from_utf8(data).unwrap();
                         self.wire(json!({"relay":"delivery","cid":cid,"g":g,"receipt":receipt,"fragment":{"relay":"data","v":1,"id":id,"index":index,"bytes":f.len(),"data":data}})).await;
                     }
@@ -148,8 +163,14 @@ impl RoomPeer {
         let message = tokio::time::timeout(wait, self.ws.next())
             .await
             .unwrap_or_else(|_| {
+                let pending_up: Vec<_> = self
+                    .up
+                    .values()
+                    .map(|progress| (progress.index, progress.total, progress.sent_at.elapsed()))
+                    .collect();
+                let last_up_ack_ago = self.last_up_ack.map(|at| at.elapsed());
                 panic!(
-                    "private relay peer timed out during {phase}: wait={wait:?}, UP receipts={}, DOWN fragments={}, outstanding DOWN grants={}",
+                    "private relay peer timed out during {phase}: wait={wait:?}, UP receipts={}, UP pending (zero-based index, fragment count, age)={pending_up:?}, last UP ACK age={last_up_ack_ago:?}, DOWN fragments={}, outstanding DOWN grants={}",
                     self.up.len(),
                     self.down_fragments,
                     self.permits.len()
@@ -168,9 +189,10 @@ impl RoomPeer {
             }
             Some("ack") => {
                 assert!(
-                    self.up.remove(frame["receipt"].as_str().unwrap()),
+                    self.up.remove(frame["receipt"].as_str().unwrap()).is_some(),
                     "unknown/replayed UP receipt"
                 );
+                self.last_up_ack = Some(Instant::now());
             }
             Some("ready") => {
                 let cid = frame["cid"].as_str().unwrap();
