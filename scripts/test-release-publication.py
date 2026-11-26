@@ -8,12 +8,16 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
+import sys
+import tarfile
 import tempfile
 from textwrap import dedent
 import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("release_image", ROOT / "scripts/push-release-image.py")
@@ -146,11 +150,15 @@ class ReleasePublication(unittest.TestCase):
             (root / "target/generate-rpm/fixture.rpm").touch()
             (root / "bin/dpkg").write_text("#!/bin/sh\nexit 0\n")
             (root / "bin/sha256sum").write_text('#!/bin/sh\nprintf "digest  %s\\n" "$1"\n')
-            (root / "bin/cargo").write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> args\n')
+            (root / "bin/cargo").write_text(
+                '#!/bin/sh\nif [ "$1" = pkgid ]; then echo "path+file:///repo#formless-bin@0.2.0"; '
+                'else printf "%s\\n" "$@" >> args; fi\n'
+            )
             for command in (root / "bin").iterdir():
                 command.chmod(0o755)
-            for kind, tag in (("", "main"), ("false", "v0.2.0"), ("true", "v0.2.0-rc.1-hotfix")):
-                with self.subTest(tag=tag):
+            for kind, tag, run_number in (("", "main", "9"), ("", "main", "10"),
+                                          ("false", "v0.2.0", ""), ("true", "v0.2.0-rc.1-hotfix", "")):
+                with self.subTest(tag=tag, run_number=run_number):
                     dist = root / "dist"
                     for file in dist.iterdir():
                         file.unlink()
@@ -159,10 +167,18 @@ class ReleasePublication(unittest.TestCase):
                     subprocess.run(
                         ["bash", "-e", "-c", run], cwd=root,
                         env={"PATH": f'{root / "bin"}:{os.environ["PATH"]}', "PRERELEASE": kind,
-                             "GITHUB_REF_NAME": tag}, check=True, timeout=5,
+                             "GITHUB_REF_NAME": tag, "GITHUB_RUN_NUMBER": run_number,
+                             "GITHUB_REF": f"refs/{'heads' if tag == 'main' else 'tags'}/{tag}",
+                             "RELEASE_ID": "main-preview"}, check=True, timeout=5,
                     )
                     actual = args.read_text().splitlines()
-                    if kind == "true":
+                    if tag == "main":
+                        self.assertIn("--deb-version", actual)
+                        self.assertIn(f"0.2.0~main.{run_number}-1", actual)
+                        self.assertIn("--set-metadata", actual)
+                        self.assertIn(f'version="0.2.0~main.{run_number}"', actual)
+                        names = ["formless_main-preview_amd64.deb", "formless-main-preview.x86_64.rpm"]
+                    elif kind == "true":
                         self.assertIn("--deb-version", actual)
                         self.assertIn("0.2.0~rc.1+hotfix-1", actual)
                         self.assertIn("--set-metadata", actual)
@@ -367,6 +383,89 @@ class ReleasePublication(unittest.TestCase):
         for action in actions:
             with self.subTest(action=action):
                 self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$")
+
+    def test_main_prerelease_waits_for_every_platform_without_publishing_stable_channels(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn('  push:\n    branches: [main]\n    tags: ["v*"]', workflow)
+        self.assertIn("format('main-{0}', github.sha)", workflow)
+        self.assertIn("group: release-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}", workflow)
+        parts = re.split(r"(?m)^  ([\w-]+):\n", workflow.split("\njobs:\n", 1)[1])
+        jobs = dict(zip(parts[1::2], parts[2::2]))
+        desktop = jobs["desktop"]
+        self.assertIn("if: github.ref == 'refs/heads/main'", desktop)
+        self.assertIn("needs: [build, linux]", desktop)
+        self.assertEqual(
+            re.findall(r"target: (\S+)\n +cli-artifact: (\S+)\n +archive: (\S+)\n +installer: (\S+)", desktop),
+            [
+                ("aarch64-apple-darwin", "formless-aarch64-apple-darwin", "tar.gz", "dmg"),
+                ("x86_64-apple-darwin", "formless-x86_64-apple-darwin", "tar.gz", "dmg"),
+                ("x86_64-unknown-linux-gnu", "formless-linux", "tar.gz", "deb"),
+                ("x86_64-pc-windows-msvc", "formless-x86_64-pc-windows-msvc", "zip", "exe"),
+            ],
+        )
+        publish = jobs["publish-main"]
+        self.assertIn("if: github.ref == 'refs/heads/main'", publish)
+        self.assertIn("needs: [build, linux, linux-install-test, desktop]", publish)
+        self.assertIn('git push origin "HEAD:refs/tags/$RELEASE_ID"', publish)
+        self.assertIn("tag_name: ${{ env.RELEASE_ID }}", publish)
+        self.assertIn("prerelease: true\n          make_latest: false", publish)
+        self.assertIn("fail_on_unmatched_files: true", publish)
+        for glob in ("*.tar.gz", "*.zip", "*.deb", "*.rpm", "formless-desktop-*.dmg", "formless-desktop-*.exe"):
+            self.assertRegex(publish, r"assets/(?:formless-)?" + re.escape(glob) + r"\n")
+        for job in ("publish", "docker"):
+            self.assertIn("if: startsWith(github.ref, 'refs/tags/v')", jobs[job])
+
+
+class PreviewPackaging(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        path = ROOT / "crates/formless-desktop/scripts/package-preview.py"
+        preview = importlib.util.spec_from_file_location("package_preview", path)
+        cls.packager = importlib.util.module_from_spec(preview)
+        preview.loader.exec_module(cls.packager)
+
+    def test_extracts_matching_cli_from_each_archive_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            for archive_name, binary in (("formless-main-fixture-x64.zip", "formless.exe"),
+                                         ("formless-main-fixture-arm64.tar.gz", "formless")):
+                with self.subTest(binary=binary):
+                    archive = path / archive_name
+                    if binary.endswith(".exe"):
+                        with zipfile.ZipFile(archive, "w") as package:
+                            package.writestr(archive.stem + "/" + binary, "matching CLI")
+                    else:
+                        with tarfile.open(archive, "w:gz") as package:
+                            payload = io.BytesIO(b"matching CLI")
+                            member = tarfile.TarInfo(archive_name.removesuffix(".tar.gz") + "/" + binary)
+                            member.size = payload.getbuffer().nbytes
+                            package.addfile(member, payload)
+                    destination = path / binary
+                    self.packager.extract_cli(archive, destination)
+                    self.assertEqual(destination.read_bytes(), b"matching CLI")
+                    if os.name == "posix" and binary == "formless":
+                        self.assertEqual(destination.stat().st_mode & 0o777, 0o755)
+
+    @unittest.skipUnless(sys.platform == "linux" and shutil.which("dpkg-shlibdeps") and shutil.which("dpkg-deb"),
+                         "requires Debian packaging tools")
+    def test_deb_includes_cli_and_a_daemon_starting_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            bundle = path / "bundle"
+            bundle.mkdir()
+            for binary in ("formless-desktop", "formless"):
+                shutil.copy2("/bin/true", bundle / binary)
+            output = path / "release" / "fixture.deb"
+            output.parent.mkdir()
+            self.packager.linux(bundle, output, "0.1.0~main.42")
+            version = subprocess.check_output(["dpkg-deb", "-f", output, "Version"], text=True).strip()
+            self.assertEqual(version, "0.1.0~main.42")
+            extracted = path / "extracted"
+            subprocess.run(["dpkg-deb", "-x", output, extracted], check=True)
+            for binary in ("formless-desktop", "formless"):
+                self.assertTrue(os.access(extracted / "usr/lib/formless-desktop" / binary, os.X_OK))
+            launcher = extracted / "usr/share/applications/formless-desktop.desktop"
+            self.assertIn("Exec=/usr/lib/formless-desktop/formless-desktop --start-daemon\n", launcher.read_text())
 
 
 if __name__ == "__main__":

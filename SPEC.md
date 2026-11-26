@@ -5587,13 +5587,14 @@ formless sessions subagent exact-subagent-id
 `update --json`, `update check --json`, and `update --check --json` emit one
 object: `{installed, status, newer_releases: [{tag, url, notes}]}`. Notes retain
 the existing trimmed body and oldest-first order; `installed` has no `v` prefix.
-`update_available` means the fetched page contains newer stable releases;
-`up_to_date` means none in that single 50-release response, without pagination.
+The lookup follows GitHub release pages within one 15-second timeout and
+excludes drafts and prereleases. `update_available` means at least one newer
+stable release was found; `up_to_date` means a completed lookup found none.
 `release_check_unavailable` maps to an actual HTTP 404 response,
 not verified absence of releases. Error text alone never selects this status.
 Completed checks exit 0; other fetch or JSON parse failures remain errors with
-no success JSON. Human output stays unchanged, and the JSON form never runs
-an updater.
+no success JSON. The human output format stays unchanged, and the JSON form
+never runs an updater.
 
 ### Root and global flags
 

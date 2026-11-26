@@ -541,7 +541,7 @@ enum Cmd {
     },
     /// Check for a newer release, show what changed, and how to upgrade
     #[command(
-        after_help = "Examples:\n  formless update check\n  formless update --check\n  formless update check --json\n\nJSON: {installed, status, newer_releases: [{tag, url, notes}]}. Status is update_available, up_to_date (within the fetched page), or release_check_unavailable (HTTP 404 status). Checks never execute an updater."
+        after_help = "Examples:\n  formless update check\n  formless update --check\n  formless update check --json\n\nJSON: {installed, status, newer_releases: [{tag, url, notes}]}. Status is update_available (newer stable release found), up_to_date (no newer stable release after checking all pages), or release_check_unavailable (HTTP 404 status). Checks never execute an updater."
     )]
     Update {
         #[command(subcommand)]
@@ -3074,7 +3074,7 @@ fn update_cmd(check: bool, json: bool) -> Result<()> {
         json,
         env!("CARGO_PKG_VERSION"),
         upgrade_command(),
-        || update_http::get("https://api.github.com/repos/athiwatc/formless/releases?per_page=50"),
+        update_http::get_releases,
     )
 }
 
