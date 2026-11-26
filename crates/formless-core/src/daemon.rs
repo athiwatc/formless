@@ -14182,12 +14182,24 @@ impl Daemon {
         // Never silent: the user sees every agent write live.
         self.broadcast(Event::Note {
             session_id: Some(session_id.to_string()),
-            text: format!("remembered: {} [{}]", m.text, m.id),
+            text: if !created && !m.enabled {
+                format!(
+                    "already remembered (disabled): {} [{}] — it remains off until you explicitly enable it",
+                    m.text, m.id
+                )
+            } else {
+                format!("remembered: {} [{}]", m.text, m.id)
+            },
         });
         Ok(json!({
             "id": m.id,
             "saved": if created { "new" } else { "already remembered" },
-            "note": "Applies from the next Session (or this one after compaction).",
+            "enabled": m.enabled,
+            "note": if !created && !m.enabled {
+                "This note already exists but is disabled. It remains off until the user explicitly enables it."
+            } else {
+                "Applies from the next Session (or this one after compaction)."
+            },
         })
         .to_string())
     }
@@ -21118,6 +21130,59 @@ mod model_download_tests {
         assert!(!spec.gguf_path(&paths).exists());
         drop(daemon);
         server.abort();
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn remembering_a_disabled_note_reports_that_it_stays_off() {
+        let base =
+            std::env::temp_dir().join(format!("fl-disabled-memory-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("data"), base.join("config")).unwrap();
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let (session_id, note) = daemon
+            .with_store(|store| {
+                let session = store.create_session(None)?;
+                let (note, _) =
+                    store.add_memory("Keep this choice disabled", "global", "user", None)?;
+                let note = store
+                    .update_memory(&note.id, None, None, Some(false))?
+                    .unwrap();
+                Ok((session.id, note))
+            })
+            .unwrap();
+        let mut events = subscribe(&daemon);
+
+        let output = daemon
+            .call_tool_direct(
+                &session_id,
+                "remember",
+                serde_json::json!({"text": "Keep this choice disabled"}),
+            )
+            .await;
+        let result: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(result["saved"], "already remembered");
+        assert_eq!(result["enabled"], false);
+        assert!(result["note"].as_str().unwrap().contains("disabled"));
+        assert!(!daemon
+            .with_reader(|store| Ok(store.get_memory(&note.id)?.unwrap().enabled))
+            .unwrap());
+
+        let note_text = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(ServerMessage::Event(Event::Note { text, .. })) = events.recv().await {
+                    break text;
+                }
+            }
+        })
+        .await
+        .expect("disabled-note status was not sent to the user");
+        assert!(
+            note_text.contains("already remembered (disabled)"),
+            "{note_text}"
+        );
+        assert!(note_text.contains("remains off"), "{note_text}");
+
+        drop(daemon);
         let _ = std::fs::remove_dir_all(base);
     }
 

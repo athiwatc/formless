@@ -2517,10 +2517,12 @@ pattern (§4.4).
   input-bound scopes, §7.4). v2 adds prompt/memory **self-optimisation**: the optimiser
   proposes one short learned-guidance addendum (kind `prompt`) from Tool
   metrics/failure patterns (user preferences belong to user memory,
-  §7.11; memory-kind proposals from older builds, when applied, become
-  memory notes with author `optimiser` and are deleted again on
-  rollback), measures
-  it against the current prompt on the scenario eval suite (§8.6; baseline vs
+  §7.11). Memory-kind proposals from older builds become optimiser memory
+  notes when applied. Applying one refuses a matching disabled note; a
+  matching enabled note can satisfy the proposal without being linked.
+  Rollback deletes only the note linked to the proposal, preserving a
+  pre-existing duplicate. The optimiser measures the proposal against the
+  current prompt on the scenario eval suite (§8.6; baseline vs
   candidate scores are stored), and only a measured proposal that beats
   the baseline by the promotion margin can be applied — always by the
   user's decision (`formless prompts`, TUI `/proposals`). The generator
@@ -2875,7 +2877,9 @@ suite cannot measure preferences.
 - **Built-ins:** `remember({text, scope?})` saves a note of at most 300
   characters. `scope` is `global` (the default) or
   `project:<absolute path>`. A duplicate (same scope, same text ignoring
-  case and spacing) refreshes the existing note. `forget({id})` deletes one.
+  case and spacing) refreshes the existing note without changing its enabled
+  state; if it is disabled, the agent and user are told it remains off.
+  `forget({id})` deletes one.
   The bootstrap prompt says to remember lasting preferences and facts,
   never secrets or one-off details, and to forget on request.
 - **Store:** the `memories` table (schema v17) holds the text, scope,
@@ -2888,9 +2892,14 @@ suite cannot measure preferences.
   from this one after compaction, which adds a note to the chat that the
   prompt changed. Disabled notes are left out.
 - **Visible and editable.** Every agent write shows live in the chat
-  (`remembered: …`, `forgot: …`). Management uses `ListMemories`,
+  (`remembered: …`, `already remembered (disabled): …`, `forgot: …`). Management uses `ListMemories`,
   `UpsertMemory` (add with no `id`, author `user`; or edit the text,
-  scope or enabled flag) and `DeleteMemory`. Clients are:
+  scope or enabled flag) and `DeleteMemory`. Edits validate text against the
+  note author's limit (800 characters for optimiser notes, 300 otherwise);
+  flag-only changes do not revalidate unchanged text. An edit that would
+  duplicate another note in the same scope is refused with a named error.
+  Disabled notes stay disabled unless the user explicitly enables them.
+  Clients are:
   - CLI: `formless memory list [--json]|add|rm|edit`
   - TUI: `/memory`, `/memory rm|on|off ID`, `/memory edit ID TEXT`,
     `/remember TEXT` (saved as the user), `/forget TEXT` (lists the
@@ -2923,8 +2932,11 @@ suite cannot measure preferences.
   preference in its own words.
 - Every change is audit-logged and broadcasts `MemoryUpdated`.
 - Optimiser notes (author `optimiser`, up to 800 characters) come from
-  applied memory-kind proposals (§8). Schema v18 migrated the applied
-  ones, and rolling such a proposal back deletes its note.
+  applied memory-kind proposals (§8). Schema v18 migrated applicable applied
+  proposals into notes linked to their proposal IDs. Application refuses a
+  matching disabled note with a named error. A matching enabled note can
+  satisfy a proposal without being linked; rollback deletes only a linked
+  note, preserving the pre-existing duplicate.
 
 ### 7.12 Orchestration scripts (`run_script`, v2.3)
 

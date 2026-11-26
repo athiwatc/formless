@@ -6036,39 +6036,51 @@ impl Store {
             "rolled_back" => ("status='applied'", false),
             other => return Err(anyhow::anyhow!("unknown proposal status '{other}'")),
         };
-        let changed = if applied {
-            self.ex(
-                &format!("UPDATE prompt_proposals SET status='applied', applied_at=?2 WHERE id=?1 AND {from}"),
-                params![id, now()],
-            )?
-        } else {
-            self.ex(
-                &format!("UPDATE prompt_proposals SET status=?2 WHERE id=?1 AND {from}"),
-                params![id, status],
-            )?
-        };
-        if changed == 0 {
-            return Ok(None);
-        }
-        let p = self.get_proposal(id)?;
-        // A memory proposal lives in the memory store (SPEC §7.11).
-        if let Some(p) = p.as_ref().filter(|p| p.kind == "memory") {
-            match status {
-                "applied" => {
-                    let (m, _) = self.add_memory(&p.content, "global", "optimiser", None)?;
-                    self.ex(
-                        "UPDATE memories SET proposal_id=?2 WHERE id=?1",
-                        params![m.id, p.id],
-                    )?;
-                }
-                "rolled_back" => {
-                    self.conn
-                        .execute("DELETE FROM memories WHERE proposal_id=?1", params![p.id])?;
-                }
-                _ => {}
+        self.transaction(|st| {
+            let changed = if applied {
+                st.ex(
+                    &format!("UPDATE prompt_proposals SET status='applied', applied_at=?2 WHERE id=?1 AND {from}"),
+                    params![id, now()],
+                )?
+            } else {
+                st.ex(
+                    &format!("UPDATE prompt_proposals SET status=?2 WHERE id=?1 AND {from}"),
+                    params![id, status],
+                )?
+            };
+            if changed == 0 {
+                return Ok(None);
             }
-        }
-        Ok(p)
+            let p = st.get_proposal(id)?;
+            // A memory proposal lives in the memory store (SPEC §7.11).
+            if let Some(p) = p.as_ref().filter(|p| p.kind == "memory") {
+                match status {
+                    "applied" => {
+                        let (m, created) =
+                            st.add_memory(&p.content, "global", "optimiser", None)?;
+                        if !created && !m.enabled {
+                            anyhow::bail!(
+                                "memory proposal matches an existing disabled note; enable or edit that note before applying the proposal"
+                            );
+                        }
+                        if created {
+                            st.ex(
+                                "UPDATE memories SET proposal_id=?2 WHERE id=?1",
+                                params![m.id, p.id],
+                            )?;
+                        }
+                    }
+                    "rolled_back" => {
+                        st.conn.execute(
+                            "DELETE FROM memories WHERE proposal_id=?1",
+                            params![p.id],
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(p)
+        })
     }
 
     /// Effective system prompt: frozen bootstrap + applied guidance
@@ -7471,7 +7483,7 @@ impl Store {
                 .optional()?;
             if let Some(id) = existing {
                 st.ex(
-                    "UPDATE memories SET enabled=1, updated_at=?2 WHERE id=?1",
+                    "UPDATE memories SET updated_at=?2 WHERE id=?1",
                     params![id, t],
                 )?;
                 return Ok((st.get_memory(&id)?.context("memory vanished")?, false));
@@ -7520,21 +7532,52 @@ impl Store {
         let Some(cur) = self.get_memory(id)? else {
             return Ok(None);
         };
+        let revalidate_text_and_scope = text.is_some() || scope.is_some();
+        let text_was_provided = text.is_some();
         let text = text.unwrap_or(&cur.text);
         let scope = scope.unwrap_or(&cur.scope);
-        crate::memory::validate(text, scope)?;
-        self.ex(
-            "UPDATE memories SET text=?2, dedup_key=?3, scope=?4, enabled=?5, updated_at=?6 WHERE id=?1",
-            params![
-                id,
-                crate::memory::clean(text),
-                crate::memory::dedup_key(text),
-                scope,
-                enabled.unwrap_or(cur.enabled),
-                now()
-            ],
-        )?;
-        self.get_memory(id)
+        if revalidate_text_and_scope {
+            let max_chars = if cur.author == "optimiser" {
+                crate::memory::MAX_OPTIMISER_CHARS
+            } else {
+                crate::memory::MAX_CHARS
+            };
+            crate::memory::validate_len(text, max_chars)?;
+            crate::memory::validate_scope(scope)?;
+        }
+        let dedup_key = crate::memory::dedup_key(text);
+        let stored_text = if text_was_provided {
+            crate::memory::clean(text)
+        } else {
+            cur.text.clone()
+        };
+        self.transaction(|st| {
+            let duplicate: Option<String> = st
+                .conn
+                .query_row(
+                    "SELECT id FROM memories WHERE scope=?1 AND dedup_key=?2 AND id<>?3",
+                    params![scope, dedup_key, id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if duplicate.is_some() {
+                anyhow::bail!(
+                    "memory duplicate: another note already has this text in the selected scope; edit that note instead"
+                );
+            }
+            st.ex(
+                "UPDATE memories SET text=?2, dedup_key=?3, scope=?4, enabled=?5, updated_at=?6 WHERE id=?1",
+                params![
+                    id,
+                    stored_text,
+                    dedup_key,
+                    scope,
+                    enabled.unwrap_or(cur.enabled),
+                    now()
+                ],
+            )?;
+            st.get_memory(id)
+        })
     }
 
     pub fn delete_memory(&self, id: &str) -> Result<bool> {

@@ -8605,7 +8605,13 @@
         if (input.value === memory?.text) return null;
         return { type: "upsert_memory", id: memory?.id, text: input.value };
       } });
-    if (result) { toast(memory ? "Saved" : "Added"); refreshSettings(); }
+    if (result) {
+      const notice = memory ? "Saved" : result.enabled === false
+        ? "Already remembered (disabled); it remains off until you explicitly enable it."
+        : "Added";
+      toast(notice);
+      refreshSettings();
+    }
   }
   async function testProvider(name) {
     toast("Testing " + name + "…");

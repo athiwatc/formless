@@ -53,10 +53,163 @@ fn memories_are_validated_deduplicated_and_scoped() {
     assert!(block.contains("When working in /code/app:\n- Tests run with make check"));
 
     store.update_memory(&a.id, None, None, Some(false)).unwrap();
+    let (duplicate, new) = store
+        .add_memory("uses pnpm, NOT npm", "global", "agent", None)
+        .unwrap();
+    assert!(!new);
+    assert_eq!(duplicate.id, a.id);
+    assert!(
+        !duplicate.enabled,
+        "a duplicate must preserve the user's choice"
+    );
+    let enabled = store
+        .update_memory(&a.id, None, None, Some(true))
+        .unwrap()
+        .unwrap();
+    assert!(
+        enabled.enabled,
+        "the user can explicitly turn a note back on"
+    );
+    store.update_memory(&a.id, None, None, Some(false)).unwrap();
     let block = formless_core::memory::prompt_block(&store.list_memories().unwrap());
     assert!(!block.contains("pnpm"), "disabled notes are left out");
     assert!(store.delete_memory(&a.id).unwrap());
     assert!(!store.delete_memory(&a.id).unwrap());
+}
+
+#[test]
+fn optimiser_edits_allow_long_notes_and_duplicate_edits_are_named() {
+    let store = Store::open_in_memory().unwrap();
+    let long_text = format!("{}x", "prefers concise answers. ".repeat(32).trim_end());
+    assert_eq!(
+        long_text.chars().count(),
+        formless_core::memory::MAX_OPTIMISER_CHARS
+    );
+    assert!(long_text.chars().count() > formless_core::memory::MAX_CHARS);
+    let (optimiser_note, _) = store
+        .add_memory("Short optimiser note", "global", "optimiser", None)
+        .unwrap();
+    let edited = store
+        .update_memory(&optimiser_note.id, Some(&long_text), None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(edited.text, long_text);
+
+    let too_long = format!("{long_text}x");
+    assert_eq!(
+        too_long.chars().count(),
+        formless_core::memory::MAX_OPTIMISER_CHARS + 1
+    );
+    let error = store
+        .update_memory(&optimiser_note.id, Some(&too_long), None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("800 characters"), "{error}");
+    assert_eq!(
+        store.get_memory(&optimiser_note.id).unwrap().unwrap().text,
+        long_text
+    );
+
+    let moved = store
+        .update_memory(&optimiser_note.id, None, Some("project:/workspace"), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(moved.scope, "project:/workspace");
+    let disabled = store
+        .update_memory(&optimiser_note.id, None, None, Some(false))
+        .unwrap()
+        .unwrap();
+    assert!(!disabled.enabled);
+
+    let (first, _) = store
+        .add_memory("Use tabs in fixtures", "global", "user", None)
+        .unwrap();
+    store
+        .add_memory("Use spaces in fixtures", "global", "user", None)
+        .unwrap();
+    let error = store
+        .update_memory(&first.id, Some("Use   spaces in fixtures"), None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("memory duplicate"), "{error}");
+    assert!(!error.contains("UNIQUE constraint failed"), "{error}");
+    assert_eq!(
+        store.get_memory(&first.id).unwrap().unwrap().text,
+        "Use tabs in fixtures"
+    );
+
+    store
+        .add_memory("Use tabs in fixtures", "project:/workspace", "user", None)
+        .unwrap();
+    let error = store
+        .update_memory(&first.id, None, Some("project:/workspace"), None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("memory duplicate"), "{error}");
+    assert!(!error.contains("UNIQUE constraint failed"), "{error}");
+    let original = store.get_memory(&first.id).unwrap().unwrap();
+    assert_eq!(original.text, "Use tabs in fixtures");
+    assert_eq!(original.scope, "global");
+}
+
+#[test]
+fn ordinary_memory_edits_enforce_the_300_character_limit() {
+    let store = Store::open_in_memory().unwrap();
+    let (note, _) = store
+        .add_memory("Original user note", "global", "user", None)
+        .unwrap();
+    let max_text = format!("{}words", "word ".repeat(59));
+    assert_eq!(max_text.chars().count(), formless_core::memory::MAX_CHARS);
+
+    let edited = store
+        .update_memory(&note.id, Some(&max_text), None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(edited.text, max_text);
+
+    let too_long = format!("{max_text}x");
+    assert_eq!(
+        too_long.chars().count(),
+        formless_core::memory::MAX_CHARS + 1
+    );
+    let error = store
+        .update_memory(&note.id, Some(&too_long), None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("300 characters"), "{error}");
+    assert_eq!(store.get_memory(&note.id).unwrap().unwrap().text, max_text);
+}
+
+#[test]
+fn metadata_only_memory_edits_preserve_legacy_optimizer_text() {
+    let paths = temp_paths("legacy-memory");
+    let db_path = paths.db_file();
+    let store = Store::open(&db_path).unwrap();
+    let (note, _) = store
+        .add_memory("Temporary note", "global", "optimiser", None)
+        .unwrap();
+    drop(store);
+
+    let legacy_text = "Keep this line.\n  Preserve this continuation.";
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute(
+        "UPDATE memories SET text=trim(?2), dedup_key=lower(trim(?2)), proposal_id='history-proposal' WHERE id=?1",
+        rusqlite::params![note.id, legacy_text],
+    )
+    .unwrap();
+    drop(db);
+
+    let store = Store::open(&db_path).unwrap();
+    let scoped = store
+        .update_memory(&note.id, None, Some("project:/legacy"), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(scoped.text, legacy_text);
+    let disabled = store
+        .update_memory(&note.id, None, None, Some(false))
+        .unwrap()
+        .unwrap();
+    assert_eq!(disabled.text, legacy_text);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -130,13 +283,46 @@ async fn users_list_add_edit_and_delete_memories() {
         (edited["text"].as_str(), edited["enabled"].as_bool()),
         (Some("Projects live in ~/src"), Some(false))
     );
+    let another = daemon
+        .handle(Request::UpsertMemory {
+            id: None,
+            text: Some("Projects live in ~/elsewhere".into()),
+            scope: None,
+            enabled: None,
+        })
+        .await
+        .unwrap();
+    let duplicate_error = daemon
+        .handle(Request::UpsertMemory {
+            id: Some(id.clone()),
+            text: another["text"].as_str().map(str::to_owned),
+            scope: None,
+            enabled: None,
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        duplicate_error.contains("memory duplicate"),
+        "{duplicate_error}"
+    );
+    assert!(
+        !duplicate_error.contains("UNIQUE constraint failed"),
+        "{duplicate_error}"
+    );
     let list = daemon.handle(Request::ListMemories).await.unwrap();
-    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list.as_array().unwrap().len(), 2);
     daemon
         .handle(Request::DeleteMemory { id: id.clone() })
         .await
         .unwrap();
     assert!(daemon.handle(Request::DeleteMemory { id }).await.is_err());
+    daemon
+        .handle(Request::DeleteMemory {
+            id: another["id"].as_str().unwrap().to_string(),
+        })
+        .await
+        .unwrap();
     assert_eq!(
         daemon.handle(Request::ListMemories).await.unwrap(),
         serde_json::json!([])

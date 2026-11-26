@@ -477,6 +477,7 @@ enum Pending {
     ProposalDiff,
     /// Apply, reject or roll back a Proposal: the answer is a note (errors already are).
     ProposalDecision,
+    Remember,
     Usage,
     RunToolInput,
     RunTool,
@@ -1759,6 +1760,20 @@ fn memory_activity_note(memory: &formless_protocol::MemoryInfo) -> String {
         if memory.enabled { "" } else { ", off" },
         plain::display_text(&memory.text),
     )
+}
+
+fn memory_remember_notice(result: &serde_json::Value) -> String {
+    let text = result
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("memory");
+    if result.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+        format!(
+            "already remembered (disabled): {text} — it remains off until you explicitly enable it"
+        )
+    } else {
+        format!("remembered: {text}")
+    }
 }
 
 /// Borrow this Session's user payloads; collecting the iterator copies only
@@ -5307,6 +5322,7 @@ impl App {
                                 None => format!("no step limit for {which}"),
                             });
                         }
+                        Pending::Remember => self.notes.push(memory_remember_notice(&result)),
                         Pending::RunControl => match result["abandoned"].as_bool() {
                             Some(true) => self.notes.push("abandoned the interrupted run".into()),
                             Some(false) => self.notes.push("nothing to abandon".into()),
@@ -8315,15 +8331,14 @@ impl App {
                     self.notes.push("usage: /remember TEXT".into());
                 } else {
                     self.request(
-                        Pending::RunControl,
+                        Pending::Remember,
                         Request::UpsertMemory {
                             id: None,
-                            text: Some(text.clone()),
+                            text: Some(text),
                             scope: None,
                             enabled: None,
                         },
                     );
-                    self.notes.push(format!("remembered: {text}"));
                 }
             }
             // Find memories; the same command again deletes them.
@@ -20926,6 +20941,17 @@ mod tests {
         assert_eq!(
             note,
             "memory fixture [project:test\\u{202e}, off] note\\r\\n\\u{1b}\\u{9b} · agent\\u{9b}"
+        );
+    }
+
+    #[test]
+    fn remembering_a_disabled_memory_reports_that_it_remains_off() {
+        let notice = memory_remember_notice(&serde_json::json!({
+            "text":"User prefers concise answers.", "enabled":false
+        }));
+        assert_eq!(
+            notice,
+            "already remembered (disabled): User prefers concise answers. — it remains off until you explicitly enable it"
         );
     }
 
