@@ -405,7 +405,7 @@ jobs:
         run: |
           docker_config=$(mktemp -d "$RUNNER_TEMP/formless-docker-config.XXXXXX")
           echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Record source and runner
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
