@@ -342,7 +342,7 @@ jobs:
         run: |
           fixtures=$(mktemp -d "$RUNNER_TEMP/formless-install.XXXXXX")
           echo "INSTALL_FIXTURES=$fixtures" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: formless-linux
           path: ${{ env.INSTALL_FIXTURES }}
@@ -508,7 +508,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: assets
           pattern: formless-*
@@ -631,7 +631,7 @@ jobs:
           echo "DOCKER_PUBLISH_DIR=$publish_dir" >> "$GITHUB_ENV"
           mkdir "$publish_dir/docker"
           echo "DOCKER_CONFIG=$publish_dir/docker" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ env.IMAGE_ARTIFACT_ID }}
           path: ${{ env.DOCKER_PUBLISH_DIR }}
@@ -728,7 +728,7 @@ jobs:
         with:
           # Match crates/formless-desktop/notices/TOOLCHAIN.json.
           toolchain: 1.100.0
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ matrix.cli-artifact }}
           path: ${{ runner.temp }}/formless-desktop-${{ github.run_attempt }}/cli
@@ -759,7 +759,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: assets
           pattern: formless-*
