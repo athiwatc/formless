@@ -414,7 +414,7 @@ jobs:
           docker version
           echo "## Docker cold-layer baseline; SHA: $GITHUB_SHA; image: $ImageOS/$ImageVersion" >> "$GITHUB_STEP_SUMMARY"
       - name: Build local image (never log in or push)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           load: true
