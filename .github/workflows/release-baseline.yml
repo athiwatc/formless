@@ -315,7 +315,7 @@ jobs:
         run: |
           fixtures=$(mktemp -d "$RUNNER_TEMP/formless-install.XXXXXX")
           echo "INSTALL_FIXTURES=$fixtures" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: baseline-linux
           path: ${{ env.INSTALL_FIXTURES }}
